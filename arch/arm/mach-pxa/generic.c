@@ -118,6 +118,7 @@ static struct map_desc standard_io_desc[] __initdata = {
 	}
 };
 
+extern void asmlinkage printascii(char *str);
 void __init pxa_map_io(void)
 {
 	iotable_init(standard_io_desc, ARRAY_SIZE(standard_io_desc));

@@ -49,4 +49,13 @@ config BATTERY_OLPC
 	help
 	  Say Y to enable support for the battery on the OLPC laptop.
 
+config BATTERY_LOOX720
+	tristate "Fujitsu Siemens Pocket Loox 718/720 battery"
+	depends on LOOX720_BATTERY
+	help
+	  Say Y to enable support for the battery on FSC Loox 718/720,
+	  recognizing battery full, AC/USB charging, etc...
+	  Info on AC/USB/main-battery will be at 
+          /sys/class/power-supply/loox720-battery
+
 endif # POWER_SUPPLY

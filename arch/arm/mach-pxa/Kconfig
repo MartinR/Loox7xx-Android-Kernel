@@ -138,7 +138,23 @@ config MACH_PCM027
 	select PXA27x
 	select IWMMXT
 
+config MACH_LOOX720
+	bool "Fujitsu-Siemens PocketLoox 720 PDA device"
+	select PXA27x
+	select IWMMXT
+	select PXA_SUSPEND_SAVE_EXTRA_REGS
+
 endchoice
+
+source "arch/arm/mach-pxa/loox720/Kconfig"
+
+config PXA27x_VOLTAGE
+	tristate "Support PXA27x CPU Core Voltage Change Sequencer"
+	depends on PXA27x && CPU_FREQ
+
+config PXA27x_VOLTAGE_MAX158xx
+	tristate "MAX158xx PMIC"
+	depends on PXA27x_VOLTAGE
 
 choice
 	prompt "Used baseboard"

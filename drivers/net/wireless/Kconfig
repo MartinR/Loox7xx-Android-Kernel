@@ -672,7 +672,7 @@ config ADM8211
 	  the Ralink RT2400 (SMC2635W) without a model number change.
 
 	  Thanks to Infineon-ADMtek for their support of this driver.
-
+	  
 source "drivers/net/wireless/p54/Kconfig"
 source "drivers/net/wireless/ath5k/Kconfig"
 source "drivers/net/wireless/iwlwifi/Kconfig"
@@ -681,5 +681,6 @@ source "drivers/net/wireless/b43/Kconfig"
 source "drivers/net/wireless/b43legacy/Kconfig"
 source "drivers/net/wireless/zd1211rw/Kconfig"
 source "drivers/net/wireless/rt2x00/Kconfig"
+source "drivers/net/wireless/acx/Kconfig"
 
 endmenu

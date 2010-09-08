@@ -36,6 +36,14 @@ config LCD_LTV350QV
 
 	  The LTV350QV panel is present on all ATSTK1000 boards.
 
+config LCD_LOOX720
+	tristate "Fujitsu Siemens Pocket Loox 718/720 LCD Driver"
+	depends on LCD_CLASS_DEVICE && MACH_LOOX720
+	default n
+	help
+	  Say y to enable the lcd driver for the Fujitsu Siemens Pocket Loox718/720
+	  PDA series, enable/disable LCD power and set LCD contrast.
+
 #
 # Backlight
 #
@@ -112,3 +120,11 @@ config BACKLIGHT_CARILLO_RANCH
 	help
 	  If you have a Intel LE80578 (Carillo Ranch) say Y to enable the
 	  backlight driver.
+
+config BACKLIGHT_LOOX720
+	tristate "Fujitsu Siemens Pocket Loox 718/720 Backlight Driver"
+	depends on BACKLIGHT_CLASS_DEVICE && MACH_LOOX720
+	default n
+	help
+	  Say y to enable the backlight driver for the Fujitsu Siemens Pocket Loox718/720
+	  PDA series, enable/disable backlight power and set brightness.

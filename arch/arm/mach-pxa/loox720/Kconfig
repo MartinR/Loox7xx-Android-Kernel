@@ -1,0 +1,145 @@
+menu "Fujitsu-Siemens PocketLoox 720 configuration"
+    depends on MACH_LOOX720
+
+config LOOX720_LCD
+    bool "FSC Loox 720 LCD"
+    select FB
+    select FB_BACKLIGHT
+    select BACKLIGHT_LOOX720
+    select LCD_CLASS_DEVICE
+    select LCD_LOOX720
+    depends on MACH_LOOX720
+    help
+        This driver provides support for changing power and brightness
+        on Loox 720 LCD display.
+
+choice
+    prompt "touchscreen selection"
+    default LOOX720_ADS7846
+
+config LOOX720_NO_TS
+    bool "disabled"
+
+config LOOX720_TS
+    bool "FSC Loox 720 Touchscreen"
+    depends on MACH_LOOX720
+    select SPI
+    select SPI_PXA2XX
+    select TOUCHSCREEN_ADS7846
+    help
+        This driver provides support for touchscreen using the ads8746 SPI driver,
+	which is badly broken and probably doesn't even work... The simple direct
+	SPI driver is very recommended.
+
+config LOOX720_ADS7846
+    bool "FSC Loox 720 simple direct SPI (Recommended)"
+    select SPI
+    select SPI_PXA2XX
+    depends on MACH_LOOX720
+    help
+        FSC Loox 720 ADS7846 touchscreen over SPI support.
+        This driver does not use the ads7846 driver but implements
+        a direct call to the ads chip over SPI.
+
+endchoice
+
+config LOOX720_ADS7846_AUTOCAL
+    bool "Enable touchscreen autocalibration"
+    depends on LOOX720_ADS7846
+    help
+        The simple direct SPI driver supports autocalibration feature.
+	Just draw a rectangle along all the four edges and the touchscreen
+	will be calibrated. At the moment useful only with Android.
+
+config LOOX720_BATTERY
+    bool "FSC Loox 720 Battery support (say Y!)"
+    depends on MACH_LOOX720
+    default y
+    select POWER_SUPPLY
+    select BATTERY_LOOX720
+    help
+        FSC Loox 718/720 power/battery support. You really should say Y here,
+        to get charging on empty battery, AC/USB charging capabilities etc
+
+
+config LOOX720_BUTTONS
+    bool "FSC Loox 720 Buttons"
+    depends on MACH_LOOX720
+    select INPUT_KEYBOARD
+    select KEYBOARD_GPIO
+    select KEYBOARD_PXA27x
+    help
+        FSC Loox 720 buttons support. Including power button.
+
+config LOOX720_BT
+    tristate "FSC Loox 720 Bluetooth (BRF6150)"
+    depends on MACH_LOOX720
+    select BT
+    select BT_HCIUART
+    select BT_HCIUART_LL
+    help
+        FSC Loox 720 Bluetooth (BRF6150) support. Should be working good.
+
+config LOOX720_PCMCIA
+    tristate 'FSC Loox 720 CF/PC Card'
+    depends on MACH_LOOX720 
+    select PCCARD
+    select PCMCIA_PXA2XX
+    default m
+    help
+        Enable CF/PC Card controller in Loox 720. This must be set to Y if you
+        want to boot from CF card, but this also turns WiFi chip on.
+
+config LOOX720_FLASH
+    tristate "FSC Loox 720 Flash ROM"
+    select MTD
+    select MTD_CFI
+    select MTD_PARTITIONS
+    select MTD_CFI_INTELEXT
+    select MTD_PXA2XX
+    depends on MACH_LOOX720
+    help
+        FSC Loox 720 internal flash ROM support.
+
+
+config DRAM_BASE
+    hex '(S)DRAM Base Address'
+    depends on MACH_LOOX720
+    default 0xa8000000
+    help
+        On the Loox 720, RAM starts at 0xa8000000. But if you use
+        Haret prior to 0.4.9, set this to 0xaa000000, ot loox won't
+        boot. Also you will have to change DRAM Size value.
+
+config DRAM_SIZE
+    hex '(S)DRAM Size'
+    depends on MACH_LOOX720
+    default 0x8000000
+    help
+        The loox has 128 MB memory but due to some problems we set
+        the value to 96 MB. If you use Haret prior to 0.4.9, set this
+        to 0x6000000, ot loox won't boot.
+        Also you will have to change DRAM Base Address value.
+
+config LOOX720_LIMIT_CPUFREQ
+        bool 'Limit high CPU frequency to 520MHz'
+        depends on MACH_LOOX720
+        default yes
+        help
+                Not all LOOX pdas work on 624MHz. So, to avoid hangs, enable this.
+
+config LOOX720_GPIOED
+        tristate 'access GPIO from userland'
+        depends on MACH_LOOX720
+        default m
+        help
+                Enable this to allow GPIO access from userland.
+
+config LOOX720_CPLD_EDIT
+        tristate 'access CPLD bits from userland'
+        depends on MACH_LOOX720
+        default m
+        help
+                Enable this to allow CPLD bits access from userland.
+
+endmenu

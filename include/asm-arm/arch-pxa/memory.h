@@ -15,7 +15,11 @@
 /*
  * Physical DRAM offset.
  */
+#ifdef CONFIG_DRAM_BASE
+#define PHYS_OFFSET ( CONFIG_DRAM_BASE )
+#else
 #define PHYS_OFFSET	UL(0xa0000000)
+#endif
 
 /*
  * Virtual view <-> DMA view memory address translations

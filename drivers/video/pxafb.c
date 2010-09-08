@@ -983,6 +983,8 @@ static void pxafb_enable_controller(struct pxafb_info *fbi)
 	pr_debug("reg_lccr1 0x%08x\n", (unsigned int) fbi->reg_lccr1);
 	pr_debug("reg_lccr2 0x%08x\n", (unsigned int) fbi->reg_lccr2);
 	pr_debug("reg_lccr3 0x%08x\n", (unsigned int) fbi->reg_lccr3);
+	pr_debug("reg_lccr4 0x%08x\n", (unsigned int) fbi->reg_lccr4);
+	pr_debug("reg_lccr5 0x%08x\n", (unsigned int) fbi->reg_lccr5);
 
 	/* enable LCD controller clock */
 	clk_enable(fbi->clk);
@@ -991,6 +993,8 @@ static void pxafb_enable_controller(struct pxafb_info *fbi)
 		return;
 
 	/* Sequence from 11.7.10 */
+	lcd_writel(fbi, LCCR5, fbi->reg_lccr5);
+	lcd_writel(fbi, LCCR4, fbi->reg_lccr4);
 	lcd_writel(fbi, LCCR3, fbi->reg_lccr3);
 	lcd_writel(fbi, LCCR2, fbi->reg_lccr2);
 	lcd_writel(fbi, LCCR1, fbi->reg_lccr1);
@@ -1004,6 +1008,9 @@ static void pxafb_enable_controller(struct pxafb_info *fbi)
 static void pxafb_disable_controller(struct pxafb_info *fbi)
 {
 	uint32_t lccr0;
+
+	fbi->reg_lccr4=lcd_readl(fbi,LCCR4);
+	fbi->reg_lccr5=lcd_readl(fbi,LCCR5);
 
 #ifdef CONFIG_FB_PXA_SMARTPANEL
 	if (fbi->lccr0 & LCCR0_LCDT) {

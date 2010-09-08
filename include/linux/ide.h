@@ -131,7 +131,7 @@ struct ide_io_ports {
 /*
  * Timeouts for various operations:
  */
-#define WAIT_DRQ	(HZ/10)		/* 100msec - spec allows up to 20ms */
+#define WAIT_DRQ	(2*HZ/3)	/* 750msec - spec allows up to 20ms */
 #define WAIT_READY	(5*HZ)		/* 5sec - some laptops are very slow */
 #define WAIT_PIDENTIFY	(10*HZ)	/* 10sec  - should be less than 3ms (?), if all ATAPI CD is closed at boot */
 #define WAIT_WORSTCASE	(30*HZ)	/* 30sec  - worst case when spinning up */
