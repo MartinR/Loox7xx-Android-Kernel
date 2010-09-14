@@ -32,6 +32,13 @@
 #include <asm/spu_csa.h>
 #include <asm/spu_info.h>
 
+#define SPUFS_PS_MAP_SIZE	0x20000
+#define SPUFS_MFC_MAP_SIZE	0x1000
+#define SPUFS_CNTL_MAP_SIZE	0x1000
+#define SPUFS_CNTL_MAP_SIZE	0x1000
+#define SPUFS_SIGNAL_MAP_SIZE	PAGE_SIZE
+#define SPUFS_MSS_MAP_SIZE	0x1000
+
 /* The magic number for our file system */
 enum {
 	SPUFS_MAGIC = 0x23c9b64e,
@@ -58,7 +65,6 @@ enum {
 };
 
 struct switch_log {
-	spinlock_t		lock;
 	wait_queue_head_t	wait;
 	unsigned long		head;
 	unsigned long		tail;
@@ -228,8 +234,16 @@ struct spufs_inode_info {
 #define SPUFS_I(inode) \
 	container_of(inode, struct spufs_inode_info, vfs_inode)
 
-extern struct tree_descr spufs_dir_contents[];
-extern struct tree_descr spufs_dir_nosched_contents[];
+struct spufs_tree_descr {
+	const char *name;
+	const struct file_operations *ops;
+	int mode;
+	size_t size;
+};
+
+extern const struct spufs_tree_descr spufs_dir_contents[];
+extern const struct spufs_tree_descr spufs_dir_nosched_contents[];
+extern const struct spufs_tree_descr spufs_dir_debug_contents[];
 
 /* system call implementation */
 extern struct spufs_calls spufs_calls;
@@ -300,7 +314,7 @@ extern char *isolated_loader;
  *	we need to call spu_release(ctx) before sleeping, and
  *	then spu_acquire(ctx) when awoken.
  *
- * 	Returns with state_mutex re-acquired when successfull or
+ * 	Returns with state_mutex re-acquired when successful or
  * 	with -ERESTARTSYS and the state_mutex dropped when interrupted.
  */
 
@@ -344,7 +358,7 @@ struct spufs_coredump_reader {
 	u64 (*get)(struct spu_context *ctx);
 	size_t size;
 };
-extern struct spufs_coredump_reader spufs_coredump_read[];
+extern const struct spufs_coredump_reader spufs_coredump_read[];
 extern int spufs_coredump_num_notes;
 
 extern int spu_init_csa(struct spu_state *csa);
@@ -358,10 +372,5 @@ extern void spu_free_lscsa(struct spu_state *csa);
 
 extern void spuctx_switch_state(struct spu_context *ctx,
 		enum spu_utilization_state new_state);
-
-#define spu_context_trace(name, ctx, spu) \
-	trace_mark(name, "ctx %p spu %p", ctx, spu);
-#define spu_context_nospu_trace(name, ctx) \
-	trace_mark(name, "ctx %p", ctx);
 
 #endif

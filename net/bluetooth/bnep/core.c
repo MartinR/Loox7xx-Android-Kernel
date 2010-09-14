@@ -25,10 +25,6 @@
    SOFTWARE IS DISCLAIMED.
 */
 
-/*
- * $Id: core.c,v 1.20 2002/08/04 21:23:58 maxk Exp $
- */
-
 #include <linux/module.h>
 
 #include <linux/kernel.h>
@@ -56,12 +52,10 @@
 
 #include "bnep.h"
 
-#ifndef CONFIG_BT_BNEP_DEBUG
-#undef  BT_DBG
-#define BT_DBG(D...)
-#endif
+#define VERSION "1.3"
 
-#define VERSION "1.2"
+static int compress_src = 1;
+static int compress_dst = 1;
 
 static LIST_HEAD(bnep_session_list);
 static DECLARE_RWSEM(bnep_session_sem);
@@ -312,8 +306,7 @@ static inline int bnep_rx_frame(struct bnep_session *s, struct sk_buff *skb)
 	struct sk_buff *nskb;
 	u8 type;
 
-	dev->last_rx = jiffies;
-	s->stats.rx_bytes += skb->len;
+	dev->stats.rx_bytes += skb->len;
 
 	type = *(u8 *) skb->data; skb_pull(skb, 1);
 
@@ -350,7 +343,7 @@ static inline int bnep_rx_frame(struct bnep_session *s, struct sk_buff *skb)
 	 * may not be modified and because of the alignment requirements. */
 	nskb = alloc_skb(2 + ETH_HLEN + skb->len, GFP_KERNEL);
 	if (!nskb) {
-		s->stats.rx_dropped++;
+		dev->stats.rx_dropped++;
 		kfree_skb(skb);
 		return -ENOMEM;
 	}
@@ -385,14 +378,14 @@ static inline int bnep_rx_frame(struct bnep_session *s, struct sk_buff *skb)
 	skb_copy_from_linear_data(skb, __skb_put(nskb, skb->len), skb->len);
 	kfree_skb(skb);
 
-	s->stats.rx_packets++;
+	dev->stats.rx_packets++;
 	nskb->ip_summed = CHECKSUM_NONE;
 	nskb->protocol  = eth_type_trans(nskb, dev);
 	netif_rx_ni(nskb);
 	return 0;
 
 badframe:
-	s->stats.rx_errors++;
+	dev->stats.rx_errors++;
 	kfree_skb(skb);
 	return 0;
 }
@@ -422,10 +415,10 @@ static inline int bnep_tx_frame(struct bnep_session *s, struct sk_buff *skb)
 	iv[il++] = (struct kvec) { &type, 1 };
 	len++;
 
-	if (!compare_ether_addr(eh->h_dest, s->eh.h_source))
+	if (compress_src && !compare_ether_addr(eh->h_dest, s->eh.h_source))
 		type |= 0x01;
 
-	if (!compare_ether_addr(eh->h_source, s->eh.h_dest))
+	if (compress_dst && !compare_ether_addr(eh->h_source, s->eh.h_dest))
 		type |= 0x02;
 
 	if (type)
@@ -455,8 +448,8 @@ send:
 	kfree_skb(skb);
 
 	if (len > 0) {
-		s->stats.tx_bytes += len;
-		s->stats.tx_packets++;
+		s->dev->stats.tx_bytes += len;
+		s->dev->stats.tx_packets++;
 		return 0;
 	}
 
@@ -507,6 +500,11 @@ static int bnep_session(void *arg)
 	/* Delete network device */
 	unregister_netdev(dev);
 
+	/* Wakeup user-space polling for socket errors */
+	s->sock->sk->sk_err = EUNATCH;
+
+	wake_up_interruptible(s->sock->sk->sk_sleep);
+
 	/* Release the socket */
 	fput(s->sock->file);
 
@@ -535,6 +533,10 @@ static struct device *bnep_get_device(struct bnep_session *session)
 	return conn ? &conn->dev : NULL;
 }
 
+static struct device_type bnep_type = {
+	.name	= "bluetooth",
+};
+
 int bnep_add_connection(struct bnep_connadd_req *req, struct socket *sock)
 {
 	struct net_device *dev;
@@ -562,7 +564,7 @@ int bnep_add_connection(struct bnep_connadd_req *req, struct socket *sock)
 		goto failed;
 	}
 
-	s = dev->priv;
+	s = netdev_priv(dev);
 
 	/* This is rx header therefore addresses are swapped.
 	 * ie eh.h_dest is our local address. */
@@ -588,6 +590,7 @@ int bnep_add_connection(struct bnep_connadd_req *req, struct socket *sock)
 #endif
 
 	SET_NETDEV_DEV(dev, bnep_get_device(s));
+	SET_NETDEV_DEVTYPE(dev, &bnep_type);
 
 	err = register_netdev(dev);
 	if (err) {
@@ -726,7 +729,13 @@ static void __exit bnep_exit(void)
 module_init(bnep_init);
 module_exit(bnep_exit);
 
-MODULE_AUTHOR("David Libault <david.libault@inventel.fr>, Maxim Krasnyansky <maxk@qualcomm.com>");
+module_param(compress_src, bool, 0644);
+MODULE_PARM_DESC(compress_src, "Compress sources headers");
+
+module_param(compress_dst, bool, 0644);
+MODULE_PARM_DESC(compress_dst, "Compress destination headers");
+
+MODULE_AUTHOR("Marcel Holtmann <marcel@holtmann.org>");
 MODULE_DESCRIPTION("Bluetooth BNEP ver " VERSION);
 MODULE_VERSION(VERSION);
 MODULE_LICENSE("GPL");

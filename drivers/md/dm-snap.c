@@ -7,8 +7,8 @@
  */
 
 #include <linux/blkdev.h>
-#include <linux/ctype.h>
 #include <linux/device-mapper.h>
+#include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/kdev_t.h>
@@ -19,9 +19,9 @@
 #include <linux/vmalloc.h>
 #include <linux/log2.h>
 #include <linux/dm-kcopyd.h>
+#include <linux/workqueue.h>
 
-#include "dm-snap.h"
-#include "dm-bio-list.h"
+#include "dm-exception-store.h"
 
 #define DM_MSG_PREFIX "snapshots"
 
@@ -40,8 +40,80 @@
  */
 #define SNAPSHOT_PAGES (((1UL << 20) >> PAGE_SHIFT) ? : 1)
 
+/*
+ * The size of the mempool used to track chunks in use.
+ */
+#define MIN_IOS 256
+
+#define DM_TRACKED_CHUNK_HASH_SIZE	16
+#define DM_TRACKED_CHUNK_HASH(x)	((unsigned long)(x) & \
+					 (DM_TRACKED_CHUNK_HASH_SIZE - 1))
+
+struct exception_table {
+	uint32_t hash_mask;
+	unsigned hash_shift;
+	struct list_head *table;
+};
+
+struct dm_snapshot {
+	struct rw_semaphore lock;
+
+	struct dm_dev *origin;
+
+	/* List of snapshots per Origin */
+	struct list_head list;
+
+	/* You can't use a snapshot if this is 0 (e.g. if full) */
+	int valid;
+
+	/* Origin writes don't trigger exceptions until this is set */
+	int active;
+
+	mempool_t *pending_pool;
+
+	atomic_t pending_exceptions_count;
+
+	struct exception_table pending;
+	struct exception_table complete;
+
+	/*
+	 * pe_lock protects all pending_exception operations and access
+	 * as well as the snapshot_bios list.
+	 */
+	spinlock_t pe_lock;
+
+	/* The on disk metadata handler */
+	struct dm_exception_store *store;
+
+	struct dm_kcopyd_client *kcopyd_client;
+
+	/* Queue of snapshot writes for ksnapd to flush */
+	struct bio_list queued_bios;
+	struct work_struct queued_bios_work;
+
+	/* Chunks with outstanding reads */
+	mempool_t *tracked_chunk_pool;
+	spinlock_t tracked_chunk_lock;
+	struct hlist_head tracked_chunk_hash[DM_TRACKED_CHUNK_HASH_SIZE];
+};
+
 static struct workqueue_struct *ksnapd;
 static void flush_queued_bios(struct work_struct *work);
+
+static sector_t chunk_to_sector(struct dm_exception_store *store,
+				chunk_t chunk)
+{
+	return chunk << store->chunk_shift;
+}
+
+static int bdev_equal(struct block_device *lhs, struct block_device *rhs)
+{
+	/*
+	 * There is only ever one instance of a particular block
+	 * device so we can compare pointers safely.
+	 */
+	return lhs == rhs;
+}
 
 struct dm_snap_pending_exception {
 	struct dm_snap_exception e;
@@ -91,7 +163,63 @@ struct dm_snap_pending_exception {
  */
 static struct kmem_cache *exception_cache;
 static struct kmem_cache *pending_cache;
-static mempool_t *pending_pool;
+
+struct dm_snap_tracked_chunk {
+	struct hlist_node node;
+	chunk_t chunk;
+};
+
+static struct kmem_cache *tracked_chunk_cache;
+
+static struct dm_snap_tracked_chunk *track_chunk(struct dm_snapshot *s,
+						 chunk_t chunk)
+{
+	struct dm_snap_tracked_chunk *c = mempool_alloc(s->tracked_chunk_pool,
+							GFP_NOIO);
+	unsigned long flags;
+
+	c->chunk = chunk;
+
+	spin_lock_irqsave(&s->tracked_chunk_lock, flags);
+	hlist_add_head(&c->node,
+		       &s->tracked_chunk_hash[DM_TRACKED_CHUNK_HASH(chunk)]);
+	spin_unlock_irqrestore(&s->tracked_chunk_lock, flags);
+
+	return c;
+}
+
+static void stop_tracking_chunk(struct dm_snapshot *s,
+				struct dm_snap_tracked_chunk *c)
+{
+	unsigned long flags;
+
+	spin_lock_irqsave(&s->tracked_chunk_lock, flags);
+	hlist_del(&c->node);
+	spin_unlock_irqrestore(&s->tracked_chunk_lock, flags);
+
+	mempool_free(c, s->tracked_chunk_pool);
+}
+
+static int __chunk_is_tracked(struct dm_snapshot *s, chunk_t chunk)
+{
+	struct dm_snap_tracked_chunk *c;
+	struct hlist_node *hn;
+	int found = 0;
+
+	spin_lock_irq(&s->tracked_chunk_lock);
+
+	hlist_for_each_entry(c, hn,
+	    &s->tracked_chunk_hash[DM_TRACKED_CHUNK_HASH(chunk)], node) {
+		if (c->chunk == chunk) {
+			found = 1;
+			break;
+		}
+	}
+
+	spin_unlock_irq(&s->tracked_chunk_lock);
+
+	return found;
+}
 
 /*
  * One of these per registered origin, held in the snapshot_origins hash
@@ -168,19 +296,22 @@ static void __insert_origin(struct origin *o)
  */
 static int register_snapshot(struct dm_snapshot *snap)
 {
-	struct origin *o;
+	struct dm_snapshot *l;
+	struct origin *o, *new_o;
 	struct block_device *bdev = snap->origin->bdev;
+
+	new_o = kmalloc(sizeof(*new_o), GFP_KERNEL);
+	if (!new_o)
+		return -ENOMEM;
 
 	down_write(&_origins_lock);
 	o = __lookup_origin(bdev);
 
-	if (!o) {
+	if (o)
+		kfree(new_o);
+	else {
 		/* New origin */
-		o = kmalloc(sizeof(*o), GFP_KERNEL);
-		if (!o) {
-			up_write(&_origins_lock);
-			return -ENOMEM;
-		}
+		o = new_o;
 
 		/* Initialise the struct */
 		INIT_LIST_HEAD(&o->snapshots);
@@ -189,7 +320,11 @@ static int register_snapshot(struct dm_snapshot *snap)
 		__insert_origin(o);
 	}
 
-	list_add_tail(&snap->list, &o->snapshots);
+	/* Sort the list according to chunk size, largest-first smallest-last */
+	list_for_each_entry(l, &o->snapshots, list)
+		if (l->store->chunk_size < snap->store->chunk_size)
+			break;
+	list_add_tail(&snap->list, &l->list);
 
 	up_write(&_origins_lock);
 	return 0;
@@ -302,14 +437,24 @@ static void free_exception(struct dm_snap_exception *e)
 	kmem_cache_free(exception_cache, e);
 }
 
-static struct dm_snap_pending_exception *alloc_pending_exception(void)
+static struct dm_snap_pending_exception *alloc_pending_exception(struct dm_snapshot *s)
 {
-	return mempool_alloc(pending_pool, GFP_NOIO);
+	struct dm_snap_pending_exception *pe = mempool_alloc(s->pending_pool,
+							     GFP_NOIO);
+
+	atomic_inc(&s->pending_exceptions_count);
+	pe->snap = s;
+
+	return pe;
 }
 
 static void free_pending_exception(struct dm_snap_pending_exception *pe)
 {
-	mempool_free(pe, pending_pool);
+	struct dm_snapshot *s = pe->snap;
+
+	mempool_free(pe, s->pending_pool);
+	smp_mb__before_atomic_dec();
+	atomic_dec(&s->pending_exceptions_count);
 }
 
 static void insert_completed_exception(struct dm_snapshot *s,
@@ -355,8 +500,13 @@ out:
 	list_add(&new_e->hash_list, e ? &e->hash_list : l);
 }
 
-int dm_add_exception(struct dm_snapshot *s, chunk_t old, chunk_t new)
+/*
+ * Callback used by the exception stores to load exceptions when
+ * initialising.
+ */
+static int dm_add_exception(void *context, chunk_t old, chunk_t new)
 {
+	struct dm_snapshot *s = context;
 	struct dm_snap_exception *e;
 
 	e = alloc_exception();
@@ -396,11 +546,11 @@ static int init_hash_tables(struct dm_snapshot *s)
 	 * Calculate based on the size of the original volume or
 	 * the COW volume...
 	 */
-	cow_dev_size = get_dev_size(s->cow->bdev);
+	cow_dev_size = get_dev_size(s->store->cow->bdev);
 	origin_dev_size = get_dev_size(s->origin->bdev);
 	max_buckets = calc_max_buckets();
 
-	hash_size = min(origin_dev_size, cow_dev_size) >> s->chunk_shift;
+	hash_size = min(origin_dev_size, cow_dev_size) >> s->store->chunk_shift;
 	hash_size = min(hash_size, max_buckets);
 
 	hash_size = rounddown_pow_of_two(hash_size);
@@ -425,150 +575,96 @@ static int init_hash_tables(struct dm_snapshot *s)
 }
 
 /*
- * Round a number up to the nearest 'size' boundary.  size must
- * be a power of 2.
- */
-static ulong round_up(ulong n, ulong size)
-{
-	size--;
-	return (n + size) & ~size;
-}
-
-static int set_chunk_size(struct dm_snapshot *s, const char *chunk_size_arg,
-			  char **error)
-{
-	unsigned long chunk_size;
-	char *value;
-
-	chunk_size = simple_strtoul(chunk_size_arg, &value, 10);
-	if (*chunk_size_arg == '\0' || *value != '\0') {
-		*error = "Invalid chunk size";
-		return -EINVAL;
-	}
-
-	if (!chunk_size) {
-		s->chunk_size = s->chunk_mask = s->chunk_shift = 0;
-		return 0;
-	}
-
-	/*
-	 * Chunk size must be multiple of page size.  Silently
-	 * round up if it's not.
-	 */
-	chunk_size = round_up(chunk_size, PAGE_SIZE >> 9);
-
-	/* Check chunk_size is a power of 2 */
-	if (!is_power_of_2(chunk_size)) {
-		*error = "Chunk size is not a power of 2";
-		return -EINVAL;
-	}
-
-	/* Validate the chunk size against the device block size */
-	if (chunk_size % (bdev_hardsect_size(s->cow->bdev) >> 9)) {
-		*error = "Chunk size is not a multiple of device blocksize";
-		return -EINVAL;
-	}
-
-	s->chunk_size = chunk_size;
-	s->chunk_mask = chunk_size - 1;
-	s->chunk_shift = ffs(chunk_size) - 1;
-
-	return 0;
-}
-
-/*
  * Construct a snapshot mapping: <origin_dev> <COW-dev> <p/n> <chunk-size>
  */
 static int snapshot_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
 	struct dm_snapshot *s;
+	int i;
 	int r = -EINVAL;
-	char persistent;
 	char *origin_path;
-	char *cow_path;
+	struct dm_exception_store *store;
+	unsigned args_used;
 
 	if (argc != 4) {
 		ti->error = "requires exactly 4 arguments";
 		r = -EINVAL;
-		goto bad1;
+		goto bad_args;
 	}
 
 	origin_path = argv[0];
-	cow_path = argv[1];
-	persistent = toupper(*argv[2]);
+	argv++;
+	argc--;
 
-	if (persistent != 'P' && persistent != 'N') {
-		ti->error = "Persistent flag is not P or N";
+	r = dm_exception_store_create(ti, argc, argv, &args_used, &store);
+	if (r) {
+		ti->error = "Couldn't create exception store";
 		r = -EINVAL;
-		goto bad1;
+		goto bad_args;
 	}
 
+	argv += args_used;
+	argc -= args_used;
+
 	s = kmalloc(sizeof(*s), GFP_KERNEL);
-	if (s == NULL) {
+	if (!s) {
 		ti->error = "Cannot allocate snapshot context private "
 		    "structure";
 		r = -ENOMEM;
-		goto bad1;
+		goto bad_snap;
 	}
 
 	r = dm_get_device(ti, origin_path, 0, ti->len, FMODE_READ, &s->origin);
 	if (r) {
 		ti->error = "Cannot get origin device";
-		goto bad2;
+		goto bad_origin;
 	}
 
-	r = dm_get_device(ti, cow_path, 0, 0,
-			  FMODE_READ | FMODE_WRITE, &s->cow);
-	if (r) {
-		dm_put_device(ti, s->origin);
-		ti->error = "Cannot get COW device";
-		goto bad2;
-	}
-
-	r = set_chunk_size(s, argv[3], &ti->error);
-	if (r)
-		goto bad3;
-
-	s->type = persistent;
-
+	s->store = store;
 	s->valid = 1;
 	s->active = 0;
-	s->last_percent = 0;
+	atomic_set(&s->pending_exceptions_count, 0);
 	init_rwsem(&s->lock);
 	spin_lock_init(&s->pe_lock);
-	s->ti = ti;
 
 	/* Allocate hash table for COW data */
 	if (init_hash_tables(s)) {
 		ti->error = "Unable to allocate hash table space";
 		r = -ENOMEM;
-		goto bad3;
-	}
-
-	s->store.snap = s;
-
-	if (persistent == 'P')
-		r = dm_create_persistent(&s->store);
-	else
-		r = dm_create_transient(&s->store);
-
-	if (r) {
-		ti->error = "Couldn't create exception store";
-		r = -EINVAL;
-		goto bad4;
+		goto bad_hash_tables;
 	}
 
 	r = dm_kcopyd_client_create(SNAPSHOT_PAGES, &s->kcopyd_client);
 	if (r) {
 		ti->error = "Could not create kcopyd client";
-		goto bad5;
+		goto bad_kcopyd;
 	}
 
+	s->pending_pool = mempool_create_slab_pool(MIN_IOS, pending_cache);
+	if (!s->pending_pool) {
+		ti->error = "Could not allocate mempool for pending exceptions";
+		goto bad_pending_pool;
+	}
+
+	s->tracked_chunk_pool = mempool_create_slab_pool(MIN_IOS,
+							 tracked_chunk_cache);
+	if (!s->tracked_chunk_pool) {
+		ti->error = "Could not allocate tracked_chunk mempool for "
+			    "tracking reads";
+		goto bad_tracked_chunk_pool;
+	}
+
+	for (i = 0; i < DM_TRACKED_CHUNK_HASH_SIZE; i++)
+		INIT_HLIST_HEAD(&s->tracked_chunk_hash[i]);
+
+	spin_lock_init(&s->tracked_chunk_lock);
+
 	/* Metadata must only be loaded into one table at once */
-	r = s->store.read_metadata(&s->store);
+	r = s->store->type->read_metadata(s->store, dm_add_exception,
+					  (void *)s);
 	if (r < 0) {
 		ti->error = "Failed to read snapshot metadata";
-		goto bad6;
+		goto bad_load_and_register;
 	} else if (r > 0) {
 		s->valid = 0;
 		DMWARN("Snapshot is marked invalid.");
@@ -577,37 +673,48 @@ static int snapshot_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	bio_list_init(&s->queued_bios);
 	INIT_WORK(&s->queued_bios_work, flush_queued_bios);
 
+	if (!s->store->chunk_size) {
+		ti->error = "Chunk size not set";
+		goto bad_load_and_register;
+	}
+
 	/* Add snapshot to the list of snapshots for this origin */
 	/* Exceptions aren't triggered till snapshot_resume() is called */
 	if (register_snapshot(s)) {
 		r = -EINVAL;
 		ti->error = "Cannot register snapshot origin";
-		goto bad6;
+		goto bad_load_and_register;
 	}
 
 	ti->private = s;
-	ti->split_io = s->chunk_size;
+	ti->split_io = s->store->chunk_size;
+	ti->num_flush_requests = 1;
 
 	return 0;
 
- bad6:
+bad_load_and_register:
+	mempool_destroy(s->tracked_chunk_pool);
+
+bad_tracked_chunk_pool:
+	mempool_destroy(s->pending_pool);
+
+bad_pending_pool:
 	dm_kcopyd_client_destroy(s->kcopyd_client);
 
- bad5:
-	s->store.destroy(&s->store);
-
- bad4:
+bad_kcopyd:
 	exit_exception_table(&s->pending, pending_cache);
 	exit_exception_table(&s->complete, exception_cache);
 
- bad3:
-	dm_put_device(ti, s->cow);
+bad_hash_tables:
 	dm_put_device(ti, s->origin);
 
- bad2:
+bad_origin:
 	kfree(s);
 
- bad1:
+bad_snap:
+	dm_exception_store_destroy(store);
+
+bad_args:
 	return r;
 }
 
@@ -618,12 +725,13 @@ static void __free_exceptions(struct dm_snapshot *s)
 
 	exit_exception_table(&s->pending, pending_cache);
 	exit_exception_table(&s->complete, exception_cache);
-
-	s->store.destroy(&s->store);
 }
 
 static void snapshot_dtr(struct dm_target *ti)
 {
+#ifdef CONFIG_DM_DEBUG
+	int i;
+#endif
 	struct dm_snapshot *s = ti->private;
 
 	flush_workqueue(ksnapd);
@@ -632,10 +740,28 @@ static void snapshot_dtr(struct dm_target *ti)
 	/* After this returns there can be no new kcopyd jobs. */
 	unregister_snapshot(s);
 
+	while (atomic_read(&s->pending_exceptions_count))
+		msleep(1);
+	/*
+	 * Ensure instructions in mempool_destroy aren't reordered
+	 * before atomic_read.
+	 */
+	smp_mb();
+
+#ifdef CONFIG_DM_DEBUG
+	for (i = 0; i < DM_TRACKED_CHUNK_HASH_SIZE; i++)
+		BUG_ON(!hlist_empty(&s->tracked_chunk_hash[i]));
+#endif
+
+	mempool_destroy(s->tracked_chunk_pool);
+
 	__free_exceptions(s);
 
+	mempool_destroy(s->pending_pool);
+
 	dm_put_device(ti, s->origin);
-	dm_put_device(ti, s->cow);
+
+	dm_exception_store_destroy(s->store);
 
 	kfree(s);
 }
@@ -694,12 +820,12 @@ static void __invalidate_snapshot(struct dm_snapshot *s, int err)
 	else if (err == -ENOMEM)
 		DMERR("Invalidating snapshot: Unable to allocate exception.");
 
-	if (s->store.drop_snapshot)
-		s->store.drop_snapshot(&s->store);
+	if (s->store->type->drop_snapshot)
+		s->store->type->drop_snapshot(s->store);
 
 	s->valid = 0;
 
-	dm_table_event(s->ti->table);
+	dm_table_event(s->store->ti->table);
 }
 
 static void get_pending_exception(struct dm_snap_pending_exception *pe)
@@ -720,8 +846,10 @@ static struct bio *put_pending_exception(struct dm_snap_pending_exception *pe)
 	 * the bios for the original write to the origin.
 	 */
 	if (primary_pe &&
-	    atomic_dec_and_test(&primary_pe->ref_count))
+	    atomic_dec_and_test(&primary_pe->ref_count)) {
 		origin_bios = bio_list_get(&primary_pe->origin_bios);
+		free_pending_exception(primary_pe);
+	}
 
 	/*
 	 * Free the pe if it's not linked to an origin write or if
@@ -729,12 +857,6 @@ static struct bio *put_pending_exception(struct dm_snap_pending_exception *pe)
 	 */
 	if (!primary_pe || primary_pe != pe)
 		free_pending_exception(pe);
-
-	/*
-	 * Free the primary pe if nothing references it.
-	 */
-	if (primary_pe && !atomic_read(&primary_pe->ref_count))
-		free_pending_exception(primary_pe);
 
 	return origin_bios;
 }
@@ -770,6 +892,13 @@ static void pending_complete(struct dm_snap_pending_exception *pe, int success)
 		error = 1;
 		goto out;
 	}
+
+	/*
+	 * Check for conflicting reads. This is extremely improbable,
+	 * so msleep(1) is sufficient and there is no need for a wait queue.
+	 */
+	while (__chunk_is_tracked(s, pe->e.old_chunk))
+		msleep(1);
 
 	/*
 	 * Add a proper exception, and remove the
@@ -814,8 +943,8 @@ static void copy_callback(int read_err, unsigned long write_err, void *context)
 
 	else
 		/* Update the metadata if we are persistent */
-		s->store.commit_exception(&s->store, &pe->e, commit_callback,
-					  pe);
+		s->store->type->commit_exception(s->store, &pe->e,
+						 commit_callback, pe);
 }
 
 /*
@@ -831,16 +960,27 @@ static void start_copy(struct dm_snap_pending_exception *pe)
 	dev_size = get_dev_size(bdev);
 
 	src.bdev = bdev;
-	src.sector = chunk_to_sector(s, pe->e.old_chunk);
-	src.count = min(s->chunk_size, dev_size - src.sector);
+	src.sector = chunk_to_sector(s->store, pe->e.old_chunk);
+	src.count = min((sector_t)s->store->chunk_size, dev_size - src.sector);
 
-	dest.bdev = s->cow->bdev;
-	dest.sector = chunk_to_sector(s, pe->e.new_chunk);
+	dest.bdev = s->store->cow->bdev;
+	dest.sector = chunk_to_sector(s->store, pe->e.new_chunk);
 	dest.count = src.count;
 
 	/* Hand over to kcopyd */
 	dm_kcopyd_copy(s->kcopyd_client,
 		    &src, 1, &dest, 0, copy_callback, pe);
+}
+
+static struct dm_snap_pending_exception *
+__lookup_pending_exception(struct dm_snapshot *s, chunk_t chunk)
+{
+	struct dm_snap_exception *e = lookup_exception(&s->pending, chunk);
+
+	if (!e)
+		return NULL;
+
+	return container_of(e, struct dm_snap_pending_exception, e);
 }
 
 /*
@@ -852,40 +992,15 @@ static void start_copy(struct dm_snap_pending_exception *pe)
  * this.
  */
 static struct dm_snap_pending_exception *
-__find_pending_exception(struct dm_snapshot *s, struct bio *bio)
+__find_pending_exception(struct dm_snapshot *s,
+			 struct dm_snap_pending_exception *pe, chunk_t chunk)
 {
-	struct dm_snap_exception *e;
-	struct dm_snap_pending_exception *pe;
-	chunk_t chunk = sector_to_chunk(s, bio->bi_sector);
+	struct dm_snap_pending_exception *pe2;
 
-	/*
-	 * Is there a pending exception for this already ?
-	 */
-	e = lookup_exception(&s->pending, chunk);
-	if (e) {
-		/* cast the exception to a pending exception */
-		pe = container_of(e, struct dm_snap_pending_exception, e);
-		goto out;
-	}
-
-	/*
-	 * Create a new pending exception, we don't want
-	 * to hold the lock while we do this.
-	 */
-	up_write(&s->lock);
-	pe = alloc_pending_exception();
-	down_write(&s->lock);
-
-	if (!s->valid) {
+	pe2 = __lookup_pending_exception(s, chunk);
+	if (pe2) {
 		free_pending_exception(pe);
-		return NULL;
-	}
-
-	e = lookup_exception(&s->pending, chunk);
-	if (e) {
-		free_pending_exception(pe);
-		pe = container_of(e, struct dm_snap_pending_exception, e);
-		goto out;
+		return pe2;
 	}
 
 	pe->e.old_chunk = chunk;
@@ -893,10 +1008,9 @@ __find_pending_exception(struct dm_snapshot *s, struct bio *bio)
 	bio_list_init(&pe->snapshot_bios);
 	pe->primary_pe = NULL;
 	atomic_set(&pe->ref_count, 0);
-	pe->snap = s;
 	pe->started = 0;
 
-	if (s->store.prepare_exception(&s->store, &pe->e)) {
+	if (s->store->type->prepare_exception(s->store, &pe->e)) {
 		free_pending_exception(pe);
 		return NULL;
 	}
@@ -904,17 +1018,18 @@ __find_pending_exception(struct dm_snapshot *s, struct bio *bio)
 	get_pending_exception(pe);
 	insert_exception(&s->pending, &pe->e);
 
- out:
 	return pe;
 }
 
 static void remap_exception(struct dm_snapshot *s, struct dm_snap_exception *e,
 			    struct bio *bio, chunk_t chunk)
 {
-	bio->bi_bdev = s->cow->bdev;
-	bio->bi_sector = chunk_to_sector(s, dm_chunk_number(e->new_chunk) +
-			 (chunk - e->old_chunk)) +
-			 (bio->bi_sector & s->chunk_mask);
+	bio->bi_bdev = s->store->cow->bdev;
+	bio->bi_sector = chunk_to_sector(s->store,
+					 dm_chunk_number(e->new_chunk) +
+					 (chunk - e->old_chunk)) +
+					 (bio->bi_sector &
+					  s->store->chunk_mask);
 }
 
 static int snapshot_map(struct dm_target *ti, struct bio *bio,
@@ -926,7 +1041,12 @@ static int snapshot_map(struct dm_target *ti, struct bio *bio,
 	chunk_t chunk;
 	struct dm_snap_pending_exception *pe = NULL;
 
-	chunk = sector_to_chunk(s, bio->bi_sector);
+	if (unlikely(bio_empty_barrier(bio))) {
+		bio->bi_bdev = s->store->cow->bdev;
+		return DM_MAPIO_REMAPPED;
+	}
+
+	chunk = sector_to_chunk(s->store, bio->bi_sector);
 
 	/* Full snapshots are not usable */
 	/* To get here the table must be live so s->active is always set. */
@@ -955,11 +1075,31 @@ static int snapshot_map(struct dm_target *ti, struct bio *bio,
 	 * writeable.
 	 */
 	if (bio_rw(bio) == WRITE) {
-		pe = __find_pending_exception(s, bio);
+		pe = __lookup_pending_exception(s, chunk);
 		if (!pe) {
-			__invalidate_snapshot(s, -ENOMEM);
-			r = -EIO;
-			goto out_unlock;
+			up_write(&s->lock);
+			pe = alloc_pending_exception(s);
+			down_write(&s->lock);
+
+			if (!s->valid) {
+				free_pending_exception(pe);
+				r = -EIO;
+				goto out_unlock;
+			}
+
+			e = lookup_exception(&s->complete, chunk);
+			if (e) {
+				free_pending_exception(pe);
+				remap_exception(s, e, bio, chunk);
+				goto out_unlock;
+			}
+
+			pe = __find_pending_exception(s, pe, chunk);
+			if (!pe) {
+				__invalidate_snapshot(s, -ENOMEM);
+				r = -EIO;
+				goto out_unlock;
+			}
 		}
 
 		remap_exception(s, &pe->e, bio, chunk);
@@ -974,19 +1114,27 @@ static int snapshot_map(struct dm_target *ti, struct bio *bio,
 			start_copy(pe);
 			goto out;
 		}
-	} else
-		/*
-		 * FIXME: this read path scares me because we
-		 * always use the origin when we have a pending
-		 * exception.  However I can't think of a
-		 * situation where this is wrong - ejt.
-		 */
+	} else {
 		bio->bi_bdev = s->origin->bdev;
+		map_context->ptr = track_chunk(s, chunk);
+	}
 
  out_unlock:
 	up_write(&s->lock);
  out:
 	return r;
+}
+
+static int snapshot_end_io(struct dm_target *ti, struct bio *bio,
+			   int error, union map_info *map_context)
+{
+	struct dm_snapshot *s = ti->private;
+	struct dm_snap_tracked_chunk *c = map_context->ptr;
+
+	if (c)
+		stop_tracking_chunk(s, c);
+
+	return 0;
 }
 
 static void snapshot_resume(struct dm_target *ti)
@@ -1001,24 +1149,27 @@ static void snapshot_resume(struct dm_target *ti)
 static int snapshot_status(struct dm_target *ti, status_type_t type,
 			   char *result, unsigned int maxlen)
 {
+	unsigned sz = 0;
 	struct dm_snapshot *snap = ti->private;
+
+	down_write(&snap->lock);
 
 	switch (type) {
 	case STATUSTYPE_INFO:
 		if (!snap->valid)
-			snprintf(result, maxlen, "Invalid");
+			DMEMIT("Invalid");
 		else {
-			if (snap->store.fraction_full) {
+			if (snap->store->type->fraction_full) {
 				sector_t numerator, denominator;
-				snap->store.fraction_full(&snap->store,
-							  &numerator,
-							  &denominator);
-				snprintf(result, maxlen, "%llu/%llu",
-					(unsigned long long)numerator,
-					(unsigned long long)denominator);
+				snap->store->type->fraction_full(snap->store,
+								 &numerator,
+								 &denominator);
+				DMEMIT("%llu/%llu",
+				       (unsigned long long)numerator,
+				       (unsigned long long)denominator);
 			}
 			else
-				snprintf(result, maxlen, "Unknown");
+				DMEMIT("Unknown");
 		}
 		break;
 
@@ -1028,15 +1179,25 @@ static int snapshot_status(struct dm_target *ti, status_type_t type,
 		 * to make private copies if the output is to
 		 * make sense.
 		 */
-		snprintf(result, maxlen, "%s %s %c %llu",
-			 snap->origin->name, snap->cow->name,
-			 snap->type,
-			 (unsigned long long)snap->chunk_size);
+		DMEMIT("%s", snap->origin->name);
+		snap->store->type->status(snap->store, type, result + sz,
+					  maxlen - sz);
 		break;
 	}
 
+	up_write(&snap->lock);
+
 	return 0;
 }
+
+static int snapshot_iterate_devices(struct dm_target *ti,
+				    iterate_devices_callout_fn fn, void *data)
+{
+	struct dm_snapshot *snap = ti->private;
+
+	return fn(ti, snap->origin, 0, ti->len, data);
+}
+
 
 /*-----------------------------------------------------------------
  * Origin methods
@@ -1060,14 +1221,14 @@ static int __origin_write(struct list_head *snapshots, struct bio *bio)
 			goto next_snapshot;
 
 		/* Nothing to do if writing beyond end of snapshot */
-		if (bio->bi_sector >= dm_table_get_size(snap->ti->table))
+		if (bio->bi_sector >= dm_table_get_size(snap->store->ti->table))
 			goto next_snapshot;
 
 		/*
 		 * Remember, different snapshots can have
 		 * different chunk sizes.
 		 */
-		chunk = sector_to_chunk(snap, bio->bi_sector);
+		chunk = sector_to_chunk(snap->store, bio->bi_sector);
 
 		/*
 		 * Check exception table to see if block
@@ -1081,10 +1242,28 @@ static int __origin_write(struct list_head *snapshots, struct bio *bio)
 		if (e)
 			goto next_snapshot;
 
-		pe = __find_pending_exception(snap, bio);
+		pe = __lookup_pending_exception(snap, chunk);
 		if (!pe) {
-			__invalidate_snapshot(snap, -ENOMEM);
-			goto next_snapshot;
+			up_write(&snap->lock);
+			pe = alloc_pending_exception(snap);
+			down_write(&snap->lock);
+
+			if (!snap->valid) {
+				free_pending_exception(pe);
+				goto next_snapshot;
+			}
+
+			e = lookup_exception(&snap->complete, chunk);
+			if (e) {
+				free_pending_exception(pe);
+				goto next_snapshot;
+			}
+
+			pe = __find_pending_exception(snap, pe, chunk);
+			if (!pe) {
+				__invalidate_snapshot(snap, -ENOMEM);
+				goto next_snapshot;
+			}
 		}
 
 		if (!primary_pe) {
@@ -1188,6 +1367,8 @@ static int origin_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 	}
 
 	ti->private = dev;
+	ti->num_flush_requests = 1;
+
 	return 0;
 }
 
@@ -1202,6 +1383,9 @@ static int origin_map(struct dm_target *ti, struct bio *bio,
 {
 	struct dm_dev *dev = ti->private;
 	bio->bi_bdev = dev->bdev;
+
+	if (unlikely(bio_empty_barrier(bio)))
+		return DM_MAPIO_REMAPPED;
 
 	/* Only tell snapshots if this is a write */
 	return (bio_rw(bio) == WRITE) ? do_origin(dev, bio) : DM_MAPIO_REMAPPED;
@@ -1218,13 +1402,14 @@ static void origin_resume(struct dm_target *ti)
 	struct dm_dev *dev = ti->private;
 	struct dm_snapshot *snap;
 	struct origin *o;
-	chunk_t chunk_size = 0;
+	unsigned chunk_size = 0;
 
 	down_read(&_origins_lock);
 	o = __lookup_origin(dev->bdev);
 	if (o)
 		list_for_each_entry (snap, &o->snapshots, list)
-			chunk_size = min_not_zero(chunk_size, snap->chunk_size);
+			chunk_size = min_not_zero(chunk_size,
+						  snap->store->chunk_size);
 	up_read(&_origins_lock);
 
 	ti->split_io = chunk_size;
@@ -1248,36 +1433,53 @@ static int origin_status(struct dm_target *ti, status_type_t type, char *result,
 	return 0;
 }
 
+static int origin_iterate_devices(struct dm_target *ti,
+				  iterate_devices_callout_fn fn, void *data)
+{
+	struct dm_dev *dev = ti->private;
+
+	return fn(ti, dev, 0, ti->len, data);
+}
+
 static struct target_type origin_target = {
 	.name    = "snapshot-origin",
-	.version = {1, 6, 0},
+	.version = {1, 7, 0},
 	.module  = THIS_MODULE,
 	.ctr     = origin_ctr,
 	.dtr     = origin_dtr,
 	.map     = origin_map,
 	.resume  = origin_resume,
 	.status  = origin_status,
+	.iterate_devices = origin_iterate_devices,
 };
 
 static struct target_type snapshot_target = {
 	.name    = "snapshot",
-	.version = {1, 6, 0},
+	.version = {1, 7, 0},
 	.module  = THIS_MODULE,
 	.ctr     = snapshot_ctr,
 	.dtr     = snapshot_dtr,
 	.map     = snapshot_map,
+	.end_io  = snapshot_end_io,
 	.resume  = snapshot_resume,
 	.status  = snapshot_status,
+	.iterate_devices = snapshot_iterate_devices,
 };
 
 static int __init dm_snapshot_init(void)
 {
 	int r;
 
+	r = dm_exception_store_init();
+	if (r) {
+		DMERR("Failed to initialize exception stores");
+		return r;
+	}
+
 	r = dm_register_target(&snapshot_target);
 	if (r) {
 		DMERR("snapshot target register failed %d", r);
-		return r;
+		goto bad_register_snapshot_target;
 	}
 
 	r = dm_register_target(&origin_target);
@@ -1306,9 +1508,9 @@ static int __init dm_snapshot_init(void)
 		goto bad4;
 	}
 
-	pending_pool = mempool_create_slab_pool(128, pending_cache);
-	if (!pending_pool) {
-		DMERR("Couldn't create pending pool.");
+	tracked_chunk_cache = KMEM_CACHE(dm_snap_tracked_chunk, 0);
+	if (!tracked_chunk_cache) {
+		DMERR("Couldn't create cache to track chunks in use.");
 		r = -ENOMEM;
 		goto bad5;
 	}
@@ -1317,44 +1519,42 @@ static int __init dm_snapshot_init(void)
 	if (!ksnapd) {
 		DMERR("Failed to create ksnapd workqueue.");
 		r = -ENOMEM;
-		goto bad6;
+		goto bad_pending_pool;
 	}
 
 	return 0;
 
-      bad6:
-	mempool_destroy(pending_pool);
-      bad5:
+bad_pending_pool:
+	kmem_cache_destroy(tracked_chunk_cache);
+bad5:
 	kmem_cache_destroy(pending_cache);
-      bad4:
+bad4:
 	kmem_cache_destroy(exception_cache);
-      bad3:
+bad3:
 	exit_origin_hash();
-      bad2:
+bad2:
 	dm_unregister_target(&origin_target);
-      bad1:
+bad1:
 	dm_unregister_target(&snapshot_target);
+
+bad_register_snapshot_target:
+	dm_exception_store_exit();
 	return r;
 }
 
 static void __exit dm_snapshot_exit(void)
 {
-	int r;
-
 	destroy_workqueue(ksnapd);
 
-	r = dm_unregister_target(&snapshot_target);
-	if (r)
-		DMERR("snapshot unregister failed %d", r);
-
-	r = dm_unregister_target(&origin_target);
-	if (r)
-		DMERR("origin unregister failed %d", r);
+	dm_unregister_target(&snapshot_target);
+	dm_unregister_target(&origin_target);
 
 	exit_origin_hash();
-	mempool_destroy(pending_pool);
 	kmem_cache_destroy(pending_cache);
 	kmem_cache_destroy(exception_cache);
+	kmem_cache_destroy(tracked_chunk_cache);
+
+	dm_exception_store_exit();
 }
 
 /* Module hooks */

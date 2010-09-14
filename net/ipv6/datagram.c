@@ -5,8 +5,6 @@
  *	Authors:
  *	Pedro Roque		<roque@di.fc.ul.pt>
  *
- *	$Id: datagram.c,v 1.24 2002/02/01 22:01:04 davem Exp $
- *
  *	This program is free software; you can redistribute it and/or
  *      modify it under the terms of the GNU General Public License
  *      as published by the Free Software Foundation; either version
@@ -177,7 +175,8 @@ ipv4_connected:
 	if (final_p)
 		ipv6_addr_copy(&fl.fl6_dst, final_p);
 
-	if ((err = __xfrm_lookup(&dst, &fl, sk, XFRM_LOOKUP_WAIT)) < 0) {
+	err = __xfrm_lookup(sock_net(sk), &dst, &fl, sk, XFRM_LOOKUP_WAIT);
+	if (err < 0) {
 		if (err == -EREMOTE)
 			err = ip6_dst_blackhole(sk, &dst, &fl);
 		if (err < 0)
@@ -663,6 +662,11 @@ int datagram_send_ctl(struct net *net,
 			switch (rthdr->type) {
 #if defined(CONFIG_IPV6_MIP6) || defined(CONFIG_IPV6_MIP6_MODULE)
 			case IPV6_SRCRT_TYPE_2:
+				if (rthdr->hdrlen != 2 ||
+				    rthdr->segments_left != 1) {
+					err = -EINVAL;
+					goto exit_f;
+				}
 				break;
 #endif
 			default:
@@ -734,7 +738,7 @@ int datagram_send_ctl(struct net *net,
 			LIMIT_NETDEBUG(KERN_DEBUG "invalid cmsg type: %d\n",
 				       cmsg->cmsg_type);
 			err = -EINVAL;
-			break;
+			goto exit_f;
 		}
 	}
 

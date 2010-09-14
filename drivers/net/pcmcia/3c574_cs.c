@@ -85,6 +85,7 @@ earlier 3Com products.
 #include <linux/ioport.h>
 #include <linux/ethtool.h>
 #include <linux/bitops.h>
+#include <linux/mii.h>
 
 #include <pcmcia/cs_types.h>
 #include <pcmcia/cs.h>
@@ -208,7 +209,6 @@ enum Window4 {		/* Window 4: Xcvr/media bits. */
 struct el3_private {
 	struct pcmcia_device	*p_dev;
 	dev_node_t node;
-	struct net_device_stats stats;
 	u16 advertising, partner;		/* NWay media advertisement */
 	unsigned char phys;			/* MII device address */
 	unsigned int autoselect:1, default_media:3;	/* Read from the EEPROM/Wn3_Config. */
@@ -240,7 +240,8 @@ static void tc574_wait_for_completion(struct net_device *dev, int cmd);
 static void tc574_reset(struct net_device *dev);
 static void media_check(unsigned long arg);
 static int el3_open(struct net_device *dev);
-static int el3_start_xmit(struct sk_buff *skb, struct net_device *dev);
+static netdev_tx_t el3_start_xmit(struct sk_buff *skb,
+					struct net_device *dev);
 static irqreturn_t el3_interrupt(int irq, void *dev_id);
 static void update_stats(struct net_device *dev);
 static struct net_device_stats *el3_get_stats(struct net_device *dev);
@@ -250,6 +251,7 @@ static void el3_tx_timeout(struct net_device *dev);
 static int el3_ioctl(struct net_device *dev, struct ifreq *rq, int cmd);
 static const struct ethtool_ops netdev_ethtool_ops;
 static void set_rx_mode(struct net_device *dev);
+static void set_multicast_list(struct net_device *dev);
 
 static void tc574_detach(struct pcmcia_device *p_dev);
 
@@ -258,6 +260,18 @@ static void tc574_detach(struct pcmcia_device *p_dev);
 	local data structures for one device.  The device is registered
 	with Card Services.
 */
+static const struct net_device_ops el3_netdev_ops = {
+	.ndo_open 		= el3_open,
+	.ndo_stop 		= el3_close,
+	.ndo_start_xmit		= el3_start_xmit,
+	.ndo_tx_timeout 	= el3_tx_timeout,
+	.ndo_get_stats		= el3_get_stats,
+	.ndo_do_ioctl		= el3_ioctl,
+	.ndo_set_multicast_list = set_multicast_list,
+	.ndo_change_mtu		= eth_change_mtu,
+	.ndo_set_mac_address 	= eth_mac_addr,
+	.ndo_validate_addr	= eth_validate_addr,
+};
 
 static int tc574_probe(struct pcmcia_device *link)
 {
@@ -285,18 +299,9 @@ static int tc574_probe(struct pcmcia_device *link)
 	link->conf.IntType = INT_MEMORY_AND_IO;
 	link->conf.ConfigIndex = 1;
 
-	/* The EL3-specific entries in the device structure. */
-	dev->hard_start_xmit = &el3_start_xmit;
-	dev->get_stats = &el3_get_stats;
-	dev->do_ioctl = &el3_ioctl;
+	dev->netdev_ops = &el3_netdev_ops;
 	SET_ETHTOOL_OPS(dev, &netdev_ethtool_ops);
-	dev->set_multicast_list = &set_rx_mode;
-	dev->open = &el3_open;
-	dev->stop = &el3_close;
-#ifdef HAVE_TX_TIMEOUT
-	dev->tx_timeout = el3_tx_timeout;
 	dev->watchdog_timeo = TX_TIMEOUT;
-#endif
 
 	return tc574_config(link);
 } /* tc574_attach */
@@ -346,7 +351,6 @@ static int tc574_config(struct pcmcia_device *link)
 	__be16 *phys_addr;
 	char *cardname;
 	__u32 config;
-	DECLARE_MAC_BUF(mac);
 
 	phys_addr = (__be16 *)dev->dev_addr;
 
@@ -356,9 +360,10 @@ static int tc574_config(struct pcmcia_device *link)
 	for (i = j = 0; j < 0x400; j += 0x20) {
 		link->io.BasePort1 = j ^ 0x300;
 		i = pcmcia_request_io(link, &link->io);
-		if (i == CS_SUCCESS) break;
+		if (i == 0)
+			break;
 	}
-	if (i != CS_SUCCESS) {
+	if (i != 0) {
 		cs_error(link, RequestIO, i);
 		goto failed;
 	}
@@ -378,7 +383,7 @@ static int tc574_config(struct pcmcia_device *link)
 	tuple.TupleDataMax = 64;
 	tuple.TupleOffset = 0;
 	tuple.DesiredTuple = 0x88;
-	if (pcmcia_get_first_tuple(link, &tuple) == CS_SUCCESS) {
+	if (pcmcia_get_first_tuple(link, &tuple) == 0) {
 		pcmcia_get_tuple_data(link, &tuple);
 		for (i = 0; i < 3; i++)
 			phys_addr[i] = htons(le16_to_cpu(buf[i]));
@@ -463,9 +468,9 @@ static int tc574_config(struct pcmcia_device *link)
 	strcpy(lp->node.dev_name, dev->name);
 
 	printk(KERN_INFO "%s: %s at io %#3lx, irq %d, "
-	       "hw_addr %s.\n",
+	       "hw_addr %pM.\n",
 	       dev->name, cardname, dev->base_addr, dev->irq,
-	       print_mac(mac, dev->dev_addr));
+	       dev->dev_addr);
 	printk(" %dK FIFO split %s Rx:Tx, %sMII interface.\n",
 		   8 << config & Ram_size,
 		   ram_split[(config & Ram_split) >> Ram_split_shift],
@@ -741,12 +746,11 @@ static int el3_open(struct net_device *dev)
 
 static void el3_tx_timeout(struct net_device *dev)
 {
-	struct el3_private *lp = netdev_priv(dev);
 	unsigned int ioaddr = dev->base_addr;
 	
 	printk(KERN_NOTICE "%s: Transmit timed out!\n", dev->name);
 	dump_status(dev);
-	lp->stats.tx_errors++;
+	dev->stats.tx_errors++;
 	dev->trans_start = jiffies;
 	/* Issue TX_RESET and TX_START commands. */
 	tc574_wait_for_completion(dev, TxReset);
@@ -756,7 +760,6 @@ static void el3_tx_timeout(struct net_device *dev)
 
 static void pop_tx_status(struct net_device *dev)
 {
-	struct el3_private *lp = netdev_priv(dev);
 	unsigned int ioaddr = dev->base_addr;
 	int i;
     
@@ -772,13 +775,14 @@ static void pop_tx_status(struct net_device *dev)
 			DEBUG(1, "%s: transmit error: status 0x%02x\n",
 				  dev->name, tx_status);
 			outw(TxEnable, ioaddr + EL3_CMD);
-			lp->stats.tx_aborted_errors++;
+			dev->stats.tx_aborted_errors++;
 		}
 		outb(0x00, ioaddr + TxStatus); /* Pop the status stack. */
 	}
 }
 
-static int el3_start_xmit(struct sk_buff *skb, struct net_device *dev)
+static netdev_tx_t el3_start_xmit(struct sk_buff *skb,
+					struct net_device *dev)
 {
 	unsigned int ioaddr = dev->base_addr;
 	struct el3_private *lp = netdev_priv(dev);
@@ -806,7 +810,7 @@ static int el3_start_xmit(struct sk_buff *skb, struct net_device *dev)
 	pop_tx_status(dev);
 	spin_unlock_irqrestore(&lp->window_lock, flags);
 	dev_kfree_skb(skb);
-	return 0;
+	return NETDEV_TX_OK;
 }
 
 /* The EL3 interrupt handler. */
@@ -987,7 +991,7 @@ static struct net_device_stats *el3_get_stats(struct net_device *dev)
 		update_stats(dev);
 		spin_unlock_irqrestore(&lp->window_lock, flags);
 	}
-	return &lp->stats;
+	return &dev->stats;
 }
 
 /*  Update statistics.
@@ -996,7 +1000,6 @@ static struct net_device_stats *el3_get_stats(struct net_device *dev)
  */
 static void update_stats(struct net_device *dev)
 {
-	struct el3_private *lp = netdev_priv(dev);
 	unsigned int ioaddr = dev->base_addr;
 	u8 rx, tx, up;
 
@@ -1008,15 +1011,15 @@ static void update_stats(struct net_device *dev)
 	/* Unlike the 3c509 we need not turn off stats updates while reading. */
 	/* Switch to the stats window, and read everything. */
 	EL3WINDOW(6);
-	lp->stats.tx_carrier_errors 		+= inb(ioaddr + 0);
-	lp->stats.tx_heartbeat_errors		+= inb(ioaddr + 1);
+	dev->stats.tx_carrier_errors 		+= inb(ioaddr + 0);
+	dev->stats.tx_heartbeat_errors		+= inb(ioaddr + 1);
 	/* Multiple collisions. */	   	inb(ioaddr + 2);
-	lp->stats.collisions			+= inb(ioaddr + 3);
-	lp->stats.tx_window_errors		+= inb(ioaddr + 4);
-	lp->stats.rx_fifo_errors		+= inb(ioaddr + 5);
-	lp->stats.tx_packets			+= inb(ioaddr + 6);
+	dev->stats.collisions			+= inb(ioaddr + 3);
+	dev->stats.tx_window_errors		+= inb(ioaddr + 4);
+	dev->stats.rx_fifo_errors		+= inb(ioaddr + 5);
+	dev->stats.tx_packets			+= inb(ioaddr + 6);
 	up		 			 = inb(ioaddr + 9);
-	lp->stats.tx_packets			+= (up&0x30) << 4;
+	dev->stats.tx_packets			+= (up&0x30) << 4;
 	/* Rx packets   */			   inb(ioaddr + 7);
 	/* Tx deferrals */			   inb(ioaddr + 8);
 	rx		 			 = inw(ioaddr + 10);
@@ -1026,31 +1029,31 @@ static void update_stats(struct net_device *dev)
 	/* BadSSD */				   inb(ioaddr + 12);
 	up					 = inb(ioaddr + 13);
 
-	lp->stats.tx_bytes 			+= tx + ((up & 0xf0) << 12);
+	dev->stats.tx_bytes 			+= tx + ((up & 0xf0) << 12);
 
 	EL3WINDOW(1);
 }
 
 static int el3_rx(struct net_device *dev, int worklimit)
 {
-	struct el3_private *lp = netdev_priv(dev);
 	unsigned int ioaddr = dev->base_addr;
 	short rx_status;
 	
 	DEBUG(3, "%s: in rx_packet(), status %4.4x, rx_status %4.4x.\n",
 		  dev->name, inw(ioaddr+EL3_STATUS), inw(ioaddr+RxStatus));
 	while (!((rx_status = inw(ioaddr + RxStatus)) & 0x8000) &&
-		   (--worklimit >= 0)) {
+			worklimit > 0) {
+		worklimit--;
 		if (rx_status & 0x4000) { /* Error, update stats. */
 			short error = rx_status & 0x3800;
-			lp->stats.rx_errors++;
+			dev->stats.rx_errors++;
 			switch (error) {
-			case 0x0000:	lp->stats.rx_over_errors++; break;
-			case 0x0800:	lp->stats.rx_length_errors++; break;
-			case 0x1000:	lp->stats.rx_frame_errors++; break;
-			case 0x1800:	lp->stats.rx_length_errors++; break;
-			case 0x2000:	lp->stats.rx_frame_errors++; break;
-			case 0x2800:	lp->stats.rx_crc_errors++; break;
+			case 0x0000:	dev->stats.rx_over_errors++; break;
+			case 0x0800:	dev->stats.rx_length_errors++; break;
+			case 0x1000:	dev->stats.rx_frame_errors++; break;
+			case 0x1800:	dev->stats.rx_length_errors++; break;
+			case 0x2000:	dev->stats.rx_frame_errors++; break;
+			case 0x2800:	dev->stats.rx_crc_errors++; break;
 			}
 		} else {
 			short pkt_len = rx_status & 0x7ff;
@@ -1066,13 +1069,12 @@ static int el3_rx(struct net_device *dev, int worklimit)
 						((pkt_len+3)>>2));
 				skb->protocol = eth_type_trans(skb, dev);
 				netif_rx(skb);
-				dev->last_rx = jiffies;
-				lp->stats.rx_packets++;
-				lp->stats.rx_bytes += pkt_len;
+				dev->stats.rx_packets++;
+				dev->stats.rx_bytes += pkt_len;
 			} else {
 				DEBUG(1, "%s: couldn't allocate a sk_buff of"
 					  " size %d.\n", dev->name, pkt_len);
-				lp->stats.rx_dropped++;
+				dev->stats.rx_dropped++;
 			}
 		}
 		tc574_wait_for_completion(dev, RxDiscard);
@@ -1096,16 +1098,16 @@ static int el3_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 {
 	struct el3_private *lp = netdev_priv(dev);
 	unsigned int ioaddr = dev->base_addr;
-	u16 *data = (u16 *)&rq->ifr_ifru;
+	struct mii_ioctl_data *data = if_mii(rq);
 	int phy = lp->phys & 0x1f;
 
 	DEBUG(2, "%s: In ioct(%-.6s, %#4.4x) %4.4x %4.4x %4.4x %4.4x.\n",
 		  dev->name, rq->ifr_ifrn.ifrn_name, cmd,
-		  data[0], data[1], data[2], data[3]);
+		  data->phy_id, data->reg_num, data->val_in, data->val_out);
 
 	switch(cmd) {
 	case SIOCGMIIPHY:		/* Get the address of the PHY in use. */
-		data[0] = phy;
+		data->phy_id = phy;
 	case SIOCGMIIREG:		/* Read the specified MII register. */
 		{
 			int saved_window;
@@ -1114,7 +1116,8 @@ static int el3_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 			spin_lock_irqsave(&lp->window_lock, flags);
 			saved_window = inw(ioaddr + EL3_CMD) >> 13;
 			EL3WINDOW(4);
-			data[3] = mdio_read(ioaddr, data[0] & 0x1f, data[1] & 0x1f);
+			data->val_out = mdio_read(ioaddr, data->phy_id & 0x1f,
+						  data->reg_num & 0x1f);
 			EL3WINDOW(saved_window);
 			spin_unlock_irqrestore(&lp->window_lock, flags);
 			return 0;
@@ -1124,12 +1127,11 @@ static int el3_ioctl(struct net_device *dev, struct ifreq *rq, int cmd)
 			int saved_window;
                        unsigned long flags;
 
-			if (!capable(CAP_NET_ADMIN))
-				return -EPERM;
 			spin_lock_irqsave(&lp->window_lock, flags);
 			saved_window = inw(ioaddr + EL3_CMD) >> 13;
 			EL3WINDOW(4);
-			mdio_write(ioaddr, data[0] & 0x1f, data[1] & 0x1f, data[2]);
+			mdio_write(ioaddr, data->phy_id & 0x1f,
+				   data->reg_num & 0x1f, data->val_in);
 			EL3WINDOW(saved_window);
 			spin_unlock_irqrestore(&lp->window_lock, flags);
 			return 0;
@@ -1158,6 +1160,16 @@ static void set_rx_mode(struct net_device *dev)
 		outw(SetRxFilter|RxStation|RxMulticast|RxBroadcast, ioaddr + EL3_CMD);
 	else
 		outw(SetRxFilter | RxStation | RxBroadcast, ioaddr + EL3_CMD);
+}
+
+static void set_multicast_list(struct net_device *dev)
+{
+	struct el3_private *lp = netdev_priv(dev);
+	unsigned long flags;
+
+	spin_lock_irqsave(&lp->window_lock, flags);
+	set_rx_mode(dev);
+	spin_unlock_irqrestore(&lp->window_lock, flags);
 }
 
 static int el3_close(struct net_device *dev)
@@ -1197,7 +1209,7 @@ static int el3_close(struct net_device *dev)
 
 static struct pcmcia_device_id tc574_ids[] = {
 	PCMCIA_DEVICE_MANF_CARD(0x0101, 0x0574),
-	PCMCIA_MFC_DEVICE_CIS_MANF_CARD(0, 0x0101, 0x0556, "3CCFEM556.cis"),
+	PCMCIA_MFC_DEVICE_CIS_MANF_CARD(0, 0x0101, 0x0556, "cis/3CCFEM556.cis"),
 	PCMCIA_DEVICE_NULL,
 };
 MODULE_DEVICE_TABLE(pcmcia, tc574_ids);

@@ -9,19 +9,18 @@
  * as published by the Free Software Foundation.
  */
 
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/poll.h>
 #include <linux/errno.h>
-#include <linux/if_arp.h>
-#include <linux/init.h>
-#include <linux/skbuff.h>
-#include <linux/pkt_sched.h>
-#include <linux/inetdevice.h>
-#include <linux/lapb.h>
-#include <linux/rtnetlink.h>
 #include <linux/hdlc.h>
+#include <linux/if_arp.h>
+#include <linux/inetdevice.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/pkt_sched.h>
+#include <linux/poll.h>
+#include <linux/rtnetlink.h>
+#include <linux/skbuff.h>
+#include <linux/slab.h>
 
 #undef DEBUG_HARD_HEADER
 
@@ -59,8 +58,7 @@ struct cisco_state {
 	spinlock_t lock;
 	unsigned long last_poll;
 	int up;
-	int request_sent;
-	u32 txseq; /* TX sequence number */
+	u32 txseq; /* TX sequence number, 0 = none */
 	u32 rxseq; /* RX sequence number */
 };
 
@@ -68,9 +66,9 @@ struct cisco_state {
 static int cisco_ioctl(struct net_device *dev, struct ifreq *ifr);
 
 
-static inline struct cisco_state * state(hdlc_device *hdlc)
+static inline struct cisco_state* state(hdlc_device *hdlc)
 {
-	return(struct cisco_state *)(hdlc->state);
+	return (struct cisco_state *)hdlc->state;
 }
 
 
@@ -118,7 +116,7 @@ static void cisco_keepalive_send(struct net_device *dev, u32 type,
 	data->type = htonl(type);
 	data->par1 = par1;
 	data->par2 = par2;
-	data->rel = __constant_htons(0xFFFF);
+	data->rel = cpu_to_be16(0xFFFF);
 	/* we will need do_div here if 1000 % HZ != 0 */
 	data->time = htonl((jiffies - INITIAL_JIFFIES) * (1000 / HZ));
 
@@ -137,20 +135,20 @@ static __be16 cisco_type_trans(struct sk_buff *skb, struct net_device *dev)
 	struct hdlc_header *data = (struct hdlc_header*)skb->data;
 
 	if (skb->len < sizeof(struct hdlc_header))
-		return __constant_htons(ETH_P_HDLC);
+		return cpu_to_be16(ETH_P_HDLC);
 
 	if (data->address != CISCO_MULTICAST &&
 	    data->address != CISCO_UNICAST)
-		return __constant_htons(ETH_P_HDLC);
+		return cpu_to_be16(ETH_P_HDLC);
 
 	switch(data->protocol) {
-	case __constant_htons(ETH_P_IP):
-	case __constant_htons(ETH_P_IPX):
-	case __constant_htons(ETH_P_IPV6):
+	case cpu_to_be16(ETH_P_IP):
+	case cpu_to_be16(ETH_P_IPX):
+	case cpu_to_be16(ETH_P_IPV6):
 		skb_pull(skb, sizeof(struct hdlc_header));
 		return data->protocol;
 	default:
-		return __constant_htons(ETH_P_HDLC);
+		return cpu_to_be16(ETH_P_HDLC);
 	}
 }
 
@@ -164,6 +162,7 @@ static int cisco_rx(struct sk_buff *skb)
 	struct cisco_packet *cisco_data;
 	struct in_device *in_dev;
 	__be32 addr, mask;
+	u32 ack;
 
 	if (skb->len < sizeof(struct hdlc_header))
 		goto rx_error;
@@ -172,7 +171,7 @@ static int cisco_rx(struct sk_buff *skb)
 	    data->address != CISCO_UNICAST)
 		goto rx_error;
 
-	switch(ntohs(data->protocol)) {
+	switch (ntohs(data->protocol)) {
 	case CISCO_SYS_INFO:
 		/* Packet is not needed, drop it. */
 		dev_kfree_skb_any(skb);
@@ -195,7 +194,7 @@ static int cisco_rx(struct sk_buff *skb)
 		case CISCO_ADDR_REQ: /* Stolen from syncppp.c :-) */
 			in_dev = dev->ip_ptr;
 			addr = 0;
-			mask = __constant_htonl(~0); /* is the mask correct? */
+			mask = ~cpu_to_be32(0); /* is the mask correct? */
 
 			if (in_dev != NULL) {
 				struct in_ifaddr **ifap = &in_dev->ifa_list;
@@ -224,8 +223,10 @@ static int cisco_rx(struct sk_buff *skb)
 		case CISCO_KEEPALIVE_REQ:
 			spin_lock(&st->lock);
 			st->rxseq = ntohl(cisco_data->par1);
-			if (st->request_sent &&
-			    ntohl(cisco_data->par2) == st->txseq) {
+			ack = ntohl(cisco_data->par2);
+			if (ack && (ack == st->txseq ||
+				    /* our current REQ may be in transit */
+				    ack == st->txseq - 1)) {
 				st->last_poll = jiffies;
 				if (!st->up) {
 					u32 sec, min, hrs, days;
@@ -252,8 +253,8 @@ static int cisco_rx(struct sk_buff *skb)
 	dev_kfree_skb_any(skb);
 	return NET_RX_DROP;
 
- rx_error:
-	dev_to_hdlc(dev)->stats.rx_errors++; /* Mark error */
+rx_error:
+	dev->stats.rx_errors++; /* Mark error */
 	dev_kfree_skb_any(skb);
 	return NET_RX_DROP;
 }
@@ -276,7 +277,6 @@ static void cisco_timer(unsigned long arg)
 
 	cisco_keepalive_send(dev, CISCO_KEEPALIVE_REQ, htonl(++st->txseq),
 			     htonl(st->rxseq));
-	st->request_sent = 1;
 	spin_unlock(&st->lock);
 
 	st->timer.expires = jiffies + st->settings.interval * HZ;
@@ -294,9 +294,7 @@ static void cisco_start(struct net_device *dev)
 	unsigned long flags;
 
 	spin_lock_irqsave(&st->lock, flags);
-	st->up = 0;
-	st->request_sent = 0;
-	st->txseq = st->rxseq = 0;
+	st->up = st->txseq = st->rxseq = 0;
 	spin_unlock_irqrestore(&st->lock, flags);
 
 	init_timer(&st->timer);
@@ -318,8 +316,7 @@ static void cisco_stop(struct net_device *dev)
 
 	spin_lock_irqsave(&st->lock, flags);
 	netif_dormant_on(dev);
-	st->up = 0;
-	st->request_sent = 0;
+	st->up = st->txseq = 0;
 	spin_unlock_irqrestore(&st->lock, flags);
 }
 
@@ -336,7 +333,7 @@ static struct hdlc_proto proto = {
 static const struct header_ops cisco_header_ops = {
 	.create = cisco_hard_header,
 };
- 
+
 static int cisco_ioctl(struct net_device *dev, struct ifreq *ifr)
 {
 	cisco_proto __user *cisco_s = ifr->ifr_settings.ifs_ifsu.cisco;
@@ -359,10 +356,10 @@ static int cisco_ioctl(struct net_device *dev, struct ifreq *ifr)
 		return 0;
 
 	case IF_PROTO_CISCO:
-		if(!capable(CAP_NET_ADMIN))
+		if (!capable(CAP_NET_ADMIN))
 			return -EPERM;
 
-		if(dev->flags & IFF_UP)
+		if (dev->flags & IFF_UP)
 			return -EBUSY;
 
 		if (copy_from_user(&new_settings, cisco_s, size))
@@ -372,7 +369,7 @@ static int cisco_ioctl(struct net_device *dev, struct ifreq *ifr)
 		    new_settings.timeout < 2)
 			return -EINVAL;
 
-		result=hdlc->attach(dev, ENCODING_NRZ,PARITY_CRC16_PR1_CCITT);
+		result = hdlc->attach(dev, ENCODING_NRZ,PARITY_CRC16_PR1_CCITT);
 		if (result)
 			return result;
 
@@ -383,7 +380,6 @@ static int cisco_ioctl(struct net_device *dev, struct ifreq *ifr)
 
 		memcpy(&state(hdlc)->settings, &new_settings, size);
 		spin_lock_init(&state(hdlc)->lock);
-		dev->hard_start_xmit = hdlc->xmit;
 		dev->header_ops = &cisco_header_ops;
 		dev->type = ARPHRD_CISCO;
 		netif_dormant_on(dev);

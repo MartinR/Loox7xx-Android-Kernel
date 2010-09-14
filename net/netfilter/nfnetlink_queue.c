@@ -1,6 +1,6 @@
 /*
  * This is a module which is used for queueing packets and communicating with
- * userspace via nfetlink.
+ * userspace via nfnetlink.
  *
  * (C) 2005 by Harald Welte <laforge@netfilter.org>
  * (C) 2007 by Patrick McHardy <kaber@trash.net>
@@ -243,7 +243,6 @@ nfqnl_build_packet_message(struct nfqnl_instance *queue,
 	switch ((enum nfqnl_config_mode)queue->copy_mode) {
 	case NFQNL_COPY_META:
 	case NFQNL_COPY_NONE:
-		data_len = 0;
 		break;
 
 	case NFQNL_COPY_PACKET:
@@ -556,7 +555,7 @@ nfqnl_rcv_dev_event(struct notifier_block *this,
 {
 	struct net_device *dev = ptr;
 
-	if (dev_net(dev) != &init_net)
+	if (!net_eq(dev_net(dev), &init_net))
 		return NOTIFY_DONE;
 
 	/* Drop any packets associated with the downed device */
@@ -609,7 +608,8 @@ static const struct nla_policy nfqa_verdict_policy[NFQA_MAX+1] = {
 
 static int
 nfqnl_recv_verdict(struct sock *ctnl, struct sk_buff *skb,
-		   struct nlmsghdr *nlh, struct nlattr *nfqa[])
+		   const struct nlmsghdr *nlh,
+		   const struct nlattr * const nfqa[])
 {
 	struct nfgenmsg *nfmsg = NLMSG_DATA(nlh);
 	u_int16_t queue_num = ntohs(nfmsg->res_id);
@@ -671,7 +671,8 @@ err_out_unlock:
 
 static int
 nfqnl_recv_unsupp(struct sock *ctnl, struct sk_buff *skb,
-		  struct nlmsghdr *nlh, struct nlattr *nfqa[])
+		  const struct nlmsghdr *nlh,
+		  const struct nlattr * const nfqa[])
 {
 	return -ENOTSUPP;
 }
@@ -688,7 +689,8 @@ static const struct nf_queue_handler nfqh = {
 
 static int
 nfqnl_recv_config(struct sock *ctnl, struct sk_buff *skb,
-		  struct nlmsghdr *nlh, struct nlattr *nfqa[])
+		  const struct nlmsghdr *nlh,
+		  const struct nlattr * const nfqa[])
 {
 	struct nfgenmsg *nfmsg = NLMSG_DATA(nlh);
 	u_int16_t queue_num = ntohs(nfmsg->res_id);
@@ -933,6 +935,8 @@ static void __exit nfnetlink_queue_fini(void)
 #endif
 	nfnetlink_subsys_unregister(&nfqnl_subsys);
 	netlink_unregister_notifier(&nfqnl_rtnl_notifier);
+
+	rcu_barrier(); /* Wait for completion of call_rcu()'s */
 }
 
 MODULE_DESCRIPTION("netfilter packet queue handler");

@@ -12,10 +12,43 @@
 #ifndef __LINUX_VIDEODEV_H
 #define __LINUX_VIDEODEV_H
 
+#include <linux/types.h>
 #include <linux/ioctl.h>
 #include <linux/videodev2.h>
 
+#if defined(__MIN_V4L1) && defined (__KERNEL__)
+
+/*
+ * Used by those V4L2 core functions that need a minimum V4L1 support,
+ * in order to allow V4L1 Compatibilty code compilation.
+ */
+
+struct video_mbuf
+{
+	int	size;		/* Total memory to map */
+	int	frames;		/* Frames */
+	int	offsets[VIDEO_MAX_FRAME];
+};
+
+#define VIDIOCGMBUF		_IOR('v',20, struct video_mbuf)		/* Memory map buffer info */
+
+#else
 #if defined(CONFIG_VIDEO_V4L1_COMPAT) || !defined (__KERNEL__)
+
+#define VID_TYPE_CAPTURE	1	/* Can capture */
+#define VID_TYPE_TUNER		2	/* Can tune */
+#define VID_TYPE_TELETEXT	4	/* Does teletext */
+#define VID_TYPE_OVERLAY	8	/* Overlay onto frame buffer */
+#define VID_TYPE_CHROMAKEY	16	/* Overlay by chromakey */
+#define VID_TYPE_CLIPPING	32	/* Can clip */
+#define VID_TYPE_FRAMERAM	64	/* Uses the frame buffer memory */
+#define VID_TYPE_SCALES		128	/* Scalable */
+#define VID_TYPE_MONOCHROME	256	/* Monochrome only */
+#define VID_TYPE_SUBCAPTURE	512	/* Can capture subareas of the image */
+#define VID_TYPE_MPEG_DECODER	1024	/* Can decode MPEG streams */
+#define VID_TYPE_MPEG_ENCODER	2048	/* Can encode MPEG streams */
+#define VID_TYPE_MJPEG_DECODER	4096	/* Can decode MJPEG streams */
+#define VID_TYPE_MJPEG_ENCODER	8192	/* Can encode MJPEG streams */
 
 struct video_capability
 {
@@ -296,6 +329,7 @@ struct video_code
 #define VID_PLAY_END_MARK		14
 
 #endif /* CONFIG_VIDEO_V4L1_COMPAT */
+#endif /* __MIN_V4L1 */
 
 #endif /* __LINUX_VIDEODEV_H */
 

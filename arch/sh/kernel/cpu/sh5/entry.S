@@ -2,7 +2,7 @@
  * arch/sh/kernel/cpu/sh5/entry.S
  *
  * Copyright (C) 2000, 2001  Paolo Alberelli
- * Copyright (C) 2004 - 2007  Paul Mundt
+ * Copyright (C) 2004 - 2008  Paul Mundt
  * Copyright (C) 2003, 2004  Richard Curnow
  *
  * This file is subject to the terms and conditions of the GNU General Public
@@ -10,8 +10,9 @@
  * for more details.
  */
 #include <linux/errno.h>
+#include <linux/init.h>
 #include <linux/sys.h>
-#include <asm/cpu/registers.h>
+#include <cpu/registers.h>
 #include <asm/processor.h>
 #include <asm/unistd.h>
 #include <asm/thread_info.h>
@@ -811,27 +812,6 @@ no_underflow:
 	! exceptions
 	add	SP, ZERO, r14
 
-#ifdef CONFIG_POOR_MANS_STRACE
-	/* We've pushed all the registers now, so only r2-r4 hold anything
-	 * useful. Move them into callee save registers */
-	or	r2, ZERO, r28
-	or	r3, ZERO, r29
-	or	r4, ZERO, r30
-
-	/* Preserve r2 as the event code */
-	movi	evt_debug, r3
-	ori	r3, 1, r3
-	ptabs	r3, tr0
-
-	or	SP, ZERO, r6
-	getcon	TRA, r5
-	blink	tr0, LINK
-
-	or	r28, ZERO, r2
-	or	r29, ZERO, r3
-	or	r30, ZERO, r4
-#endif
-
 	/* For syscall and debug race condition, get TRA now */
 	getcon	TRA, r5
 
@@ -886,11 +866,6 @@ no_underflow:
  */
 	.global ret_from_irq
 ret_from_irq:
-#ifdef CONFIG_POOR_MANS_STRACE
-	pta	evt_debug_ret_from_irq, tr0
-	ori	SP, 0, r2
-	blink	tr0, LINK
-#endif
 	ld.q	SP, FRAME_S(FSSR), r6
 	shlri	r6, 30, r6
 	andi	r6, 1, r6
@@ -903,12 +878,6 @@ ret_from_irq:
 	.global ret_from_exception
 ret_from_exception:
 	preempt_stop()
-
-#ifdef CONFIG_POOR_MANS_STRACE
-	pta	evt_debug_ret_from_exc, tr0
-	ori	SP, 0, r2
-	blink	tr0, LINK
-#endif
 
 	ld.q	SP, FRAME_S(FSSR), r6
 	shlri	r6, 30, r6
@@ -923,6 +892,8 @@ ret_from_exception:
 	blink   tr0, ZERO
 
 resume_kernel:
+	CLI()
+
 	pta	restore_all, tr0
 
 	getcon	KCR0, r6
@@ -939,18 +910,10 @@ need_resched:
 	andi	r7, 0xf0, r7
 	bne	r7, ZERO, tr0
 
-	movi	((PREEMPT_ACTIVE >> 16) & 65535), r8
-	shori	(PREEMPT_ACTIVE & 65535), r8
-	st.l	r6, TI_PRE_COUNT, r8
-
-	STI()
-	movi	schedule, r7
+	movi	preempt_schedule_irq, r7
 	ori	r7, 1, r7
 	ptabs	r7, tr1
 	blink	tr1, LINK
-
-	st.l	r6, TI_PRE_COUNT, ZERO
-	CLI()
 
 	pta	need_resched, tr1
 	blink	tr1, ZERO
@@ -987,11 +950,11 @@ work_resched:
 work_notifysig:
 	gettr	tr1, LINK
 
-	movi	do_signal, r6
+	movi	do_notify_resume, r6
 	ptabs	r6, tr0
 	or	SP, ZERO, r2
-	or	ZERO, ZERO, r3
-	blink	tr0, LINK	    /* Call do_signal(regs, 0), return here */
+	or	r7, ZERO, r3
+	blink	tr0, LINK	    /* Call do_notify_resume(regs, current_thread_info->flags), return here */
 
 restore_all:
 	/* Do prefetches */
@@ -1241,18 +1204,6 @@ syscall_bad:
 	.global syscall_ret
 syscall_ret:
 	st.q	SP, FRAME_R(9), r2	/* Expecting SP back to BASIC frame */
-
-#ifdef CONFIG_POOR_MANS_STRACE
-	/* nothing useful in registers at this point */
-
-	movi	evt_debug2, r5
-	ori	r5, 1, r5
-	ptabs	r5, tr0
-	ld.q	SP, FRAME_R(9), r2
-	or	SP, ZERO, r3
-	blink	tr0, LINK
-#endif
-
 	ld.q	SP, FRAME_S(FSPC), r2
 	addi	r2, 4, r2		/* Move PC, being pre-execution event */
 	st.q	SP, FRAME_S(FSPC), r2
@@ -1273,24 +1224,11 @@ ret_from_fork:
 	ptabs	r5, tr0
 	blink	tr0, LINK
 
-#ifdef CONFIG_POOR_MANS_STRACE
-	/* nothing useful in registers at this point */
-
-	movi	evt_debug2, r5
-	ori	r5, 1, r5
-	ptabs	r5, tr0
-	ld.q	SP, FRAME_R(9), r2
-	or	SP, ZERO, r3
-	blink	tr0, LINK
-#endif
-
 	ld.q	SP, FRAME_S(FSPC), r2
 	addi	r2, 4, r2		/* Move PC, being pre-execution event */
 	st.q	SP, FRAME_S(FSPC), r2
 	pta	ret_from_syscall, tr0
 	blink	tr0, ZERO
-
-
 
 syscall_allowed:
 	/* Use LINK to deflect the exit point, default is syscall_ret */
@@ -1300,18 +1238,20 @@ syscall_allowed:
 
 	getcon	KCR0, r2
 	ld.l	r2, TI_FLAGS, r4
-	movi	(_TIF_SYSCALL_TRACE | _TIF_SINGLESTEP | _TIF_SYSCALL_AUDIT), r6
+	movi	_TIF_WORK_SYSCALL_MASK, r6
 	and	r6, r4, r6
 	beq/l	r6, ZERO, tr0
 
 	/* Trace it by calling syscall_trace before and after */
-	movi	syscall_trace, r4
+	movi	do_syscall_trace_enter, r4
 	or	SP, ZERO, r2
-	or	ZERO, ZERO, r3
 	ptabs	r4, tr0
 	blink	tr0, LINK
 
-	/* Reload syscall number as r5 is trashed by syscall_trace */
+	/* Save the retval */
+	st.q	SP, FRAME_R(2), r2
+
+	/* Reload syscall number as r5 is trashed by do_syscall_trace_enter */
 	ld.q	SP, FRAME_S(FSYSCALL_ID), r5
 	andi	r5, 0x1ff, r5
 
@@ -1343,9 +1283,8 @@ syscall_ret_trace:
 	/* We get back here only if under trace */
 	st.q	SP, FRAME_R(9), r2	/* Save return value */
 
-	movi	syscall_trace, LINK
+	movi	do_syscall_trace_leave, LINK
 	or	SP, ZERO, r2
-	movi	1, r3
 	ptabs	LINK, tr0
 	blink	tr0, LINK
 
@@ -1414,8 +1353,8 @@ peek_real_address_q:
 	   r2(out) : result quadword
 
 	   This is provided as a cheapskate way of manipulating device
-	   registers for debugging (to avoid the need to onchip_remap the debug
-	   module, and to avoid the need to onchip_remap the watchpoint
+	   registers for debugging (to avoid the need to ioremap the debug
+	   module, and to avoid the need to ioremap the watchpoint
 	   controller in a way that identity maps sufficient bits to avoid the
 	   SH5-101 cut2 silicon defect).
 
@@ -1463,8 +1402,8 @@ poke_real_address_q:
 	   r3 : quadword value to write.
 
 	   This is provided as a cheapskate way of manipulating device
-	   registers for debugging (to avoid the need to onchip_remap the debug
-	   module, and to avoid the need to onchip_remap the watchpoint
+	   registers for debugging (to avoid the need to ioremap the debug
+	   module, and to avoid the need to ioremap the watchpoint
 	   controller in a way that identity maps sufficient bits to avoid the
 	   SH5-101 cut2 silicon defect).
 
@@ -2063,10 +2002,10 @@ asm_uaccess_end:
 
 
 /*
- * --- .text.init Section
+ * --- .init.text Section
  */
 
-	.section	.text.init, "ax"
+	__INIT
 
 /*
  * void trap_init (void)

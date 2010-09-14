@@ -3,7 +3,7 @@
  *
  *  Copyright (C) 1991, 1992  Linus Torvalds
  *
- *  Copyright (C) 1996  Gertjan van Wingerde    (gertjan@cs.vu.nl)
+ *  Copyright (C) 1996  Gertjan van Wingerde
  *	Minix V2 fs support.
  *
  *  Modified for 680x0 by Andreas Schwab
@@ -48,8 +48,6 @@ static void minix_put_super(struct super_block *sb)
 	kfree(sbi->s_imap);
 	sb->s_fs_info = NULL;
 	kfree(sbi);
-
-	return;
 }
 
 static struct kmem_cache * minix_inode_cachep;
@@ -68,7 +66,7 @@ static void minix_destroy_inode(struct inode *inode)
 	kmem_cache_free(minix_inode_cachep, minix_i(inode));
 }
 
-static void init_once(struct kmem_cache * cachep, void *foo)
+static void init_once(void *foo)
 {
 	struct minix_inode_info *ei = (struct minix_inode_info *) foo;
 
@@ -256,9 +254,6 @@ static int minix_fill_super(struct super_block *s, void *data, int silent)
 	if (!s->s_root)
 		goto out_iput;
 
-	if (!NO_TRUNCATE)
-		s->s_root->d_op = &minix_dentry_operations;
-
 	if (!(s->s_flags & MS_RDONLY)) {
 		if (sbi->s_version != MINIX_V3) /* s_state is now out from V3 sb */
 			ms->s_state &= ~MINIX_VALID_FS;
@@ -324,15 +319,20 @@ out:
 
 static int minix_statfs(struct dentry *dentry, struct kstatfs *buf)
 {
-	struct minix_sb_info *sbi = minix_sb(dentry->d_sb);
-	buf->f_type = dentry->d_sb->s_magic;
-	buf->f_bsize = dentry->d_sb->s_blocksize;
+	struct super_block *sb = dentry->d_sb;
+	struct minix_sb_info *sbi = minix_sb(sb);
+	u64 id = huge_encode_dev(sb->s_bdev->bd_dev);
+	buf->f_type = sb->s_magic;
+	buf->f_bsize = sb->s_blocksize;
 	buf->f_blocks = (sbi->s_nzones - sbi->s_firstdatazone) << sbi->s_log_zone_size;
 	buf->f_bfree = minix_count_free_blocks(sbi);
 	buf->f_bavail = buf->f_bfree;
 	buf->f_files = sbi->s_ninodes;
 	buf->f_ffree = minix_count_free_inodes(sbi);
 	buf->f_namelen = sbi->s_namelen;
+	buf->f_fsid.val[0] = (u32)id;
+	buf->f_fsid.val[1] = (u32)(id >> 32);
+
 	return 0;
 }
 
@@ -552,38 +552,25 @@ static struct buffer_head * V2_minix_update_inode(struct inode * inode)
 	return bh;
 }
 
-static struct buffer_head *minix_update_inode(struct inode *inode)
-{
-	if (INODE_VERSION(inode) == MINIX_V1)
-		return V1_minix_update_inode(inode);
-	else
-		return V2_minix_update_inode(inode);
-}
-
-static int minix_write_inode(struct inode * inode, int wait)
-{
-	brelse(minix_update_inode(inode));
-	return 0;
-}
-
-int minix_sync_inode(struct inode * inode)
+static int minix_write_inode(struct inode *inode, int wait)
 {
 	int err = 0;
 	struct buffer_head *bh;
 
-	bh = minix_update_inode(inode);
-	if (bh && buffer_dirty(bh))
-	{
+	if (INODE_VERSION(inode) == MINIX_V1)
+		bh = V1_minix_update_inode(inode);
+	else
+		bh = V2_minix_update_inode(inode);
+	if (!bh)
+		return -EIO;
+	if (wait && buffer_dirty(bh)) {
 		sync_dirty_buffer(bh);
-		if (buffer_req(bh) && !buffer_uptodate(bh))
-		{
+		if (buffer_req(bh) && !buffer_uptodate(bh)) {
 			printk("IO error syncing minix inode [%s:%08lx]\n",
 				inode->i_sb->s_id, inode->i_ino);
-			err = -1;
+			err = -EIO;
 		}
 	}
-	else if (!bh)
-		err = -1;
 	brelse (bh);
 	return err;
 }

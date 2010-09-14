@@ -58,7 +58,7 @@ ENTRY(sys_call_table)
 	.long sys_mkdir
 	.long sys_rmdir		/* 40 */
 	.long sys_dup
-	.long sys_pipe
+	.long sys_sh_pipe
 	.long sys_times
 	.long sys_ni_syscall	/* old prof syscall holder */
 	.long sys_brk		/* 45 */
@@ -105,7 +105,7 @@ ENTRY(sys_call_table)
 	.long sys_uselib
 	.long sys_swapon
 	.long sys_reboot
-	.long old_readdir
+	.long sys_old_readdir
 	.long old_mmap		/* 90 */
 	.long sys_munmap
 	.long sys_truncate
@@ -139,7 +139,7 @@ ENTRY(sys_call_table)
 	.long sys_clone		/* 120 */
 	.long sys_setdomainname
 	.long sys_newuname
-	.long sys_ni_syscall	/* sys_modify_ldt */
+	.long sys_cacheflush	/* x86: sys_modify_ldt */
 	.long sys_adjtimex
 	.long sys_mprotect		/* 125 */
 	.long sys_sigprocmask
@@ -343,3 +343,13 @@ ENTRY(sys_call_table)
 	.long sys_fallocate
 	.long sys_timerfd_settime	/* 325 */
 	.long sys_timerfd_gettime
+	.long sys_signalfd4
+	.long sys_eventfd2
+	.long sys_epoll_create1
+	.long sys_dup3			/* 330 */
+	.long sys_pipe2
+	.long sys_inotify_init1
+	.long sys_preadv
+	.long sys_pwritev
+	.long sys_rt_tgsigqueueinfo	/* 335 */
+	.long sys_perf_event_open

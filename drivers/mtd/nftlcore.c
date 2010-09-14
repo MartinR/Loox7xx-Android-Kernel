@@ -1,7 +1,6 @@
 /* Linux driver for NAND Flash Translation Layer      */
 /* (c) 1999 Machine Vision Holdings, Inc.             */
 /* Author: David Woodhouse <dwmw2@infradead.org>      */
-/* $Id: nftlcore.c,v 1.98 2005/11/07 11:14:21 gleixner Exp $ */
 
 /*
   The contents of this file are distributed under the GNU General
@@ -16,11 +15,11 @@
 #include <asm/errno.h>
 #include <asm/io.h>
 #include <asm/uaccess.h>
-#include <linux/miscdevice.h>
 #include <linux/delay.h>
 #include <linux/slab.h>
 #include <linux/init.h>
 #include <linux/hdreg.h>
+#include <linux/blkdev.h>
 
 #include <linux/kmod.h>
 #include <linux/mtd/mtd.h>
@@ -40,7 +39,7 @@ static void nftl_add_mtd(struct mtd_blktrans_ops *tr, struct mtd_info *mtd)
 	struct NFTLrecord *nftl;
 	unsigned long temp;
 
-	if (mtd->type != MTD_NANDFLASH)
+	if (mtd->type != MTD_NANDFLASH || mtd->size > UINT_MAX)
 		return;
 	/* OK, this is moderately ugly.  But probably safe.  Alternatives? */
 	if (memcmp(mtd->name, "DiskOnChip", 10))
@@ -136,16 +135,17 @@ static void nftl_remove_dev(struct mtd_blktrans_dev *dev)
 int nftl_read_oob(struct mtd_info *mtd, loff_t offs, size_t len,
 		  size_t *retlen, uint8_t *buf)
 {
+	loff_t mask = mtd->writesize - 1;
 	struct mtd_oob_ops ops;
 	int res;
 
 	ops.mode = MTD_OOB_PLACE;
-	ops.ooboffs = offs & (mtd->writesize - 1);
+	ops.ooboffs = offs & mask;
 	ops.ooblen = len;
 	ops.oobbuf = buf;
 	ops.datbuf = NULL;
 
-	res = mtd->read_oob(mtd, offs & ~(mtd->writesize - 1), &ops);
+	res = mtd->read_oob(mtd, offs & ~mask, &ops);
 	*retlen = ops.oobretlen;
 	return res;
 }
@@ -156,16 +156,17 @@ int nftl_read_oob(struct mtd_info *mtd, loff_t offs, size_t len,
 int nftl_write_oob(struct mtd_info *mtd, loff_t offs, size_t len,
 		   size_t *retlen, uint8_t *buf)
 {
+	loff_t mask = mtd->writesize - 1;
 	struct mtd_oob_ops ops;
 	int res;
 
 	ops.mode = MTD_OOB_PLACE;
-	ops.ooboffs = offs & (mtd->writesize - 1);
+	ops.ooboffs = offs & mask;
 	ops.ooblen = len;
 	ops.oobbuf = buf;
 	ops.datbuf = NULL;
 
-	res = mtd->write_oob(mtd, offs & ~(mtd->writesize - 1), &ops);
+	res = mtd->write_oob(mtd, offs & ~mask, &ops);
 	*retlen = ops.oobretlen;
 	return res;
 }
@@ -178,17 +179,18 @@ int nftl_write_oob(struct mtd_info *mtd, loff_t offs, size_t len,
 static int nftl_write(struct mtd_info *mtd, loff_t offs, size_t len,
 		      size_t *retlen, uint8_t *buf, uint8_t *oob)
 {
+	loff_t mask = mtd->writesize - 1;
 	struct mtd_oob_ops ops;
 	int res;
 
 	ops.mode = MTD_OOB_PLACE;
-	ops.ooboffs = offs;
+	ops.ooboffs = offs & mask;
 	ops.ooblen = mtd->oobsize;
 	ops.oobbuf = oob;
 	ops.datbuf = buf;
 	ops.len = len;
 
-	res = mtd->write_oob(mtd, offs & ~(mtd->writesize - 1), &ops);
+	res = mtd->write_oob(mtd, offs & ~mask, &ops);
 	*retlen = ops.retlen;
 	return res;
 }
@@ -209,7 +211,7 @@ static u16 NFTL_findfreeblock(struct NFTLrecord *nftl, int desperate )
 	/* Normally, we force a fold to happen before we run out of free blocks completely */
 	if (!desperate && nftl->numfreeEUNs < 2) {
 		DEBUG(MTD_DEBUG_LEVEL1, "NFTL_findfreeblock: there are too few free EUNs\n");
-		return 0xffff;
+		return BLOCK_NIL;
 	}
 
 	/* Scan for a free block */
@@ -231,11 +233,11 @@ static u16 NFTL_findfreeblock(struct NFTLrecord *nftl, int desperate )
 			printk("Argh! No free blocks found! LastFreeEUN = %d, "
 			       "FirstEUN = %d\n", nftl->LastFreeEUN,
 			       le16_to_cpu(nftl->MediaHdr.FirstPhysicalEUN));
-			return 0xffff;
+			return BLOCK_NIL;
 		}
 	} while (pot != nftl->LastFreeEUN);
 
-	return 0xffff;
+	return BLOCK_NIL;
 }
 
 static u16 NFTL_foldchain (struct NFTLrecord *nftl, unsigned thisVUC, unsigned pendingblock )
@@ -432,7 +434,7 @@ static u16 NFTL_foldchain (struct NFTLrecord *nftl, unsigned thisVUC, unsigned p
 
 	/* add the header so that it is now a valid chain */
 	oob.u.a.VirtUnitNum = oob.u.a.SpareVirtUnitNum = cpu_to_le16(thisVUC);
-	oob.u.a.ReplUnitNum = oob.u.a.SpareReplUnitNum = 0xffff;
+	oob.u.a.ReplUnitNum = oob.u.a.SpareReplUnitNum = BLOCK_NIL;
 
 	nftl_write_oob(mtd, (nftl->EraseSize * targetEUN) + 8,
 		       8, &retlen, (char *)&oob.u);
@@ -516,7 +518,7 @@ static u16 NFTL_makefreeblock( struct NFTLrecord *nftl , unsigned pendingblock)
 	if (ChainLength < 2) {
 		printk(KERN_WARNING "No Virtual Unit Chains available for folding. "
 		       "Failing request\n");
-		return 0xffff;
+		return BLOCK_NIL;
 	}
 
 	return NFTL_foldchain (nftl, LongestChain, pendingblock);
@@ -579,7 +581,7 @@ static inline u16 NFTL_findwriteunit(struct NFTLrecord *nftl, unsigned block)
 				printk(KERN_WARNING
 				       "Infinite loop in Virtual Unit Chain 0x%x\n",
 				       thisVUC);
-				return 0xffff;
+				return BLOCK_NIL;
 			}
 
 			/* Skip to next block in chain */
@@ -602,7 +604,7 @@ static inline u16 NFTL_findwriteunit(struct NFTLrecord *nftl, unsigned block)
 			//u16 startEUN = nftl->EUNtable[thisVUC];
 
 			//printk("Write to VirtualUnitChain %d, calling makefreeblock()\n", thisVUC);
-			writeEUN = NFTL_makefreeblock(nftl, 0xffff);
+			writeEUN = NFTL_makefreeblock(nftl, BLOCK_NIL);
 
 			if (writeEUN == BLOCK_NIL) {
 				/* OK, we accept that the above comment is
@@ -674,7 +676,7 @@ static inline u16 NFTL_findwriteunit(struct NFTLrecord *nftl, unsigned block)
 
 	printk(KERN_WARNING "Error folding to make room for Virtual Unit Chain 0x%x\n",
 	       thisVUC);
-	return 0xffff;
+	return BLOCK_NIL;
 }
 
 static int nftl_writeblock(struct mtd_blktrans_dev *mbd, unsigned long block,
@@ -803,12 +805,8 @@ static struct mtd_blktrans_ops nftl_tr = {
 	.owner		= THIS_MODULE,
 };
 
-extern char nftlmountrev[];
-
 static int __init init_nftl(void)
 {
-	printk(KERN_INFO "NFTL driver: nftlcore.c $Revision: 1.98 $, nftlmount.c %s\n", nftlmountrev);
-
 	return register_mtd_blktrans(&nftl_tr);
 }
 
@@ -823,3 +821,4 @@ module_exit(cleanup_nftl);
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("David Woodhouse <dwmw2@infradead.org>, Fabrice Bellard <fabrice.bellard@netgem.com> et al.");
 MODULE_DESCRIPTION("Support code for NAND Flash Translation Layer, used on M-Systems DiskOnChip 2000 and Millennium");
+MODULE_ALIAS_BLOCKDEV_MAJOR(NFTL_MAJOR);

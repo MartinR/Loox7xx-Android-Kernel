@@ -273,8 +273,6 @@ struct xl_private {
 	struct wait_queue *srb_wait;
 	volatile int asb_queued;   
 
-	struct net_device_stats xl_stats ;
-
 	u16 mac_buffer ; 	
 	u16 xl_lan_status ;
 	u8 xl_ring_speed ;
@@ -286,5 +284,8 @@ struct xl_private {
 	u8 xl_laa[6] ; 
 	u32 rx_ring_dma_addr ; 
 	u32 tx_ring_dma_addr ; 
+
+	/* firmware section */
+	const struct firmware *fw;
 };
 

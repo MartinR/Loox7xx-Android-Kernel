@@ -22,10 +22,10 @@
 #include <linux/bitops.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
-
-#include <asm/hardware.h>
-#include <asm/uaccess.h>
-#include <asm/io.h>
+#include <linux/uaccess.h>
+#include <linux/io.h>
+#include <linux/device.h>
+#include <linux/clk.h>
 
 #define MODULE_NAME "DAVINCI-WDT: "
 
@@ -70,15 +70,16 @@ static unsigned long wdt_status;
 
 static struct resource	*wdt_mem;
 static void __iomem	*wdt_base;
+struct clk		*wdt_clk;
 
 static void wdt_service(void)
 {
 	spin_lock(&io_lock);
 
 	/* put watchdog in service state */
-	davinci_writel(WDKEY_SEQ0, wdt_base + WDTCR);
+	iowrite32(WDKEY_SEQ0, wdt_base + WDTCR);
 	/* put watchdog in active state */
-	davinci_writel(WDKEY_SEQ1, wdt_base + WDTCR);
+	iowrite32(WDKEY_SEQ1, wdt_base + WDTCR);
 
 	spin_unlock(&io_lock);
 }
@@ -87,33 +88,36 @@ static void wdt_enable(void)
 {
 	u32 tgcr;
 	u32 timer_margin;
+	unsigned long wdt_freq;
+
+	wdt_freq = clk_get_rate(wdt_clk);
 
 	spin_lock(&io_lock);
 
 	/* disable, internal clock source */
-	davinci_writel(0, wdt_base + TCR);
+	iowrite32(0, wdt_base + TCR);
 	/* reset timer, set mode to 64-bit watchdog, and unreset */
-	davinci_writel(0, wdt_base + TGCR);
+	iowrite32(0, wdt_base + TGCR);
 	tgcr = TIMMODE_64BIT_WDOG | TIM12RS_UNRESET | TIM34RS_UNRESET;
-	davinci_writel(tgcr, wdt_base + TGCR);
+	iowrite32(tgcr, wdt_base + TGCR);
 	/* clear counter regs */
-	davinci_writel(0, wdt_base + TIM12);
-	davinci_writel(0, wdt_base + TIM34);
+	iowrite32(0, wdt_base + TIM12);
+	iowrite32(0, wdt_base + TIM34);
 	/* set timeout period */
-	timer_margin = (((u64)heartbeat * CLOCK_TICK_RATE) & 0xffffffff);
-	davinci_writel(timer_margin, wdt_base + PRD12);
-	timer_margin = (((u64)heartbeat * CLOCK_TICK_RATE) >> 32);
-	davinci_writel(timer_margin, wdt_base + PRD34);
+	timer_margin = (((u64)heartbeat * wdt_freq) & 0xffffffff);
+	iowrite32(timer_margin, wdt_base + PRD12);
+	timer_margin = (((u64)heartbeat * wdt_freq) >> 32);
+	iowrite32(timer_margin, wdt_base + PRD34);
 	/* enable run continuously */
-	davinci_writel(ENAMODE12_PERIODIC, wdt_base + TCR);
+	iowrite32(ENAMODE12_PERIODIC, wdt_base + TCR);
 	/* Once the WDT is in pre-active state write to
 	 * TIM12, TIM34, PRD12, PRD34, TCR, TGCR, WDTCR are
 	 * write protected (except for the WDKEY field)
 	 */
 	/* put watchdog in pre-active state */
-	davinci_writel(WDKEY_SEQ0 | WDEN, wdt_base + WDTCR);
+	iowrite32(WDKEY_SEQ0 | WDEN, wdt_base + WDTCR);
 	/* put watchdog in active state */
-	davinci_writel(WDKEY_SEQ1 | WDEN, wdt_base + WDTCR);
+	iowrite32(WDKEY_SEQ1 | WDEN, wdt_base + WDTCR);
 
 	spin_unlock(&io_lock);
 }
@@ -143,9 +147,8 @@ static struct watchdog_info ident = {
 	.identity = "DaVinci Watchdog",
 };
 
-static int
-davinci_wdt_ioctl(struct inode *inode, struct file *file, unsigned int cmd,
-		  unsigned long arg)
+static long davinci_wdt_ioctl(struct file *file,
+					unsigned int cmd, unsigned long arg)
 {
 	int ret = -ENOTTY;
 
@@ -160,13 +163,13 @@ davinci_wdt_ioctl(struct inode *inode, struct file *file, unsigned int cmd,
 		ret = put_user(0, (int *)arg);
 		break;
 
-	case WDIOC_GETTIMEOUT:
-		ret = put_user(heartbeat, (int *)arg);
-		break;
-
 	case WDIOC_KEEPALIVE:
 		wdt_service();
 		ret = 0;
+		break;
+
+	case WDIOC_GETTIMEOUT:
+		ret = put_user(heartbeat, (int *)arg);
 		break;
 	}
 	return ret;
@@ -184,7 +187,7 @@ static const struct file_operations davinci_wdt_fops = {
 	.owner = THIS_MODULE,
 	.llseek = no_llseek,
 	.write = davinci_wdt_write,
-	.ioctl = davinci_wdt_ioctl,
+	.unlocked_ioctl = davinci_wdt_ioctl,
 	.open = davinci_wdt_open,
 	.release = davinci_wdt_release,
 };
@@ -195,21 +198,26 @@ static struct miscdevice davinci_wdt_miscdev = {
 	.fops = &davinci_wdt_fops,
 };
 
-static int davinci_wdt_probe(struct platform_device *pdev)
+static int __devinit davinci_wdt_probe(struct platform_device *pdev)
 {
 	int ret = 0, size;
 	struct resource *res;
+	struct device *dev = &pdev->dev;
+
+	wdt_clk = clk_get(dev, NULL);
+	if (WARN_ON(IS_ERR(wdt_clk)))
+		return PTR_ERR(wdt_clk);
+
+	clk_enable(wdt_clk);
 
 	if (heartbeat < 1 || heartbeat > MAX_HEARTBEAT)
 		heartbeat = DEFAULT_HEARTBEAT;
 
-	printk(KERN_INFO MODULE_NAME
-		"DaVinci Watchdog Timer: heartbeat %d sec\n", heartbeat);
+	dev_info(dev, "heartbeat %d sec\n", heartbeat);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (res == NULL) {
-		printk(KERN_INFO MODULE_NAME
-			"failed to get memory region resource\n");
+		dev_err(dev, "failed to get memory region resource\n");
 		return -ENOENT;
 	}
 
@@ -217,24 +225,30 @@ static int davinci_wdt_probe(struct platform_device *pdev)
 	wdt_mem = request_mem_region(res->start, size, pdev->name);
 
 	if (wdt_mem == NULL) {
-		printk(KERN_INFO MODULE_NAME "failed to get memory region\n");
+		dev_err(dev, "failed to get memory region\n");
 		return -ENOENT;
 	}
-	wdt_base = (void __iomem *)(res->start);
+
+	wdt_base = ioremap(res->start, size);
+	if (!wdt_base) {
+		dev_err(dev, "failed to map memory region\n");
+		return -ENOMEM;
+	}
 
 	ret = misc_register(&davinci_wdt_miscdev);
 	if (ret < 0) {
-		printk(KERN_ERR MODULE_NAME "cannot register misc device\n");
+		dev_err(dev, "cannot register misc device\n");
 		release_resource(wdt_mem);
 		kfree(wdt_mem);
 	} else {
 		set_bit(WDT_DEVICE_INITED, &wdt_status);
 	}
 
+	iounmap(wdt_base);
 	return ret;
 }
 
-static int davinci_wdt_remove(struct platform_device *pdev)
+static int __devexit davinci_wdt_remove(struct platform_device *pdev)
 {
 	misc_deregister(&davinci_wdt_miscdev);
 	if (wdt_mem) {
@@ -242,6 +256,10 @@ static int davinci_wdt_remove(struct platform_device *pdev)
 		kfree(wdt_mem);
 		wdt_mem = NULL;
 	}
+
+	clk_disable(wdt_clk);
+	clk_put(wdt_clk);
+
 	return 0;
 }
 
@@ -251,7 +269,7 @@ static struct platform_driver platform_wdt_driver = {
 		.owner	= THIS_MODULE,
 	},
 	.probe = davinci_wdt_probe,
-	.remove = davinci_wdt_remove,
+	.remove = __devexit_p(davinci_wdt_remove),
 };
 
 static int __init davinci_wdt_init(void)

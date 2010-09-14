@@ -64,7 +64,7 @@ static void ncp_destroy_inode(struct inode *inode)
 	kmem_cache_free(ncp_inode_cachep, NCP_FINFO(inode));
 }
 
-static void init_once(struct kmem_cache *cachep, void *foo)
+static void init_once(void *foo)
 {
 	struct ncp_inode_info *ei = (struct ncp_inode_info *) foo;
 
@@ -736,6 +736,8 @@ static void ncp_put_super(struct super_block *sb)
 {
 	struct ncp_server *server = NCP_SBP(sb);
 
+	lock_kernel();
+
 	ncp_lock_server(server);
 	ncp_disconnect(server);
 	ncp_unlock_server(server);
@@ -744,16 +746,8 @@ static void ncp_put_super(struct super_block *sb)
 
 #ifdef CONFIG_NCPFS_NLS
 	/* unload the NLS charsets */
-	if (server->nls_vol)
-	{
-		unload_nls(server->nls_vol);
-		server->nls_vol = NULL;
-	}
-	if (server->nls_io)
-	{
-		unload_nls(server->nls_io);
-		server->nls_io = NULL;
-	}
+	unload_nls(server->nls_vol);
+	unload_nls(server->nls_io);
 #endif /* CONFIG_NCPFS_NLS */
 
 	if (server->info_filp)
@@ -769,6 +763,8 @@ static void ncp_put_super(struct super_block *sb)
 	vfree(server->packet);
 	sb->s_fs_info = NULL;
 	kfree(server);
+
+	unlock_kernel();
 }
 
 static int ncp_statfs(struct dentry *dentry, struct kstatfs *buf)

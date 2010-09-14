@@ -1,6 +1,8 @@
 #ifndef __SOUND_EMU10K1_H
 #define __SOUND_EMU10K1_H
 
+#include <linux/types.h>
+
 /*
  *  Copyright (c) by Jaroslav Kysela <perex@perex.cz>,
  *		     Creative Labs, Inc.
@@ -34,6 +36,7 @@
 #include <sound/timer.h>
 #include <linux/interrupt.h>
 #include <linux/mutex.h>
+
 #include <asm/io.h>
 
 /* ------------------- DEFINES -------------------- */
@@ -1670,6 +1673,7 @@ struct snd_emu_chip_details {
 	unsigned char spi_dac;      /* SPI interface for DAC */
 	unsigned char i2c_adc;      /* I2C interface for ADC */
 	unsigned char adc_1361t;    /* Use Philips 1361T ADC */
+	unsigned char invert_shared_spdif; /* analog/digital switch inverted */
 	const char *driver;
 	const char *name;
 	const char *id;		/* for backward compatibility - can be NULL if not needed */
@@ -2170,7 +2174,7 @@ struct snd_emu10k1_fx8010_code {
 	char name[128];
 
 	DECLARE_BITMAP(gpr_valid, 0x200); /* bitmask of valid initializers */
-	u_int32_t __user *gpr_map;	  /* initializers */
+	__u32 __user *gpr_map;		/* initializers */
 
 	unsigned int gpr_add_control_count; /* count of GPR controls to add/replace */
 	struct snd_emu10k1_fx8010_control_gpr __user *gpr_add_controls; /* GPR controls to add/replace */
@@ -2183,11 +2187,11 @@ struct snd_emu10k1_fx8010_code {
 	struct snd_emu10k1_fx8010_control_gpr __user *gpr_list_controls; /* listed GPR controls */
 
 	DECLARE_BITMAP(tram_valid, 0x100); /* bitmask of valid initializers */
-	u_int32_t __user *tram_data_map;  /* data initializers */
-	u_int32_t __user *tram_addr_map;  /* map initializers */
+	__u32 __user *tram_data_map;	  /* data initializers */
+	__u32 __user *tram_addr_map;	  /* map initializers */
 
 	DECLARE_BITMAP(code_valid, 1024); /* bitmask of valid instructions */
-	u_int32_t __user *code;		  /* one instruction - 64 bits */
+	__u32 __user *code;		  /* one instruction - 64 bits */
 };
 
 struct snd_emu10k1_fx8010_tram {

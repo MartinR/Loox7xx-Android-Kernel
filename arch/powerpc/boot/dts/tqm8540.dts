@@ -12,8 +12,8 @@
 /dts-v1/;
 
 / {
-	model = "tqm,8540";
-	compatible = "tqm,8540", "tqm,85xx";
+	model = "tqc,tqm8540";
+	compatible = "tqc,tqm8540";
 	#address-cells = <1>;
 	#size-cells = <1>;
 
@@ -40,6 +40,7 @@
 			timebase-frequency = <0>;
 			bus-frequency = <0>;
 			clock-frequency = <0>;
+			next-level-cache = <&L2>;
 		};
 	};
 
@@ -53,19 +54,31 @@
 		#size-cells = <1>;
 		device_type = "soc";
 		ranges = <0x0 0xe0000000 0x100000>;
-		reg = <0xe0000000 0x200>;
 		bus-frequency = <0>;
 		compatible = "fsl,mpc8540-immr", "simple-bus";
 
+		ecm-law@0 {
+			compatible = "fsl,ecm-law";
+			reg = <0x0 0x1000>;
+			fsl,num-laws = <8>;
+		};
+
+		ecm@1000 {
+			compatible = "fsl,mpc8540-ecm", "fsl,ecm";
+			reg = <0x1000 0x1000>;
+			interrupts = <17 2>;
+			interrupt-parent = <&mpic>;
+		};
+
 		memory-controller@2000 {
-			compatible = "fsl,8540-memory-controller";
+			compatible = "fsl,mpc8540-memory-controller";
 			reg = <0x2000 0x1000>;
 			interrupt-parent = <&mpic>;
 			interrupts = <18 2>;
 		};
 
-		l2-cache-controller@20000 {
-			compatible = "fsl,8540-l2-cache-controller";
+		L2: l2-cache-controller@20000 {
+			compatible = "fsl,mpc8540-l2-cache-controller";
 			reg = <0x20000 0x1000>;
 			cache-line-size = <32>;
 			cache-size = <0x40000>;	// L2, 256K
@@ -83,72 +96,155 @@
 			interrupt-parent = <&mpic>;
 			dfsrr;
 
+			dtt@48 {
+				compatible = "national,lm75";
+				reg = <0x48>;
+			};
+
 			rtc@68 {
 				compatible = "dallas,ds1337";
 				reg = <0x68>;
 			};
 		};
 
-		mdio@24520 {
+		dma@21300 {
 			#address-cells = <1>;
-			#size-cells = <0>;
-			compatible = "fsl,gianfar-mdio";
-			reg = <0x24520 0x20>;
-
-			phy1: ethernet-phy@1 {
+			#size-cells = <1>;
+			compatible = "fsl,mpc8540-dma", "fsl,eloplus-dma";
+			reg = <0x21300 0x4>;
+			ranges = <0x0 0x21100 0x200>;
+			cell-index = <0>;
+			dma-channel@0 {
+				compatible = "fsl,mpc8540-dma-channel",
+						"fsl,eloplus-dma-channel";
+				reg = <0x0 0x80>;
+				cell-index = <0>;
 				interrupt-parent = <&mpic>;
-				interrupts = <8 1>;
-				reg = <1>;
-				device_type = "ethernet-phy";
+				interrupts = <20 2>;
 			};
-			phy2: ethernet-phy@2 {
+			dma-channel@80 {
+				compatible = "fsl,mpc8540-dma-channel",
+						"fsl,eloplus-dma-channel";
+				reg = <0x80 0x80>;
+				cell-index = <1>;
 				interrupt-parent = <&mpic>;
-				interrupts = <8 1>;
-				reg = <2>;
-				device_type = "ethernet-phy";
+				interrupts = <21 2>;
 			};
-			phy3: ethernet-phy@3 {
+			dma-channel@100 {
+				compatible = "fsl,mpc8540-dma-channel",
+						"fsl,eloplus-dma-channel";
+				reg = <0x100 0x80>;
+				cell-index = <2>;
 				interrupt-parent = <&mpic>;
-				interrupts = <8 1>;
-				reg = <3>;
-				device_type = "ethernet-phy";
+				interrupts = <22 2>;
+			};
+			dma-channel@180 {
+				compatible = "fsl,mpc8540-dma-channel",
+						"fsl,eloplus-dma-channel";
+				reg = <0x180 0x80>;
+				cell-index = <3>;
+				interrupt-parent = <&mpic>;
+				interrupts = <23 2>;
 			};
 		};
 
 		enet0: ethernet@24000 {
+			#address-cells = <1>;
+			#size-cells = <1>;
 			cell-index = <0>;
 			device_type = "network";
 			model = "TSEC";
 			compatible = "gianfar";
 			reg = <0x24000 0x1000>;
+			ranges = <0x0 0x24000 0x1000>;
 			local-mac-address = [ 00 00 00 00 00 00 ];
 			interrupts = <29 2 30 2 34 2>;
 			interrupt-parent = <&mpic>;
 			phy-handle = <&phy2>;
+
+			mdio@520 {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				compatible = "fsl,gianfar-mdio";
+				reg = <0x520 0x20>;
+
+				phy1: ethernet-phy@1 {
+					interrupt-parent = <&mpic>;
+					interrupts = <8 1>;
+					reg = <1>;
+					device_type = "ethernet-phy";
+				};
+				phy2: ethernet-phy@2 {
+					interrupt-parent = <&mpic>;
+					interrupts = <8 1>;
+					reg = <2>;
+					device_type = "ethernet-phy";
+				};
+				phy3: ethernet-phy@3 {
+					interrupt-parent = <&mpic>;
+					interrupts = <8 1>;
+					reg = <3>;
+					device_type = "ethernet-phy";
+				};
+				tbi0: tbi-phy@11 {
+					reg = <0x11>;
+					device_type = "tbi-phy";
+				};
+			};
 		};
 
 		enet1: ethernet@25000 {
+			#address-cells = <1>;
+			#size-cells = <1>;
 			cell-index = <1>;
 			device_type = "network";
 			model = "TSEC";
 			compatible = "gianfar";
 			reg = <0x25000 0x1000>;
+			ranges = <0x0 0x25000 0x1000>;
 			local-mac-address = [ 00 00 00 00 00 00 ];
 			interrupts = <35 2 36 2 40 2>;
 			interrupt-parent = <&mpic>;
 			phy-handle = <&phy1>;
+
+			mdio@520 {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				compatible = "fsl,gianfar-tbi";
+				reg = <0x520 0x20>;
+
+				tbi1: tbi-phy@11 {
+					reg = <0x11>;
+					device_type = "tbi-phy";
+				};
+			};
 		};
 
 		enet2: ethernet@26000 {
+			#address-cells = <1>;
+			#size-cells = <1>;
 			cell-index = <2>;
 			device_type = "network";
 			model = "FEC";
 			compatible = "gianfar";
 			reg = <0x26000 0x1000>;
+			ranges = <0x0 0x26000 0x1000>;
 			local-mac-address = [ 00 00 00 00 00 00 ];
 			interrupts = <41 2>;
 			interrupt-parent = <&mpic>;
 			phy-handle = <&phy3>;
+
+			mdio@520 {
+				#address-cells = <1>;
+				#size-cells = <0>;
+				compatible = "fsl,gianfar-tbi";
+				reg = <0x520 0x20>;
+
+				tbi2: tbi-phy@11 {
+					reg = <0x11>;
+					device_type = "tbi-phy";
+				};
+			};
 		};
 
 		serial0: serial@4500 {
@@ -177,11 +273,11 @@
 			#interrupt-cells = <2>;
 			reg = <0x40000 0x40000>;
 			device_type = "open-pic";
+			compatible = "chrp,open-pic";
 		};
 	};
 
 	pci0: pci@e0008000 {
-		cell-index = <0>;
 		#interrupt-cells = <1>;
 		#size-cells = <2>;
 		#address-cells = <3>;

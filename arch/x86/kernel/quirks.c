@@ -35,9 +35,6 @@ static void __devinit quirk_intel_irqbalance(struct pci_dev *dev)
 	if (!(word & (1 << 13))) {
 		dev_info(&dev->dev, "Intel E7520/7320/7525 detected; "
 			"disabling irq balancing and affinity\n");
-#ifdef CONFIG_IRQBALANCE
-		irqbalance_disable("");
-#endif
 		noirqdebug_setup("");
 #ifdef CONFIG_PROC_FS
 		no_irq_affinity = 1;
@@ -65,6 +62,7 @@ static enum {
 	ICH_FORCE_HPET_RESUME,
 	VT8237_FORCE_HPET_RESUME,
 	NVIDIA_FORCE_HPET_RESUME,
+	ATI_FORCE_HPET_RESUME,
 } force_hpet_resume_type;
 
 static void __iomem *rcba_base;
@@ -76,8 +74,7 @@ static void ich_force_hpet_resume(void)
 	if (!force_hpet_address)
 		return;
 
-	if (rcba_base == NULL)
-		BUG();
+	BUG_ON(rcba_base == NULL);
 
 	/* read the Function Disable register, dword mode only */
 	val = readl(rcba_base + 0x3404);
@@ -158,6 +155,8 @@ static void ich_force_enable_hpet(struct pci_dev *dev)
 
 DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_ESB2_0,
 			 ich_force_enable_hpet);
+DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_ICH6_0,
+			 ich_force_enable_hpet);
 DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_ICH6_1,
 			 ich_force_enable_hpet);
 DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_ICH7_0,
@@ -168,11 +167,20 @@ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_ICH7_31,
 			 ich_force_enable_hpet);
 DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_ICH8_1,
 			 ich_force_enable_hpet);
+DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_ICH8_4,
+			 ich_force_enable_hpet);
 DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_ICH9_7,
 			 ich_force_enable_hpet);
-
+DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, 0x3a16,	/* ICH10 */
+			 ich_force_enable_hpet);
 
 static struct pci_dev *cached_dev;
+
+static void hpet_print_force_info(void)
+{
+	printk(KERN_INFO "HPET not enabled in BIOS. "
+	       "You might try hpet=force boot option\n");
+}
 
 static void old_ich_force_hpet_resume(void)
 {
@@ -255,6 +263,8 @@ static void old_ich_force_enable_hpet_user(struct pci_dev *dev)
 		old_ich_force_enable_hpet(dev);
 }
 
+DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_ESB_1,
+			 old_ich_force_enable_hpet_user);
 DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_82801CA_0,
 			 old_ich_force_enable_hpet_user);
 DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_INTEL, PCI_DEVICE_ID_INTEL_82801CA_12,
@@ -290,8 +300,13 @@ static void vt8237_force_enable_hpet(struct pci_dev *dev)
 {
 	u32 uninitialized_var(val);
 
-	if (!hpet_force_user || hpet_address || force_hpet_address)
+	if (hpet_address || force_hpet_address)
 		return;
+
+	if (!hpet_force_user) {
+		hpet_print_force_info();
+		return;
+	}
 
 	pci_read_config_dword(dev, 0x68, &val);
 	/*
@@ -330,6 +345,73 @@ DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_8235,
 DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_VIA, PCI_DEVICE_ID_VIA_8237,
 			 vt8237_force_enable_hpet);
 
+static void ati_force_hpet_resume(void)
+{
+	pci_write_config_dword(cached_dev, 0x14, 0xfed00000);
+	printk(KERN_DEBUG "Force enabled HPET at resume\n");
+}
+
+static u32 ati_ixp4x0_rev(struct pci_dev *dev)
+{
+	u32 d;
+	u8  b;
+
+	pci_read_config_byte(dev, 0xac, &b);
+	b &= ~(1<<5);
+	pci_write_config_byte(dev, 0xac, b);
+	pci_read_config_dword(dev, 0x70, &d);
+	d |= 1<<8;
+	pci_write_config_dword(dev, 0x70, d);
+	pci_read_config_dword(dev, 0x8, &d);
+	d &= 0xff;
+	dev_printk(KERN_DEBUG, &dev->dev, "SB4X0 revision 0x%x\n", d);
+	return d;
+}
+
+static void ati_force_enable_hpet(struct pci_dev *dev)
+{
+	u32 d, val;
+	u8  b;
+
+	if (hpet_address || force_hpet_address)
+		return;
+
+	if (!hpet_force_user) {
+		hpet_print_force_info();
+		return;
+	}
+
+	d = ati_ixp4x0_rev(dev);
+	if (d  < 0x82)
+		return;
+
+	/* base address */
+	pci_write_config_dword(dev, 0x14, 0xfed00000);
+	pci_read_config_dword(dev, 0x14, &val);
+
+	/* enable interrupt */
+	outb(0x72, 0xcd6); b = inb(0xcd7);
+	b |= 0x1;
+	outb(0x72, 0xcd6); outb(b, 0xcd7);
+	outb(0x72, 0xcd6); b = inb(0xcd7);
+	if (!(b & 0x1))
+		return;
+	pci_read_config_dword(dev, 0x64, &d);
+	d |= (1<<10);
+	pci_write_config_dword(dev, 0x64, d);
+	pci_read_config_dword(dev, 0x64, &d);
+	if (!(d & (1<<10)))
+		return;
+
+	force_hpet_address = val;
+	force_hpet_resume_type = ATI_FORCE_HPET_RESUME;
+	dev_printk(KERN_DEBUG, &dev->dev, "Force enabled HPET at 0x%lx\n",
+		   force_hpet_address);
+	cached_dev = dev;
+}
+DECLARE_PCI_FIXUP_HEADER(PCI_VENDOR_ID_ATI, PCI_DEVICE_ID_ATI_IXP400_SMBUS,
+			 ati_force_enable_hpet);
+
 /*
  * Undocumented chipset feature taken from LinuxBIOS.
  */
@@ -343,8 +425,13 @@ static void nvidia_force_enable_hpet(struct pci_dev *dev)
 {
 	u32 uninitialized_var(val);
 
-	if (!hpet_force_user || hpet_address || force_hpet_address)
+	if (hpet_address || force_hpet_address)
 		return;
+
+	if (!hpet_force_user) {
+		hpet_print_force_info();
+		return;
+	}
 
 	pci_write_config_dword(dev, 0x44, 0xfed00001);
 	pci_read_config_dword(dev, 0x44, &val);
@@ -397,9 +484,49 @@ void force_hpet_resume(void)
 	case NVIDIA_FORCE_HPET_RESUME:
 		nvidia_force_hpet_resume();
 		return;
+	case ATI_FORCE_HPET_RESUME:
+		ati_force_hpet_resume();
+		return;
 	default:
 		break;
 	}
 }
+#endif
 
+#if defined(CONFIG_PCI) && defined(CONFIG_NUMA)
+/* Set correct numa_node information for AMD NB functions */
+static void __init quirk_amd_nb_node(struct pci_dev *dev)
+{
+	struct pci_dev *nb_ht;
+	unsigned int devfn;
+	u32 val;
+
+	devfn = PCI_DEVFN(PCI_SLOT(dev->devfn), 0);
+	nb_ht = pci_get_slot(dev->bus, devfn);
+	if (!nb_ht)
+		return;
+
+	pci_read_config_dword(nb_ht, 0x60, &val);
+	set_dev_node(&dev->dev, val & 7);
+	pci_dev_put(nb_ht);
+}
+
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_K8_NB,
+			quirk_amd_nb_node);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_K8_NB_ADDRMAP,
+			quirk_amd_nb_node);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_K8_NB_MEMCTL,
+			quirk_amd_nb_node);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_K8_NB_MISC,
+			quirk_amd_nb_node);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_10H_NB_HT,
+			quirk_amd_nb_node);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_10H_NB_MAP,
+			quirk_amd_nb_node);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_10H_NB_DRAM,
+			quirk_amd_nb_node);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_10H_NB_MISC,
+			quirk_amd_nb_node);
+DECLARE_PCI_FIXUP_FINAL(PCI_VENDOR_ID_AMD, PCI_DEVICE_ID_AMD_10H_NB_LINK,
+			quirk_amd_nb_node);
 #endif

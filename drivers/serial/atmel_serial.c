@@ -42,11 +42,11 @@
 #include <asm/io.h>
 
 #include <asm/mach/serial_at91.h>
-#include <asm/arch/board.h>
+#include <mach/board.h>
 
 #ifdef CONFIG_ARM
-#include <asm/arch/cpu.h>
-#include <asm/arch/gpio.h>
+#include <mach/cpu.h>
+#include <mach/gpio.h>
 #endif
 
 #define PDC_BUFFER_SIZE		512
@@ -131,7 +131,8 @@ struct atmel_uart_char {
 struct atmel_uart_port {
 	struct uart_port	uart;		/* uart */
 	struct clk		*clk;		/* uart clock */
-	unsigned short		suspended;	/* is port suspended? */
+	int			may_wakeup;	/* cached value of device_may_wakeup for times we need to disable it */
+	u32			backup_imr;	/* IMR saved during suspend */
 	int			break_active;	/* break being received */
 
 	short			use_dma_rx;	/* enable PDC receiver */
@@ -426,7 +427,7 @@ static void atmel_rx_chars(struct uart_port *port)
  */
 static void atmel_tx_chars(struct uart_port *port)
 {
-	struct circ_buf *xmit = &port->info->xmit;
+	struct circ_buf *xmit = &port->state->xmit;
 
 	if (port->x_char && UART_GET_CSR(port) & ATMEL_US_TXRDY) {
 		UART_PUT_CHAR(port, port->x_char);
@@ -559,7 +560,7 @@ static irqreturn_t atmel_interrupt(int irq, void *dev_id)
 static void atmel_tx_dma(struct uart_port *port)
 {
 	struct atmel_uart_port *atmel_port = to_atmel_uart_port(port);
-	struct circ_buf *xmit = &port->info->xmit;
+	struct circ_buf *xmit = &port->state->xmit;
 	struct atmel_dma_buffer *pdc = &atmel_port->pdc_tx;
 	int count;
 
@@ -578,7 +579,7 @@ static void atmel_tx_dma(struct uart_port *port)
 	/* disable PDC transmit */
 	UART_PUT_PTCR(port, ATMEL_PDC_TXTDIS);
 
-	if (!uart_circ_empty(xmit)) {
+	if (!uart_circ_empty(xmit) && !uart_tx_stopped(port)) {
 		dma_sync_single_for_device(port->dev,
 					   pdc->dma_addr,
 					   pdc->dma_size,
@@ -662,14 +663,14 @@ static void atmel_rx_from_ring(struct uart_port *port)
 	 * uart_start(), which takes the lock.
 	 */
 	spin_unlock(&port->lock);
-	tty_flip_buffer_push(port->info->tty);
+	tty_flip_buffer_push(port->state->port.tty);
 	spin_lock(&port->lock);
 }
 
 static void atmel_rx_from_dma(struct uart_port *port)
 {
 	struct atmel_uart_port *atmel_port = to_atmel_uart_port(port);
-	struct tty_struct *tty = port->info->tty;
+	struct tty_struct *tty = port->state->port.tty;
 	struct atmel_dma_buffer *pdc;
 	int rx_idx = atmel_port->pdc_rx_idx;
 	unsigned int head;
@@ -775,7 +776,7 @@ static void atmel_tasklet_func(unsigned long data)
 		if (status_change & ATMEL_US_CTS)
 			uart_handle_cts_change(port, !(status & ATMEL_US_CTS));
 
-		wake_up_interruptible(&port->info->delta_msr_wait);
+		wake_up_interruptible(&port->state->port.delta_msr_wait);
 
 		atmel_port->irq_status_prev = status;
 	}
@@ -794,7 +795,7 @@ static void atmel_tasklet_func(unsigned long data)
 static int atmel_startup(struct uart_port *port)
 {
 	struct atmel_uart_port *atmel_port = to_atmel_uart_port(port);
-	struct tty_struct *tty = port->info->tty;
+	struct tty_struct *tty = port->state->port.tty;
 	int retval;
 
 	/*
@@ -853,7 +854,7 @@ static int atmel_startup(struct uart_port *port)
 	}
 	if (atmel_use_dma_tx(port)) {
 		struct atmel_dma_buffer *pdc = &atmel_port->pdc_tx;
-		struct circ_buf *xmit = &port->info->xmit;
+		struct circ_buf *xmit = &port->state->xmit;
 
 		pdc->buf = xmit->buf;
 		pdc->dma_addr = dma_map_single(port->dev,
@@ -875,6 +876,10 @@ static int atmel_startup(struct uart_port *port)
 			return retval;
 		}
 	}
+
+	/* Save current CSR for comparison in atmel_tasklet_func() */
+	atmel_port->irq_status_prev = UART_GET_CSR(port);
+	atmel_port->irq_status = atmel_port->irq_status_prev;
 
 	/*
 	 * Finally, enable the serial port
@@ -956,6 +961,20 @@ static void atmel_shutdown(struct uart_port *port)
 }
 
 /*
+ * Flush any TX data submitted for DMA. Called when the TX circular
+ * buffer is reset.
+ */
+static void atmel_flush_buffer(struct uart_port *port)
+{
+	struct atmel_uart_port *atmel_port = to_atmel_uart_port(port);
+
+	if (atmel_use_dma_tx(port)) {
+		UART_PUT_TCR(port, 0);
+		atmel_port->pdc_tx.ofs = 0;
+	}
+}
+
+/*
  * Power / Clock management.
  */
 static void atmel_serial_pm(struct uart_port *port, unsigned int state,
@@ -970,8 +989,15 @@ static void atmel_serial_pm(struct uart_port *port, unsigned int state,
 		 * This is called on uart_open() or a resume event.
 		 */
 		clk_enable(atmel_port->clk);
+
+		/* re-enable interrupts if we disabled some on suspend */
+		UART_PUT_IER(port, atmel_port->backup_imr);
 		break;
 	case 3:
+		/* Back up the interrupt mask and disable all interrupts */
+		atmel_port->backup_imr = UART_GET_IMR(port);
+		UART_PUT_IDR(port, -1);
+
 		/*
 		 * Disable the peripheral clock for this serial port.
 		 * This is called on uart_close() or a suspend event.
@@ -994,7 +1020,8 @@ static void atmel_set_termios(struct uart_port *port, struct ktermios *termios,
 
 	/* Get current mode register */
 	mode = UART_GET_MR(port) & ~(ATMEL_US_USCLKS | ATMEL_US_CHRL
-					| ATMEL_US_NBSTOP | ATMEL_US_PAR);
+					| ATMEL_US_NBSTOP | ATMEL_US_PAR
+					| ATMEL_US_USMODE);
 
 	baud = uart_get_baud_rate(port, termios, old, 0, port->uartclk / 16);
 	quot = uart_get_divisor(port, baud);
@@ -1039,6 +1066,12 @@ static void atmel_set_termios(struct uart_port *port, struct ktermios *termios,
 	} else
 		mode |= ATMEL_US_PAR_NONE;
 
+	/* hardware handshake (RTS/CTS) */
+	if (termios->c_cflag & CRTSCTS)
+		mode |= ATMEL_US_USMODE_HWHS;
+	else
+		mode |= ATMEL_US_USMODE_NORMAL;
+
 	spin_lock_irqsave(&port->lock, flags);
 
 	port->read_status_mask = ATMEL_US_OVRE;
@@ -1071,11 +1104,13 @@ static void atmel_set_termios(struct uart_port *port, struct ktermios *termios,
 	/* update the per-port timeout */
 	uart_update_timeout(port, termios->c_cflag, baud);
 
-	/* save/disable interrupts and drain transmitter */
+	/*
+	 * save/disable interrupts. The tty layer will ensure that the
+	 * transmitter is empty if requested by the caller, so there's
+	 * no need to wait for it here.
+	 */
 	imr = UART_GET_IMR(port);
 	UART_PUT_IDR(port, -1);
-	while (!(UART_GET_CSR(port) & ATMEL_US_TXEMPTY))
-		cpu_relax();
 
 	/* disable receiver and transmitter */
 	UART_PUT_CR(port, ATMEL_US_TXDIS | ATMEL_US_RXDIS);
@@ -1189,6 +1224,7 @@ static struct uart_ops atmel_pops = {
 	.break_ctl	= atmel_break_ctl,
 	.startup	= atmel_startup,
 	.shutdown	= atmel_shutdown,
+	.flush_buffer	= atmel_flush_buffer,
 	.set_termios	= atmel_set_termios,
 	.type		= atmel_type,
 	.release_port	= atmel_release_port,
@@ -1235,6 +1271,8 @@ static void __devinit atmel_init_port(struct atmel_uart_port *atmel_port,
 		atmel_port->clk = clk_get(&pdev->dev, "usart");
 		clk_enable(atmel_port->clk);
 		port->uartclk = clk_get_rate(atmel_port->clk);
+		clk_disable(atmel_port->clk);
+		/* only enable clock when USART is in use */
 	}
 
 	atmel_port->use_dma_rx = data->use_dma_rx;
@@ -1356,6 +1394,8 @@ static int __init atmel_console_setup(struct console *co, char *options)
 		return -ENODEV;
 	}
 
+	clk_enable(atmel_ports[co->index].clk);
+
 	UART_PUT_IDR(port, -1);
 	UART_PUT_CR(port, ATMEL_US_RSTSTA | ATMEL_US_RSTRX);
 	UART_PUT_CR(port, ATMEL_US_TXEN | ATMEL_US_RXEN);
@@ -1380,7 +1420,7 @@ static struct console atmel_console = {
 	.data		= &atmel_uart,
 };
 
-#define ATMEL_CONSOLE_DEVICE	&atmel_console
+#define ATMEL_CONSOLE_DEVICE	(&atmel_console)
 
 /*
  * Early console initialization (before VM subsystem initialized).
@@ -1439,19 +1479,33 @@ static struct uart_driver atmel_uart = {
 };
 
 #ifdef CONFIG_PM
+static bool atmel_serial_clk_will_stop(void)
+{
+#ifdef CONFIG_ARCH_AT91
+	return at91_suspend_entering_slow_clock();
+#else
+	return false;
+#endif
+}
+
 static int atmel_serial_suspend(struct platform_device *pdev,
 				pm_message_t state)
 {
 	struct uart_port *port = platform_get_drvdata(pdev);
 	struct atmel_uart_port *atmel_port = to_atmel_uart_port(port);
 
-	if (device_may_wakeup(&pdev->dev)
-	    && !at91_suspend_entering_slow_clock())
-		enable_irq_wake(port->irq);
-	else {
-		uart_suspend_port(&atmel_uart, port);
-		atmel_port->suspended = 1;
+	if (atmel_is_console_port(port) && console_suspend_enabled) {
+		/* Drain the TX shifter */
+		while (!(UART_GET_CSR(port) & ATMEL_US_TXEMPTY))
+			cpu_relax();
 	}
+
+	/* we can not wake up if we're running on slow clock */
+	atmel_port->may_wakeup = device_may_wakeup(&pdev->dev);
+	if (atmel_serial_clk_will_stop())
+		device_set_wakeup_enable(&pdev->dev, 0);
+
+	uart_suspend_port(&atmel_uart, port);
 
 	return 0;
 }
@@ -1461,11 +1515,8 @@ static int atmel_serial_resume(struct platform_device *pdev)
 	struct uart_port *port = platform_get_drvdata(pdev);
 	struct atmel_uart_port *atmel_port = to_atmel_uart_port(port);
 
-	if (atmel_port->suspended) {
-		uart_resume_port(&atmel_uart, port);
-		atmel_port->suspended = 0;
-	} else
-		disable_irq_wake(port->irq);
+	uart_resume_port(&atmel_uart, port);
+	device_set_wakeup_enable(&pdev->dev, atmel_port->may_wakeup);
 
 	return 0;
 }
@@ -1480,9 +1531,11 @@ static int __devinit atmel_serial_probe(struct platform_device *pdev)
 	void *data;
 	int ret;
 
-	BUILD_BUG_ON(!is_power_of_2(ATMEL_SERIAL_RINGSIZE));
+	BUILD_BUG_ON(ATMEL_SERIAL_RINGSIZE & (ATMEL_SERIAL_RINGSIZE - 1));
 
 	port = &atmel_ports[pdev->id];
+	port->backup_imr = 0;
+
 	atmel_init_port(port, pdev);
 
 	if (!atmel_use_dma_rx(&port->uart)) {
@@ -1498,6 +1551,17 @@ static int __devinit atmel_serial_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_add_port;
 
+#ifdef CONFIG_SERIAL_ATMEL_CONSOLE
+	if (atmel_is_console_port(&port->uart)
+			&& ATMEL_CONSOLE_DEVICE->flags & CON_ENABLED) {
+		/*
+		 * The serial core enabled the clock for us, so undo
+		 * the clk_enable() in atmel_console_setup()
+		 */
+		clk_disable(port->clk);
+	}
+#endif
+
 	device_init_wakeup(&pdev->dev, 1);
 	platform_set_drvdata(pdev, port);
 
@@ -1508,7 +1572,6 @@ err_add_port:
 	port->rx_ring.buf = NULL;
 err_alloc_ring:
 	if (!atmel_is_console_port(&port->uart)) {
-		clk_disable(port->clk);
 		clk_put(port->clk);
 		port->clk = NULL;
 	}
@@ -1532,7 +1595,6 @@ static int __devexit atmel_serial_remove(struct platform_device *pdev)
 
 	/* "port" is allocated statically, so we shouldn't free it */
 
-	clk_disable(atmel_port->clk);
 	clk_put(atmel_port->clk);
 
 	return ret;

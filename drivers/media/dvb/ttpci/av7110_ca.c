@@ -208,7 +208,7 @@ static ssize_t ci_ll_read(struct dvb_ringbuffer *cibuf, struct file *file,
 		return -EINVAL;
 	DVB_RINGBUFFER_SKIP(cibuf, 2);
 
-	return dvb_ringbuffer_read(cibuf, (u8 *)buf, len, 1);
+	return dvb_ringbuffer_read_user(cibuf, buf, len);
 }
 
 static int dvb_ca_open(struct inode *inode, struct file *file)
@@ -345,7 +345,7 @@ static ssize_t dvb_ca_read(struct file *file, char __user *buf,
 	return ci_ll_read(&av7110->ci_rbuffer, file, buf, count, ppos);
 }
 
-static struct file_operations dvb_ca_fops = {
+static const struct file_operations dvb_ca_fops = {
 	.owner		= THIS_MODULE,
 	.read		= dvb_ca_read,
 	.write		= dvb_ca_write,

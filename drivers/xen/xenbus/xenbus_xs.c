@@ -184,6 +184,7 @@ void *xenbus_dev_request_and_reply(struct xsd_sockmsg *msg)
 
 	return ret;
 }
+EXPORT_SYMBOL(xenbus_dev_request_and_reply);
 
 /* Send message to xs, get kmalloc'ed reply.  ERR_PTR() on error. */
 static void *xs_talkv(struct xenbus_transaction t,
@@ -283,9 +284,9 @@ static char *join(const char *dir, const char *name)
 	char *buffer;
 
 	if (strlen(name) == 0)
-		buffer = kasprintf(GFP_KERNEL, "%s", dir);
+		buffer = kasprintf(GFP_NOIO | __GFP_HIGH, "%s", dir);
 	else
-		buffer = kasprintf(GFP_KERNEL, "%s/%s", dir, name);
+		buffer = kasprintf(GFP_NOIO | __GFP_HIGH, "%s/%s", dir, name);
 	return (!buffer) ? ERR_PTR(-ENOMEM) : buffer;
 }
 
@@ -297,7 +298,7 @@ static char **split(char *strings, unsigned int len, unsigned int *num)
 	*num = count_strings(strings, len);
 
 	/* Transfer to one big alloc for easy freeing. */
-	ret = kmalloc(*num * sizeof(char *) + len, GFP_KERNEL);
+	ret = kmalloc(*num * sizeof(char *) + len, GFP_NOIO | __GFP_HIGH);
 	if (!ret) {
 		kfree(strings);
 		return ERR_PTR(-ENOMEM);
@@ -672,6 +673,8 @@ void xs_resume(void)
 	struct xenbus_watch *watch;
 	char token[sizeof(watch) * 2 + 1];
 
+	xb_init_comms();
+
 	mutex_unlock(&xs_state.response_mutex);
 	mutex_unlock(&xs_state.request_mutex);
 	up_write(&xs_state.transaction_mutex);
@@ -751,7 +754,7 @@ static int process_msg(void)
 	}
 
 
-	msg = kmalloc(sizeof(*msg), GFP_KERNEL);
+	msg = kmalloc(sizeof(*msg), GFP_NOIO | __GFP_HIGH);
 	if (msg == NULL) {
 		err = -ENOMEM;
 		goto out;
@@ -763,7 +766,7 @@ static int process_msg(void)
 		goto out;
 	}
 
-	body = kmalloc(msg->hdr.len + 1, GFP_KERNEL);
+	body = kmalloc(msg->hdr.len + 1, GFP_NOIO | __GFP_HIGH);
 	if (body == NULL) {
 		kfree(msg);
 		err = -ENOMEM;

@@ -55,7 +55,6 @@ struct dma_pinned_list *dma_pin_iovec_pages(struct iovec *iov, size_t len)
 	int nr_iovecs = 0;
 	int iovec_len_used = 0;
 	int iovec_pages_used = 0;
-	long err;
 
 	/* don't pin down non-user-based iovecs */
 	if (segment_eq(get_fs(), KERNEL_DS))
@@ -72,23 +71,21 @@ struct dma_pinned_list *dma_pin_iovec_pages(struct iovec *iov, size_t len)
 	local_list = kmalloc(sizeof(*local_list)
 		+ (nr_iovecs * sizeof (struct dma_page_list))
 		+ (iovec_pages_used * sizeof (struct page*)), GFP_KERNEL);
-	if (!local_list) {
-		err = -ENOMEM;
+	if (!local_list)
 		goto out;
-	}
 
 	/* list of pages starts right after the page list array */
 	pages = (struct page **) &local_list->page_list[nr_iovecs];
+
+	local_list->nr_iovecs = 0;
 
 	for (i = 0; i < nr_iovecs; i++) {
 		struct dma_page_list *page_list = &local_list->page_list[i];
 
 		len -= iov[i].iov_len;
 
-		if (!access_ok(VERIFY_WRITE, iov[i].iov_base, iov[i].iov_len)) {
-			err = -EFAULT;
+		if (!access_ok(VERIFY_WRITE, iov[i].iov_base, iov[i].iov_len))
 			goto unpin;
-		}
 
 		page_list->nr_pages = num_pages_spanned(&iov[i]);
 		page_list->base_address = iov[i].iov_base;
@@ -109,10 +106,8 @@ struct dma_pinned_list *dma_pin_iovec_pages(struct iovec *iov, size_t len)
 			NULL);
 		up_read(&current->mm->mmap_sem);
 
-		if (ret != page_list->nr_pages) {
-			err = -ENOMEM;
+		if (ret != page_list->nr_pages)
 			goto unpin;
-		}
 
 		local_list->nr_iovecs = i + 1;
 	}
@@ -122,7 +117,7 @@ struct dma_pinned_list *dma_pin_iovec_pages(struct iovec *iov, size_t len)
 unpin:
 	dma_unpin_iovec_pages(local_list);
 out:
-	return ERR_PTR(err);
+	return NULL;
 }
 
 void dma_unpin_iovec_pages(struct dma_pinned_list *pinned_list)
@@ -188,6 +183,11 @@ dma_cookie_t dma_memcpy_to_iovec(struct dma_chan *chan, struct iovec *iov,
 					iov_byte_offset,
 					kdata,
 					copy);
+			/* poll for a descriptor slot */
+			if (unlikely(dma_cookie < 0)) {
+				dma_async_issue_pending(chan);
+				continue;
+			}
 
 			len -= copy;
 			iov[iovec_idx].iov_len -= copy;
@@ -253,6 +253,11 @@ dma_cookie_t dma_memcpy_pg_to_iovec(struct dma_chan *chan, struct iovec *iov,
 					page,
 					offset,
 					copy);
+			/* poll for a descriptor slot */
+			if (unlikely(dma_cookie < 0)) {
+				dma_async_issue_pending(chan);
+				continue;
+			}
 
 			len -= copy;
 			iov[iovec_idx].iov_len -= copy;

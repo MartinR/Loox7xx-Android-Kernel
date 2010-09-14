@@ -15,6 +15,7 @@
 #include <linux/module.h>
 #include <linux/sched.h>
 #include <linux/slab.h>
+#include <linux/smp_lock.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
@@ -24,10 +25,10 @@
 #include <asm/etraxi2c.h>
 
 #include <asm/system.h>
-#include <asm/arch/svinto.h>
+#include <arch/svinto.h>
 #include <asm/io.h>
 #include <asm/delay.h>
-#include <asm/arch/io_interface_mux.h>
+#include <arch/io_interface_mux.h>
 
 #include "i2c.h"
 
@@ -566,6 +567,7 @@ i2c_readreg(unsigned char theSlave, unsigned char theReg)
 static int
 i2c_open(struct inode *inode, struct file *filp)
 {
+	cycle_kernel_lock();
 	return 0;
 }
 

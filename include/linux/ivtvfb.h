@@ -21,11 +21,7 @@
 #ifndef __LINUX_IVTVFB_H__
 #define __LINUX_IVTVFB_H__
 
-#ifdef __KERNEL__
-#include <linux/compiler.h> /* need __user */
-#else
-#define __user
-#endif
+#include <linux/compiler.h>
 #include <linux/types.h>
 
 /* Framebuffer external API */
@@ -37,6 +33,6 @@ struct ivtvfb_dma_frame {
 };
 
 #define IVTVFB_IOC_DMA_FRAME 	_IOW('V', BASE_VIDIOC_PRIVATE+0, struct ivtvfb_dma_frame)
-#define FBIO_WAITFORVSYNC	_IOW('F', 0x20, u_int32_t)
+#define FBIO_WAITFORVSYNC	_IOW('F', 0x20, __u32)
 
 #endif

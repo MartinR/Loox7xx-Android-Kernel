@@ -11,6 +11,7 @@
 #define _LINUX_HFSPLUS_FS_H
 
 #include <linux/fs.h>
+#include <linux/mutex.h>
 #include <linux/buffer_head.h>
 #include "hfsplus_raw.h"
 
@@ -154,7 +155,7 @@ struct hfsplus_sb_info {
 
 
 struct hfsplus_inode_info {
-	struct semaphore extents_lock;
+	struct mutex extents_lock;
 	u32 clump_blocks, alloc_blocks;
 	sector_t fs_blocks;
 	/* Allocation extents from catalog record or volume header */
@@ -326,7 +327,7 @@ void hfsplus_file_truncate(struct inode *);
 /* inode.c */
 extern const struct address_space_operations hfsplus_aops;
 extern const struct address_space_operations hfsplus_btree_aops;
-extern struct dentry_operations hfsplus_dentry_operations;
+extern const struct dentry_operations hfsplus_dentry_operations;
 
 void hfsplus_inode_read_fork(struct inode *, struct hfsplus_fork_raw *);
 void hfsplus_inode_write_fork(struct inode *, struct hfsplus_fork_raw *);

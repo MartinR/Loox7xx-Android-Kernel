@@ -12,6 +12,7 @@
 #include <linux/init.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
+#include <linux/smp.h>
 #include <linux/mm.h>
 
 #include <asm/page.h>
@@ -320,6 +321,7 @@ void __cpuinit r3k_cache_init(void)
 	flush_cache_range = r3k_flush_cache_range;
 	flush_cache_page = r3k_flush_cache_page;
 	flush_icache_range = r3k_flush_icache_range;
+	local_flush_icache_range = r3k_flush_icache_range;
 
 	flush_cache_sigtramp = r3k_flush_cache_sigtramp;
 	local_flush_data_cache_page = local_r3k_flush_data_cache_page;

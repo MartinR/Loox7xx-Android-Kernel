@@ -23,6 +23,7 @@
 #include <linux/init.h>
 #include <linux/interrupt.h>
 #include <linux/spinlock.h>
+#include <linux/smp_lock.h>
 
 #include <asm/etraxgpio.h>
 #include <hwregs/reg_map.h>
@@ -32,7 +33,7 @@
 #include <asm/io.h>
 #include <asm/system.h>
 #include <asm/irq.h>
-#include <asm/arch/mach/pinmux.h>
+#include <mach/pinmux.h>
 
 #ifdef CONFIG_ETRAX_VIRTUAL_GPIO
 #include "../i2c.h"
@@ -390,6 +391,8 @@ static int gpio_open(struct inode *inode, struct file *filp)
 
 	if (!priv)
 		return -ENOMEM;
+
+	lock_kernel();
 	memset(priv, 0, sizeof(*priv));
 
 	priv->minor = p;
@@ -412,6 +415,7 @@ static int gpio_open(struct inode *inode, struct file *filp)
 		spin_unlock_irq(&gpio_lock);
 	}
 
+	unlock_kernel();
 	return 0;
 }
 
@@ -677,7 +681,7 @@ static int virtual_gpio_ioctl(struct file *file, unsigned int cmd,
 		shadow |= ~readl(dir_oe[priv->minor]) |
 			(arg & changeable_bits[priv->minor]);
 		i2c_write(VIRT_I2C_ADDR, (void *)&shadow, sizeof(shadow));
-		spin_lock_irqrestore(&gpio_lock, flags);
+		spin_unlock_irqrestore(&gpio_lock, flags);
 		break;
 	case IO_CLRBITS:
 		spin_lock_irqsave(&gpio_lock, flags);
@@ -686,7 +690,7 @@ static int virtual_gpio_ioctl(struct file *file, unsigned int cmd,
 		shadow |= ~readl(dir_oe[priv->minor]) &
 			~(arg & changeable_bits[priv->minor]);
 		i2c_write(VIRT_I2C_ADDR, (void *)&shadow, sizeof(shadow));
-		spin_lock_irqrestore(&gpio_lock, flags);
+		spin_unlock_irqrestore(&gpio_lock, flags);
 		break;
 	case IO_HIGHALARM:
 		/* Set alarm when bits with 1 in arg go high. */

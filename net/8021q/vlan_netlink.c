@@ -59,7 +59,8 @@ static int vlan_validate(struct nlattr *tb[], struct nlattr *data[])
 	}
 	if (data[IFLA_VLAN_FLAGS]) {
 		flags = nla_data(data[IFLA_VLAN_FLAGS]);
-		if ((flags->flags & flags->mask) & ~VLAN_FLAG_REORDER_HDR)
+		if ((flags->flags & flags->mask) &
+		    ~(VLAN_FLAG_REORDER_HDR | VLAN_FLAG_GVRP))
 			return -EINVAL;
 	}
 
@@ -75,7 +76,6 @@ static int vlan_validate(struct nlattr *tb[], struct nlattr *data[])
 static int vlan_changelink(struct net_device *dev,
 			   struct nlattr *tb[], struct nlattr *data[])
 {
-	struct vlan_dev_info *vlan = vlan_dev_info(dev);
 	struct ifla_vlan_flags *flags;
 	struct ifla_vlan_qos_mapping *m;
 	struct nlattr *attr;
@@ -83,8 +83,7 @@ static int vlan_changelink(struct net_device *dev,
 
 	if (data[IFLA_VLAN_FLAGS]) {
 		flags = nla_data(data[IFLA_VLAN_FLAGS]);
-		vlan->flags = (vlan->flags & ~flags->mask) |
-			      (flags->flags & flags->mask);
+		vlan_dev_change_flags(dev, flags->flags, flags->mask);
 	}
 	if (data[IFLA_VLAN_INGRESS_QOS]) {
 		nla_for_each_nested(attr, data[IFLA_VLAN_INGRESS_QOS], rem) {
@@ -98,6 +97,25 @@ static int vlan_changelink(struct net_device *dev,
 			vlan_dev_set_egress_priority(dev, m->from, m->to);
 		}
 	}
+	return 0;
+}
+
+static int vlan_get_tx_queues(struct net *net,
+			      struct nlattr *tb[],
+			      unsigned int *num_tx_queues,
+			      unsigned int *real_num_tx_queues)
+{
+	struct net_device *real_dev;
+
+	if (!tb[IFLA_LINK])
+		return -EINVAL;
+
+	real_dev = __dev_get_by_index(net, nla_get_u32(tb[IFLA_LINK]));
+	if (!real_dev)
+		return -ENODEV;
+
+	*num_tx_queues      = real_dev->num_tx_queues;
+	*real_num_tx_queues = real_dev->real_num_tx_queues;
 	return 0;
 }
 
@@ -151,6 +169,7 @@ static size_t vlan_get_size(const struct net_device *dev)
 	struct vlan_dev_info *vlan = vlan_dev_info(dev);
 
 	return nla_total_size(2) +	/* IFLA_VLAN_ID */
+	       sizeof(struct ifla_vlan_flags) + /* IFLA_VLAN_FLAGS */
 	       vlan_qos_map_size(vlan->nr_ingress_mappings) +
 	       vlan_qos_map_size(vlan->nr_egress_mappings);
 }
@@ -217,6 +236,7 @@ struct rtnl_link_ops vlan_link_ops __read_mostly = {
 	.maxtype	= IFLA_VLAN_MAX,
 	.policy		= vlan_policy,
 	.priv_size	= sizeof(struct vlan_dev_info),
+	.get_tx_queues  = vlan_get_tx_queues,
 	.setup		= vlan_setup,
 	.validate	= vlan_validate,
 	.newlink	= vlan_newlink,

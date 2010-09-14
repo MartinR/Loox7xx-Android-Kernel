@@ -39,7 +39,7 @@
 #include <asm/uaccess.h>
 #include <asm/pgalloc.h>
 #include <asm/mmu_context.h>
-#include <asm/cpu/registers.h>
+#include <cpu/registers.h>
 
 /* Callable from fault.c, so not static */
 inline void __do_tlb_refill(unsigned long address,
@@ -56,16 +56,7 @@ inline void __do_tlb_refill(unsigned long address,
 	/*
 	 * Set PTEH register
 	 */
-	pteh = address & MMU_VPN_MASK;
-
-	/* Sign extend based on neff. */
-#if (NEFF == 32)
-	/* Faster sign extension */
-	pteh = (unsigned long long)(signed long long)(signed long)pteh;
-#else
-	/* General case */
-	pteh = (pteh & NEFF_SIGN) ? (pteh | NEFF_MASK) : pteh;
-#endif
+	pteh = neff_sign_extend(address & MMU_VPN_MASK);
 
 	/* Set the ASID. */
 	pteh |= get_asid() << PTEH_ASID_SHIFT;

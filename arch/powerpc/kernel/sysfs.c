@@ -15,20 +15,31 @@
 #include <asm/firmware.h>
 #include <asm/hvcall.h>
 #include <asm/prom.h>
-#include <asm/paca.h>
-#include <asm/lppaca.h>
 #include <asm/machdep.h>
 #include <asm/smp.h>
+#include <asm/pmc.h>
+
+#include "cacheinfo.h"
+
+#ifdef CONFIG_PPC64
+#include <asm/paca.h>
+#include <asm/lppaca.h>
+#endif
 
 static DEFINE_PER_CPU(struct cpu, cpu_devices);
 
-/* SMT stuff */
+/*
+ * SMT snooze delay stuff, 64-bit only for now
+ */
 
-#ifdef CONFIG_PPC_MULTIPLATFORM
+#ifdef CONFIG_PPC64
+
 /* Time in microseconds we delay before sleeping in the idle loop */
 DEFINE_PER_CPU(unsigned long, smt_snooze_delay) = { 100 };
 
-static ssize_t store_smt_snooze_delay(struct sys_device *dev, const char *buf,
+static ssize_t store_smt_snooze_delay(struct sys_device *dev,
+				      struct sysdev_attribute *attr,
+				      const char *buf,
 				      size_t count)
 {
 	struct cpu *cpu = container_of(dev, struct cpu, sysdev);
@@ -44,7 +55,9 @@ static ssize_t store_smt_snooze_delay(struct sys_device *dev, const char *buf,
 	return count;
 }
 
-static ssize_t show_smt_snooze_delay(struct sys_device *dev, char *buf)
+static ssize_t show_smt_snooze_delay(struct sys_device *dev,
+				     struct sysdev_attribute *attr,
+				     char *buf)
 {
 	struct cpu *cpu = container_of(dev, struct cpu, sysdev);
 
@@ -100,7 +113,7 @@ static int __init setup_smt_snooze_delay(char *str)
 }
 __setup("smt-snooze-delay=", setup_smt_snooze_delay);
 
-#endif /* CONFIG_PPC_MULTIPLATFORM */
+#endif /* CONFIG_PPC64 */
 
 /*
  * Enabling PMCs will slow partition context switch times so we only do
@@ -109,8 +122,10 @@ __setup("smt-snooze-delay=", setup_smt_snooze_delay);
 
 static DEFINE_PER_CPU(char, pmcs_enabled);
 
-void ppc64_enable_pmcs(void)
+void ppc_enable_pmcs(void)
 {
+	ppc_set_pmu_inuse(1);
+
 	/* Only need to enable them once */
 	if (__get_cpu_var(pmcs_enabled))
 		return;
@@ -120,53 +135,37 @@ void ppc64_enable_pmcs(void)
 	if (ppc_md.enable_pmcs)
 		ppc_md.enable_pmcs();
 }
-EXPORT_SYMBOL(ppc64_enable_pmcs);
-
-/* XXX convert to rusty's on_one_cpu */
-static unsigned long run_on_cpu(unsigned long cpu,
-			        unsigned long (*func)(unsigned long),
-				unsigned long arg)
-{
-	cpumask_t old_affinity = current->cpus_allowed;
-	unsigned long ret;
-
-	/* should return -EINVAL to userspace */
-	if (set_cpus_allowed(current, cpumask_of_cpu(cpu)))
-		return 0;
-
-	ret = func(arg);
-
-	set_cpus_allowed(current, old_affinity);
-
-	return ret;
-}
+EXPORT_SYMBOL(ppc_enable_pmcs);
 
 #define SYSFS_PMCSETUP(NAME, ADDRESS) \
-static unsigned long read_##NAME(unsigned long junk) \
+static void read_##NAME(void *val) \
 { \
-	return mfspr(ADDRESS); \
+	*(unsigned long *)val = mfspr(ADDRESS);	\
 } \
-static unsigned long write_##NAME(unsigned long val) \
+static void write_##NAME(void *val) \
 { \
-	ppc64_enable_pmcs(); \
-	mtspr(ADDRESS, val); \
-	return 0; \
+	ppc_enable_pmcs(); \
+	mtspr(ADDRESS, *(unsigned long *)val);	\
 } \
-static ssize_t show_##NAME(struct sys_device *dev, char *buf) \
+static ssize_t show_##NAME(struct sys_device *dev, \
+			struct sysdev_attribute *attr, \
+			char *buf) \
 { \
 	struct cpu *cpu = container_of(dev, struct cpu, sysdev); \
-	unsigned long val = run_on_cpu(cpu->sysdev.id, read_##NAME, 0); \
+	unsigned long val; \
+	smp_call_function_single(cpu->sysdev.id, read_##NAME, &val, 1);	\
 	return sprintf(buf, "%lx\n", val); \
 } \
 static ssize_t __used \
-	store_##NAME(struct sys_device *dev, const char *buf, size_t count) \
+	store_##NAME(struct sys_device *dev, struct sysdev_attribute *attr, \
+			const char *buf, size_t count) \
 { \
 	struct cpu *cpu = container_of(dev, struct cpu, sysdev); \
 	unsigned long val; \
 	int ret = sscanf(buf, "%lx", &val); \
 	if (ret != 1) \
 		return -EINVAL; \
-	run_on_cpu(cpu->sysdev.id, write_##NAME, val); \
+	smp_call_function_single(cpu->sysdev.id, write_##NAME, &val, 1); \
 	return count; \
 }
 
@@ -175,28 +174,53 @@ static ssize_t __used \
  * that are implemented on the current processor
  */
 
+#if defined(CONFIG_PPC64)
+#define HAS_PPC_PMC_CLASSIC	1
+#define HAS_PPC_PMC_IBM		1
+#define HAS_PPC_PMC_PA6T	1
+#elif defined(CONFIG_6xx)
+#define HAS_PPC_PMC_CLASSIC	1
+#define HAS_PPC_PMC_IBM		1
+#define HAS_PPC_PMC_G4		1
+#endif
+
+
+#ifdef HAS_PPC_PMC_CLASSIC
 SYSFS_PMCSETUP(mmcr0, SPRN_MMCR0);
 SYSFS_PMCSETUP(mmcr1, SPRN_MMCR1);
-SYSFS_PMCSETUP(mmcra, SPRN_MMCRA);
 SYSFS_PMCSETUP(pmc1, SPRN_PMC1);
 SYSFS_PMCSETUP(pmc2, SPRN_PMC2);
 SYSFS_PMCSETUP(pmc3, SPRN_PMC3);
 SYSFS_PMCSETUP(pmc4, SPRN_PMC4);
 SYSFS_PMCSETUP(pmc5, SPRN_PMC5);
 SYSFS_PMCSETUP(pmc6, SPRN_PMC6);
+
+#ifdef HAS_PPC_PMC_G4
+SYSFS_PMCSETUP(mmcr2, SPRN_MMCR2);
+#endif
+
+#ifdef CONFIG_PPC64
 SYSFS_PMCSETUP(pmc7, SPRN_PMC7);
 SYSFS_PMCSETUP(pmc8, SPRN_PMC8);
+
+SYSFS_PMCSETUP(mmcra, SPRN_MMCRA);
 SYSFS_PMCSETUP(purr, SPRN_PURR);
 SYSFS_PMCSETUP(spurr, SPRN_SPURR);
 SYSFS_PMCSETUP(dscr, SPRN_DSCR);
 
+static SYSDEV_ATTR(mmcra, 0600, show_mmcra, store_mmcra);
+static SYSDEV_ATTR(spurr, 0600, show_spurr, NULL);
+static SYSDEV_ATTR(dscr, 0600, show_dscr, store_dscr);
+static SYSDEV_ATTR(purr, 0600, show_purr, store_purr);
+#endif /* CONFIG_PPC64 */
+
+#ifdef HAS_PPC_PMC_PA6T
 SYSFS_PMCSETUP(pa6t_pmc0, SPRN_PA6T_PMC0);
 SYSFS_PMCSETUP(pa6t_pmc1, SPRN_PA6T_PMC1);
 SYSFS_PMCSETUP(pa6t_pmc2, SPRN_PA6T_PMC2);
 SYSFS_PMCSETUP(pa6t_pmc3, SPRN_PA6T_PMC3);
 SYSFS_PMCSETUP(pa6t_pmc4, SPRN_PA6T_PMC4);
 SYSFS_PMCSETUP(pa6t_pmc5, SPRN_PA6T_PMC5);
-
 #ifdef CONFIG_DEBUG_KERNEL
 SYSFS_PMCSETUP(hid0, SPRN_HID0);
 SYSFS_PMCSETUP(hid1, SPRN_HID1);
@@ -227,28 +251,37 @@ SYSFS_PMCSETUP(tsr1, SPRN_PA6T_TSR1);
 SYSFS_PMCSETUP(tsr2, SPRN_PA6T_TSR2);
 SYSFS_PMCSETUP(tsr3, SPRN_PA6T_TSR3);
 #endif /* CONFIG_DEBUG_KERNEL */
+#endif /* HAS_PPC_PMC_PA6T */
 
-static SYSDEV_ATTR(mmcra, 0600, show_mmcra, store_mmcra);
-static SYSDEV_ATTR(spurr, 0600, show_spurr, NULL);
-static SYSDEV_ATTR(dscr, 0600, show_dscr, store_dscr);
-static SYSDEV_ATTR(purr, 0600, show_purr, store_purr);
-
+#ifdef HAS_PPC_PMC_IBM
 static struct sysdev_attribute ibm_common_attrs[] = {
 	_SYSDEV_ATTR(mmcr0, 0600, show_mmcr0, store_mmcr0),
 	_SYSDEV_ATTR(mmcr1, 0600, show_mmcr1, store_mmcr1),
 };
+#endif /* HAS_PPC_PMC_G4 */
 
-static struct sysdev_attribute ibm_pmc_attrs[] = {
+#ifdef HAS_PPC_PMC_G4
+static struct sysdev_attribute g4_common_attrs[] = {
+	_SYSDEV_ATTR(mmcr0, 0600, show_mmcr0, store_mmcr0),
+	_SYSDEV_ATTR(mmcr1, 0600, show_mmcr1, store_mmcr1),
+	_SYSDEV_ATTR(mmcr2, 0600, show_mmcr2, store_mmcr2),
+};
+#endif /* HAS_PPC_PMC_G4 */
+
+static struct sysdev_attribute classic_pmc_attrs[] = {
 	_SYSDEV_ATTR(pmc1, 0600, show_pmc1, store_pmc1),
 	_SYSDEV_ATTR(pmc2, 0600, show_pmc2, store_pmc2),
 	_SYSDEV_ATTR(pmc3, 0600, show_pmc3, store_pmc3),
 	_SYSDEV_ATTR(pmc4, 0600, show_pmc4, store_pmc4),
 	_SYSDEV_ATTR(pmc5, 0600, show_pmc5, store_pmc5),
 	_SYSDEV_ATTR(pmc6, 0600, show_pmc6, store_pmc6),
+#ifdef CONFIG_PPC64
 	_SYSDEV_ATTR(pmc7, 0600, show_pmc7, store_pmc7),
 	_SYSDEV_ATTR(pmc8, 0600, show_pmc8, store_pmc8),
+#endif
 };
 
+#ifdef HAS_PPC_PMC_PA6T
 static struct sysdev_attribute pa6t_attrs[] = {
 	_SYSDEV_ATTR(mmcr0, 0600, show_mmcr0, store_mmcr0),
 	_SYSDEV_ATTR(mmcr1, 0600, show_mmcr1, store_mmcr1),
@@ -289,32 +322,46 @@ static struct sysdev_attribute pa6t_attrs[] = {
 	_SYSDEV_ATTR(tsr3, 0600, show_tsr3, store_tsr3),
 #endif /* CONFIG_DEBUG_KERNEL */
 };
+#endif /* HAS_PPC_PMC_PA6T */
+#endif /* HAS_PPC_PMC_CLASSIC */
 
-
-static void register_cpu_online(unsigned int cpu)
+static void __cpuinit register_cpu_online(unsigned int cpu)
 {
 	struct cpu *c = &per_cpu(cpu_devices, cpu);
 	struct sys_device *s = &c->sysdev;
 	struct sysdev_attribute *attrs, *pmc_attrs;
 	int i, nattrs;
 
+#ifdef CONFIG_PPC64
 	if (!firmware_has_feature(FW_FEATURE_ISERIES) &&
 			cpu_has_feature(CPU_FTR_SMT))
 		sysdev_create_file(s, &attr_smt_snooze_delay);
+#endif
 
 	/* PMC stuff */
 	switch (cur_cpu_spec->pmc_type) {
+#ifdef HAS_PPC_PMC_IBM
 	case PPC_PMC_IBM:
 		attrs = ibm_common_attrs;
 		nattrs = sizeof(ibm_common_attrs) / sizeof(struct sysdev_attribute);
-		pmc_attrs = ibm_pmc_attrs;
+		pmc_attrs = classic_pmc_attrs;
 		break;
+#endif /* HAS_PPC_PMC_IBM */
+#ifdef HAS_PPC_PMC_G4
+	case PPC_PMC_G4:
+		attrs = g4_common_attrs;
+		nattrs = sizeof(g4_common_attrs) / sizeof(struct sysdev_attribute);
+		pmc_attrs = classic_pmc_attrs;
+		break;
+#endif /* HAS_PPC_PMC_G4 */
+#ifdef HAS_PPC_PMC_PA6T
 	case PPC_PMC_PA6T:
 		/* PA Semi starts counting at PMC0 */
 		attrs = pa6t_attrs;
 		nattrs = sizeof(pa6t_attrs) / sizeof(struct sysdev_attribute);
 		pmc_attrs = NULL;
 		break;
+#endif /* HAS_PPC_PMC_PA6T */
 	default:
 		attrs = NULL;
 		nattrs = 0;
@@ -328,6 +375,7 @@ static void register_cpu_online(unsigned int cpu)
 		for (i = 0; i < cur_cpu_spec->num_pmcs; i++)
 			sysdev_create_file(s, &pmc_attrs[i]);
 
+#ifdef CONFIG_PPC64
 	if (cpu_has_feature(CPU_FTR_MMCRA))
 		sysdev_create_file(s, &attr_mmcra);
 
@@ -339,6 +387,9 @@ static void register_cpu_online(unsigned int cpu)
 
 	if (cpu_has_feature(CPU_FTR_DSCR))
 		sysdev_create_file(s, &attr_dscr);
+#endif /* CONFIG_PPC64 */
+
+	cacheinfo_cpu_online(cpu);
 }
 
 #ifdef CONFIG_HOTPLUG_CPU
@@ -351,23 +402,36 @@ static void unregister_cpu_online(unsigned int cpu)
 
 	BUG_ON(!c->hotpluggable);
 
+#ifdef CONFIG_PPC64
 	if (!firmware_has_feature(FW_FEATURE_ISERIES) &&
 			cpu_has_feature(CPU_FTR_SMT))
 		sysdev_remove_file(s, &attr_smt_snooze_delay);
+#endif
 
 	/* PMC stuff */
 	switch (cur_cpu_spec->pmc_type) {
+#ifdef HAS_PPC_PMC_IBM
 	case PPC_PMC_IBM:
 		attrs = ibm_common_attrs;
 		nattrs = sizeof(ibm_common_attrs) / sizeof(struct sysdev_attribute);
-		pmc_attrs = ibm_pmc_attrs;
+		pmc_attrs = classic_pmc_attrs;
 		break;
+#endif /* HAS_PPC_PMC_IBM */
+#ifdef HAS_PPC_PMC_G4
+	case PPC_PMC_G4:
+		attrs = g4_common_attrs;
+		nattrs = sizeof(g4_common_attrs) / sizeof(struct sysdev_attribute);
+		pmc_attrs = classic_pmc_attrs;
+		break;
+#endif /* HAS_PPC_PMC_G4 */
+#ifdef HAS_PPC_PMC_PA6T
 	case PPC_PMC_PA6T:
 		/* PA Semi starts counting at PMC0 */
 		attrs = pa6t_attrs;
 		nattrs = sizeof(pa6t_attrs) / sizeof(struct sysdev_attribute);
 		pmc_attrs = NULL;
 		break;
+#endif /* HAS_PPC_PMC_PA6T */
 	default:
 		attrs = NULL;
 		nattrs = 0;
@@ -381,6 +445,7 @@ static void unregister_cpu_online(unsigned int cpu)
 		for (i = 0; i < cur_cpu_spec->num_pmcs; i++)
 			sysdev_remove_file(s, &pmc_attrs[i]);
 
+#ifdef CONFIG_PPC64
 	if (cpu_has_feature(CPU_FTR_MMCRA))
 		sysdev_remove_file(s, &attr_mmcra);
 
@@ -392,6 +457,9 @@ static void unregister_cpu_online(unsigned int cpu)
 
 	if (cpu_has_feature(CPU_FTR_DSCR))
 		sysdev_remove_file(s, &attr_dscr);
+#endif /* CONFIG_PPC64 */
+
+	cacheinfo_cpu_offline(cpu);
 }
 #endif /* CONFIG_HOTPLUG_CPU */
 
@@ -522,7 +590,8 @@ static void register_nodes(void)
 #endif
 
 /* Only valid if CPU is present. */
-static ssize_t show_physical_id(struct sys_device *dev, char *buf)
+static ssize_t show_physical_id(struct sys_device *dev,
+				struct sysdev_attribute *attr, char *buf)
 {
 	struct cpu *cpu = container_of(dev, struct cpu, sysdev);
 

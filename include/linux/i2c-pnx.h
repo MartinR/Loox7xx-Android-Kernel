@@ -12,14 +12,16 @@
 #ifndef __I2C_PNX_H__
 #define __I2C_PNX_H__
 
-#include <asm/arch/i2c.h>
+#include <linux/pm.h>
+
+struct platform_device;
 
 struct i2c_pnx_mif {
 	int			ret;		/* Return value */
 	int			mode;		/* Interface mode */
 	struct completion	complete;	/* I/O completion */
 	struct timer_list	timer;		/* Timeout */
-	char *			buf;		/* Data buffer */
+	u8 *			buf;		/* Data buffer */
 	int			len;		/* Length of data buffer */
 };
 

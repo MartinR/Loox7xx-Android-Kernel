@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2006 - 2008 NetEffect, Inc. All rights reserved.
+ * Copyright (c) 2006 - 2009 Intel-NE, Inc.  All rights reserved.
  * Copyright (c) 2005 Open Grid Computing, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
@@ -43,7 +43,6 @@
 #include <linux/dma-mapping.h>
 #include <linux/workqueue.h>
 #include <linux/slab.h>
-#include <linux/version.h>
 #include <asm/io.h>
 #include <linux/crc32c.h>
 
@@ -57,10 +56,8 @@
 
 #define QUEUE_DISCONNECTS
 
-#define DRV_BUILD   "1"
-
 #define DRV_NAME    "iw_nes"
-#define DRV_VERSION "1.0 KO Build " DRV_BUILD
+#define DRV_VERSION "1.5.0.0"
 #define PFX         DRV_NAME ": "
 
 /*
@@ -93,9 +90,6 @@
 #define NES_MAX_PORT_COUNT 4
 
 #define MAX_DPC_ITERATIONS               128
-
-#define NES_CQP_REQUEST_NO_DOORBELL_RING 0
-#define NES_CQP_REQUEST_RING_DOORBELL    1
 
 #define NES_DRV_OPT_ENABLE_MPA_VER_0     0x00000001
 #define NES_DRV_OPT_DISABLE_MPA_CRC      0x00000002
@@ -141,14 +135,18 @@
 
 #ifdef CONFIG_INFINIBAND_NES_DEBUG
 #define nes_debug(level, fmt, args...) \
+do { \
 	if (level & nes_debug_level) \
-		printk(KERN_ERR PFX "%s[%u]: " fmt, __func__, __LINE__, ##args)
+		printk(KERN_ERR PFX "%s[%u]: " fmt, __func__, __LINE__, ##args); \
+} while (0)
 
-#define assert(expr)                                                \
-if (!(expr)) {                                                       \
-	printk(KERN_ERR PFX "Assertion failed! %s, %s, %s, line %d\n",  \
-		   #expr, __FILE__, __func__, __LINE__);                \
-}
+#define assert(expr) \
+do { \
+	if (!(expr)) { \
+		printk(KERN_ERR PFX "Assertion failed! %s, %s, %s, line %d\n", \
+			   #expr, __FILE__, __func__, __LINE__); \
+	} \
+} while (0)
 
 #define NES_EVENT_TIMEOUT   1200000
 #else
@@ -173,7 +171,7 @@ extern int disable_mpa_crc;
 extern unsigned int send_first;
 extern unsigned int nes_drv_opt;
 extern unsigned int nes_debug_level;
-
+extern unsigned int wqm_quanta;
 extern struct list_head nes_adapter_list;
 
 extern atomic_t cm_connects;
@@ -289,8 +287,8 @@ static inline __le32 get_crc_value(struct nes_v4_quad *nes_quad)
 static inline void
 set_wqe_64bit_value(__le32 *wqe_words, u32 index, u64 value)
 {
-	wqe_words[index]     = cpu_to_le32((u32) ((unsigned long)value));
-	wqe_words[index + 1] = cpu_to_le32((u32)(upper_32_bits((unsigned long)value)));
+	wqe_words[index]     = cpu_to_le32((u32) value);
+	wqe_words[index + 1] = cpu_to_le32(upper_32_bits(value));
 }
 
 static inline void
@@ -525,7 +523,7 @@ int nes_cm_disconn(struct nes_qp *);
 void nes_cm_disconn_worker(void *);
 
 /* nes_verbs.c */
-int nes_hw_modify_qp(struct nes_device *, struct nes_qp *, u32, u32);
+int nes_hw_modify_qp(struct nes_device *, struct nes_qp *, u32, u32, u32);
 int nes_modify_qp(struct ib_qp *, struct ib_qp_attr *, int, struct ib_udata *);
 struct nes_ib_device *nes_init_ofa_device(struct net_device *);
 void nes_destroy_ofa_device(struct nes_ib_device *);
@@ -538,7 +536,11 @@ void nes_read_1G_phy_reg(struct nes_device *, u8, u8, u16 *);
 void nes_write_10G_phy_reg(struct nes_device *, u16, u8, u16, u16);
 void nes_read_10G_phy_reg(struct nes_device *, u8, u8, u16);
 struct nes_cqp_request *nes_get_cqp_request(struct nes_device *);
-void nes_post_cqp_request(struct nes_device *, struct nes_cqp_request *, int);
+void nes_free_cqp_request(struct nes_device *nesdev,
+			  struct nes_cqp_request *cqp_request);
+void nes_put_cqp_request(struct nes_device *nesdev,
+			 struct nes_cqp_request *cqp_request);
+void nes_post_cqp_request(struct nes_device *, struct nes_cqp_request *);
 int nes_arp_table(struct nes_device *, u32, u8 *, u32);
 void nes_mh_fix(unsigned long);
 void nes_clc(unsigned long);

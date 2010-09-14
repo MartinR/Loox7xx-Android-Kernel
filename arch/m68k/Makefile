@@ -13,7 +13,7 @@
 # Copyright (C) 1994 by Hamish Macdonald
 #
 
-KBUILD_DEFCONFIG := amiga_defconfig
+KBUILD_DEFCONFIG := multi_defconfig
 
 # override top level makefile
 AS += -m68020
@@ -117,3 +117,6 @@ endif
 
 archclean:
 	rm -f vmlinux.gz vmlinux.bz2
+
+install:
+	sh $(srctree)/arch/m68k/install.sh $(KERNELRELEASE) vmlinux.gz System.map "$(INSTALL_PATH)"

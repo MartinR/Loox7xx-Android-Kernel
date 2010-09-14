@@ -28,6 +28,11 @@ enum pci_dev_reg_1 {
 	PCI_Y2_PHY2_POWD = 1<<27, /* Set PHY 2 to Power Down (YUKON-2) */
 	PCI_Y2_PHY1_POWD = 1<<26, /* Set PHY 1 to Power Down (YUKON-2) */
 	PCI_Y2_PME_LEGACY= 1<<15, /* PCI Express legacy power management mode */
+
+	PCI_PHY_LNK_TIM_MSK= 3L<<8,/* Bit  9.. 8:	GPHY Link Trigger Timer */
+	PCI_ENA_L1_EVENT = 1<<7, /* Enable PEX L1 Event */
+	PCI_ENA_GPHY_LNK = 1<<6, /* Enable PEX L1 on GPHY Link down */
+	PCI_FORCE_PEX_L1 = 1<<5, /* Force to PEX L1 */
 };
 
 enum pci_dev_reg_2 {
@@ -45,7 +50,11 @@ enum pci_dev_reg_2 {
 
 /*	PCI_OUR_REG_4		32 bit	Our Register 4 (Yukon-ECU only) */
 enum pci_dev_reg_4 {
-					/* (Link Training & Status State Machine) */
+				/* (Link Training & Status State Machine) */
+	P_PEX_LTSSM_STAT_MSK	= 0x7fL<<25,	/* Bit 31..25:	PEX LTSSM Mask */
+#define P_PEX_LTSSM_STAT(x)	((x << 25) & P_PEX_LTSSM_STAT_MSK)
+	P_PEX_LTSSM_L1_STAT	= 0x34,
+	P_PEX_LTSSM_DET_STAT	= 0x01,
 	P_TIMER_VALUE_MSK	= 0xffL<<16,	/* Bit 23..16:	Timer Value Mask */
 					/* (Active State Power Management) */
 	P_FORCE_ASPM_REQUEST	= 1<<15, /* Force ASPM Request (A1 only) */
@@ -146,7 +155,7 @@ enum pci_cfg_reg1 {
 enum csr_regs {
 	B0_RAP		= 0x0000,
 	B0_CTST		= 0x0004,
-	B0_Y2LED	= 0x0005,
+
 	B0_POWER_CTRL	= 0x0007,
 	B0_ISRC		= 0x0008,
 	B0_IMSK		= 0x000c,
@@ -251,7 +260,7 @@ enum csr_regs {
 	Y2_CFG_AER      = 0x1d00,	/* PCI Advanced Error Report region */
 };
 
-/*	B0_CTST			16 bit	Control/Status register */
+/*	B0_CTST			24 bit	Control/Status register */
 enum {
 	Y2_VMAIN_AVAIL	= 1<<17,/* VMAIN available (YUKON-2 only) */
 	Y2_VAUX_AVAIL	= 1<<16,/* VAUX available (YUKON-2 only) */
@@ -272,13 +281,6 @@ enum {
 	CS_MRST_SET	= 1<<2,	/* Set Master reset	*/
 	CS_RST_CLR	= 1<<1,	/* Clear Software reset	*/
 	CS_RST_SET	= 1,	/* Set   Software reset	*/
-};
-
-/*	B0_LED			 8 Bit	LED register */
-enum {
-/* Bit  7.. 2:	reserved */
-	LED_STAT_ON	= 1<<1,	/* Status LED on	*/
-	LED_STAT_OFF	= 1,	/* Status LED off	*/
 };
 
 /*	B0_POWER_CTRL	 8 Bit	Power Control reg (YUKON only) */
@@ -432,6 +434,7 @@ enum {
  	CHIP_ID_YUKON_FE   = 0xb7, /* YUKON-2 FE */
  	CHIP_ID_YUKON_FE_P = 0xb8, /* YUKON-2 FE+ */
 	CHIP_ID_YUKON_SUPR = 0xb9, /* YUKON-2 Supreme */
+	CHIP_ID_YUKON_UL_2 = 0xba, /* YUKON-2 Ultra 2 */
 };
 enum yukon_ec_rev {
 	CHIP_REV_YU_EC_A1    = 0,  /* Chip Rev. for Yukon-EC A1/A0 */
@@ -453,6 +456,9 @@ enum yukon_fe_p_rev {
 enum yukon_ex_rev {
 	CHIP_REV_YU_EX_A0    = 1,
 	CHIP_REV_YU_EX_B0    = 2,
+};
+enum yukon_supr_rev {
+	CHIP_REV_YU_SU_A0    = 0,
 };
 
 
@@ -1143,6 +1149,12 @@ enum {
 	PHY_M_PC_ENA_AUTO	= 3, /* 11 = Enable Automatic Crossover */
 };
 
+/* for Yukon-EC Ultra Gigabit Ethernet PHY (88E1149 only) */
+enum {
+	PHY_M_PC_COP_TX_DIS	= 1<<3, /* Copper Transmitter Disable */
+	PHY_M_PC_POW_D_ENA	= 1<<2,	/* Power Down Enable */
+};
+
 /* for 10/100 Fast Ethernet PHY (88E3082 only) */
 enum {
 	PHY_M_PC_ENA_DTE_DT	= 1<<15, /* Enable Data Terminal Equ. (DTE) Detect */
@@ -1411,6 +1423,7 @@ enum {
 /*****  PHY_MARV_PHY_CTRL (page 2)		16 bit r/w	MAC Specific Ctrl *****/
 enum {
 	PHY_M_MAC_MD_MSK	= 7<<7, /* Bit  9.. 7: Mode Select Mask */
+	PHY_M_MAC_GMIF_PUP	= 1<<3,	/* GMII Power Up (88E1149 only) */
 	PHY_M_MAC_MD_AUTO	= 3,/* Auto Copper/1000Base-X */
 	PHY_M_MAC_MD_COPPER	= 5,/* Copper only */
 	PHY_M_MAC_MD_1000BX	= 7,/* 1000Base-X only */
@@ -1563,7 +1576,6 @@ enum {
 };
 
 #define GM_GPCR_SPEED_1000	(GM_GPCR_GIGS_ENA | GM_GPCR_SPEED_100)
-#define GM_GPCR_AU_ALL_DIS	(GM_GPCR_AU_DUP_DIS | GM_GPCR_AU_FCT_DIS|GM_GPCR_AU_SPD_DIS)
 
 /*	GM_TX_CTRL			16 bit r/w	Transmit Control Register */
 enum {
@@ -1965,6 +1977,9 @@ struct sky2_status_le {
 
 struct tx_ring_info {
 	struct sk_buff	*skb;
+	unsigned long flags;
+#define TX_MAP_SINGLE   0x0001
+#define TX_MAP_PAGE     000002
 	DECLARE_PCI_UNMAP_ADDR(mapaddr);
 	DECLARE_PCI_UNMAP_LEN(maplen);
 };
@@ -1992,12 +2007,14 @@ struct sky2_port {
 
 	struct tx_ring_info  *tx_ring;
 	struct sky2_tx_le    *tx_le;
+	u16		     tx_ring_size;
 	u16		     tx_cons;		/* next le to check */
 	u16		     tx_prod;		/* next le to use */
 	u16		     tx_next;		/* debug only */
 
 	u16		     tx_pending;
 	u16		     tx_last_mss;
+	u32		     tx_last_upper;
 	u32		     tx_tcpsum;
 
 	struct rx_ring_info  *rx_ring ____cacheline_aligned_in_smp;
@@ -2021,15 +2038,18 @@ struct sky2_port {
 		u8	fifo_lev;
 	} check;
 
-
 	dma_addr_t	     rx_le_map;
 	dma_addr_t	     tx_le_map;
+
 	u16		     advertising;	/* ADVERTISED_ bits */
-	u16		     speed;	/* SPEED_1000, SPEED_100, ... */
-	u8		     autoneg;	/* AUTONEG_ENABLE, AUTONEG_DISABLE */
-	u8		     duplex;	/* DUPLEX_HALF, DUPLEX_FULL */
-	u8		     rx_csum;
-	u8		     wol;
+	u16		     speed;		/* SPEED_1000, SPEED_100, ... */
+	u8		     wol;		/* WAKE_ bits */
+	u8		     duplex;		/* DUPLEX_HALF, DUPLEX_FULL */
+	u16		     flags;
+#define SKY2_FLAG_RX_CHECKSUM		0x0001
+#define SKY2_FLAG_AUTO_SPEED		0x0002
+#define SKY2_FLAG_AUTO_PAUSE		0x0004
+
  	enum flow_control    flow_mode;
  	enum flow_control    flow_status;
 
@@ -2065,6 +2085,8 @@ struct sky2_hw {
 	struct timer_list    watchdog_timer;
 	struct work_struct   restart_work;
 	wait_queue_head_t    msi_wait;
+
+	char		     irq_name[0];
 };
 
 static inline int sky2_is_copper(const struct sky2_hw *hw)

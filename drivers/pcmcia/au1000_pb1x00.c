@@ -26,7 +26,6 @@
 #include <linux/delay.h>
 #include <linux/ioport.h>
 #include <linux/kernel.h>
-#include <linux/tqueue.h>
 #include <linux/timer.h>
 #include <linux/mm.h>
 #include <linux/proc_fs.h>
@@ -35,10 +34,8 @@
 #include <pcmcia/cs_types.h>
 #include <pcmcia/cs.h>
 #include <pcmcia/ss.h>
-#include <pcmcia/bulkmem.h>
 #include <pcmcia/cistpl.h>
 #include <pcmcia/bus_ops.h>
-#include "cs_internal.h"
 
 #include <asm/io.h>
 #include <asm/irq.h>

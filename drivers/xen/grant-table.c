@@ -40,6 +40,7 @@
 #include <xen/interface/xen.h>
 #include <xen/page.h>
 #include <xen/grant_table.h>
+#include <asm/xen/hypercall.h>
 
 #include <asm/pgtable.h>
 #include <asm/sync_bitops.h>
@@ -471,14 +472,14 @@ static int gnttab_map(unsigned int start_idx, unsigned int end_idx)
 	return 0;
 }
 
-static int gnttab_resume(void)
+int gnttab_resume(void)
 {
 	if (max_nr_grant_frames() < nr_grant_frames)
 		return -ENOSYS;
 	return gnttab_map(0, nr_grant_frames - 1);
 }
 
-static int gnttab_suspend(void)
+int gnttab_suspend(void)
 {
 	arch_gnttab_unmap_shared(shared, nr_grant_frames);
 	return 0;
@@ -508,7 +509,7 @@ static int __devinit gnttab_init(void)
 	unsigned int max_nr_glist_frames, nr_glist_frames;
 	unsigned int nr_init_grefs;
 
-	if (!is_running_on_xen())
+	if (!xen_domain())
 		return -ENODEV;
 
 	nr_grant_frames = 1;

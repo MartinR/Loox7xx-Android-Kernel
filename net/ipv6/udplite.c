@@ -2,8 +2,6 @@
  *  UDPLITEv6   An implementation of the UDP-Lite protocol over IPv6.
  *              See also net/ipv4/udplite.c
  *
- *  Version:    $Id: udplite.c,v 1.9 2006/10/19 08:28:10 gerrit Exp $
- *
  *  Authors:    Gerrit Renker       <gerrit@erg.abdn.ac.uk>
  *
  *  Changes:
@@ -15,21 +13,19 @@
  */
 #include "udp_impl.h"
 
-DEFINE_SNMP_STAT(struct udp_mib, udplite_stats_in6) __read_mostly;
-
 static int udplitev6_rcv(struct sk_buff *skb)
 {
-	return __udp6_lib_rcv(skb, udplite_hash, IPPROTO_UDPLITE);
+	return __udp6_lib_rcv(skb, &udplite_table, IPPROTO_UDPLITE);
 }
 
 static void udplitev6_err(struct sk_buff *skb,
 			  struct inet6_skb_parm *opt,
-			  int type, int code, int offset, __be32 info)
+			  u8 type, u8 code, int offset, __be32 info)
 {
-	__udp6_lib_err(skb, opt, type, code, offset, info, udplite_hash);
+	__udp6_lib_err(skb, opt, type, code, offset, info, &udplite_table);
 }
 
-static struct inet6_protocol udplitev6_protocol = {
+static const struct inet6_protocol udplitev6_protocol = {
 	.handler	=	udplitev6_rcv,
 	.err_handler	=	udplitev6_err,
 	.flags		=	INET6_PROTO_NOPOLICY|INET6_PROTO_FINAL,
@@ -53,7 +49,8 @@ struct proto udplitev6_prot = {
 	.unhash		   = udp_lib_unhash,
 	.get_port	   = udp_v6_get_port,
 	.obj_size	   = sizeof(struct udp6_sock),
-	.h.udp_hash	   = udplite_hash,
+	.slab_flags	   = SLAB_DESTROY_BY_RCU,
+	.h.udp_table	   = &udplite_table,
 #ifdef CONFIG_COMPAT
 	.compat_setsockopt = compat_udpv6_setsockopt,
 	.compat_getsockopt = compat_udpv6_getsockopt,
@@ -99,7 +96,7 @@ void udplitev6_exit(void)
 static struct udp_seq_afinfo udplite6_seq_afinfo = {
 	.name		= "udplite6",
 	.family		= AF_INET6,
-	.hashtable	= udplite_hash,
+	.udp_table	= &udplite_table,
 	.seq_fops	= {
 		.owner	=	THIS_MODULE,
 	},

@@ -40,6 +40,7 @@
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
+#include <linux/smp_lock.h>
 #include <linux/timer.h>
 #include <linux/string.h>
 #include <linux/net.h>
@@ -191,7 +192,7 @@ static int x25_device_event(struct notifier_block *this, unsigned long event,
 	struct net_device *dev = ptr;
 	struct x25_neigh *nb;
 
-	if (dev_net(dev) != &init_net)
+	if (!net_eq(dev_net(dev), &init_net))
 		return NOTIFY_DONE;
 
 	if (dev->type == ARPHRD_X25
@@ -332,14 +333,14 @@ static unsigned int x25_new_lci(struct x25_neigh *nb)
 /*
  *	Deferred destroy.
  */
-void x25_destroy_socket(struct sock *);
+static void __x25_destroy_socket(struct sock *);
 
 /*
  *	handler for deferred kills.
  */
 static void x25_destroy_timer(unsigned long data)
 {
-	x25_destroy_socket((struct sock *)data);
+	x25_destroy_socket_from_timer((struct sock *)data);
 }
 
 /*
@@ -349,12 +350,10 @@ static void x25_destroy_timer(unsigned long data)
  *	will touch it and we are (fairly 8-) ) safe.
  *	Not static as it's used by the timer
  */
-void x25_destroy_socket(struct sock *sk)
+static void __x25_destroy_socket(struct sock *sk)
 {
 	struct sk_buff *skb;
 
-	sock_hold(sk);
-	lock_sock(sk);
 	x25_stop_heartbeat(sk);
 	x25_stop_timer(sk);
 
@@ -374,8 +373,7 @@ void x25_destroy_socket(struct sock *sk)
 		kfree_skb(skb);
 	}
 
-	if (atomic_read(&sk->sk_wmem_alloc) ||
-	    atomic_read(&sk->sk_rmem_alloc)) {
+	if (sk_has_allocations(sk)) {
 		/* Defer: outstanding buffers */
 		sk->sk_timer.expires  = jiffies + 10 * HZ;
 		sk->sk_timer.function = x25_destroy_timer;
@@ -385,7 +383,22 @@ void x25_destroy_socket(struct sock *sk)
 		/* drop last reference so sock_put will free */
 		__sock_put(sk);
 	}
+}
 
+void x25_destroy_socket_from_timer(struct sock *sk)
+{
+	sock_hold(sk);
+	bh_lock_sock(sk);
+	__x25_destroy_socket(sk);
+	bh_unlock_sock(sk);
+	sock_put(sk);
+}
+
+static void x25_destroy_socket(struct sock *sk)
+{
+	sock_hold(sk);
+	lock_sock(sk);
+	__x25_destroy_socket(sk);
 	release_sock(sk);
 	sock_put(sk);
 }
@@ -396,7 +409,7 @@ void x25_destroy_socket(struct sock *sk)
  */
 
 static int x25_setsockopt(struct socket *sock, int level, int optname,
-			  char __user *optval, int optlen)
+			  char __user *optval, unsigned int optlen)
 {
 	int opt;
 	struct sock *sk = sock->sk;
@@ -555,13 +568,11 @@ static struct sock *x25_make_new(struct sock *osk)
 	x25 = x25_sk(sk);
 
 	sk->sk_type        = osk->sk_type;
-	sk->sk_socket      = osk->sk_socket;
 	sk->sk_priority    = osk->sk_priority;
 	sk->sk_protocol    = osk->sk_protocol;
 	sk->sk_rcvbuf      = osk->sk_rcvbuf;
 	sk->sk_sndbuf      = osk->sk_sndbuf;
 	sk->sk_state       = TCP_ESTABLISHED;
-	sk->sk_sleep       = osk->sk_sleep;
 	sk->sk_backlog_rcv = osk->sk_backlog_rcv;
 	sock_copy_flags(sk, osk);
 
@@ -614,8 +625,7 @@ static int x25_release(struct socket *sock)
 			break;
 	}
 
-	sock->sk	= NULL;
-	sk->sk_socket	= NULL;	/* Not used, but we should do this */
+	sock_orphan(sk);
 out:
 	return 0;
 }
@@ -808,14 +818,12 @@ static int x25_accept(struct socket *sock, struct socket *newsock, int flags)
 	if (!skb->sk)
 		goto out2;
 	newsk		 = skb->sk;
-	newsk->sk_socket = newsock;
-	newsk->sk_sleep  = &newsock->wait;
+	sock_graft(newsk, newsock);
 
 	/* Now attach up the new socket */
 	skb->sk = NULL;
 	kfree_skb(skb);
 	sk->sk_ack_backlog--;
-	newsock->sk    = newsk;
 	newsock->state = SS_CONNECTED;
 	rc = 0;
 out2:
@@ -956,10 +964,8 @@ int x25_rx_call_request(struct sk_buff *skb, struct x25_neigh *nb,
 	/*
 	 *	Incoming Call User Data.
 	 */
-	if (skb->len >= 0) {
-		skb_copy_from_linear_data(skb, makex25->calluserdata.cuddata, skb->len);
-		makex25->calluserdata.cudlength = skb->len;
-	}
+	skb_copy_from_linear_data(skb, makex25->calluserdata.cuddata, skb->len);
+	makex25->calluserdata.cudlength = skb->len;
 
 	sk->sk_ack_backlog++;
 
@@ -1040,6 +1046,12 @@ static int x25_sendmsg(struct kiocb *iocb, struct socket *sock,
 
 		sx25.sx25_family = AF_X25;
 		sx25.sx25_addr   = x25->dest_addr;
+	}
+
+	/* Sanity check the packet size */
+	if (len > 65535) {
+		rc = -EMSGSIZE;
+		goto out;
 	}
 
 	SOCK_DEBUG(sk, "x25_sendmsg: sendto: Addresses built.\n");
@@ -1127,8 +1139,9 @@ static int x25_sendmsg(struct kiocb *iocb, struct socket *sock,
 	if (msg->msg_flags & MSG_OOB)
 		skb_queue_tail(&x25->interrupt_out_queue, skb);
 	else {
-		len = x25_output(sk, skb);
-		if (len < 0)
+		rc = x25_output(sk, skb);
+		len = rc;
+		if (rc < 0)
 			kfree_skb(skb);
 		else if (x25->qbitincl)
 			len++;
@@ -1259,8 +1272,8 @@ static int x25_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 
 	switch (cmd) {
 		case TIOCOUTQ: {
-			int amount = sk->sk_sndbuf -
-				     atomic_read(&sk->sk_wmem_alloc);
+			int amount = sk->sk_sndbuf - sk_wmem_alloc_get(sk);
+
 			if (amount < 0)
 				amount = 0;
 			rc = put_user(amount, (unsigned int __user *)argp);
@@ -1613,8 +1626,8 @@ static const struct proto_ops SOCKOPS_WRAPPED(x25_proto_ops) = {
 
 SOCKOPS_WRAP(x25_proto, AF_X25);
 
-static struct packet_type x25_packet_type = {
-	.type =	__constant_htons(ETH_P_X25),
+static struct packet_type x25_packet_type __read_mostly = {
+	.type =	cpu_to_be16(ETH_P_X25),
 	.func =	x25_lapb_receive_frame,
 };
 

@@ -98,7 +98,7 @@ static int sp8870_readreg (struct sp8870_state* state, u16 reg)
 static int sp8870_firmware_upload (struct sp8870_state* state, const struct firmware *fw)
 {
 	struct i2c_msg msg;
-	char *fw_buf = fw->data;
+	const char *fw_buf = fw->data;
 	int fw_pos;
 	u8 tx_buf[255];
 	int tx_len;
@@ -557,7 +557,7 @@ struct dvb_frontend* sp8870_attach(const struct sp8870_config* config,
 	struct sp8870_state* state = NULL;
 
 	/* allocate memory for the internal state */
-	state = kmalloc(sizeof(struct sp8870_state), GFP_KERNEL);
+	state = kzalloc(sizeof(struct sp8870_state), GFP_KERNEL);
 	if (state == NULL) goto error;
 
 	/* setup the state */

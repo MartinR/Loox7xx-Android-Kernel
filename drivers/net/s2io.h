@@ -18,15 +18,6 @@
 #define vBIT(val, loc, sz)	(((u64)val) << (64-loc-sz))
 #define INV(d)  ((d&0xff)<<24) | (((d>>8)&0xff)<<16) | (((d>>16)&0xff)<<8)| ((d>>24)&0xff)
 
-#ifndef BOOL
-#define BOOL    int
-#endif
-
-#ifndef TRUE
-#define TRUE    1
-#define FALSE   0
-#endif
-
 #undef SUCCESS
 #define SUCCESS 0
 #define FAILURE -1
@@ -73,7 +64,10 @@ enum {
 static int debug_level = ERR_DBG;
 
 /* DEBUG message print. */
-#define DBG_PRINT(dbg_level, args...)  if(!(debug_level<dbg_level)) printk(args)
+#define DBG_PRINT(dbg_level, fmt, args...) do {			\
+	if (dbg_level >= debug_level)				\
+		pr_info(fmt, ##args);				\
+	} while (0)
 
 /* Protocol assist features of the NIC */
 #define L3_CKSUM_OK 0xFFFF
@@ -748,7 +742,7 @@ struct ring_info {
 
 	/* interface MTU value */
         unsigned mtu;
-    
+
 	/* Buffer Address store. */
 	struct buffAdd **ba;
 
@@ -962,6 +956,7 @@ struct s2io_nic {
 	int task_flag;
 	unsigned long long start_time;
 	struct vlan_group *vlgrp;
+	int vlan_strip_flag;
 #define MSIX_FLG                0xA5
 	int num_entries;
 	struct msix_entry *entries;
@@ -1107,6 +1102,7 @@ static int init_shared_mem(struct s2io_nic *sp);
 static void free_shared_mem(struct s2io_nic *sp);
 static int init_nic(struct s2io_nic *nic);
 static int rx_intr_handler(struct ring_info *ring_data, int budget);
+static void s2io_txpic_intr_handle(struct s2io_nic *sp);
 static void tx_intr_handler(struct fifo_info *fifo_data);
 static void s2io_handle_errors(void * dev_id);
 

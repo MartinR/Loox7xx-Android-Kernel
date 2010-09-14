@@ -33,20 +33,19 @@
 
 */
 
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/poll.h>
 #include <linux/errno.h>
-#include <linux/if_arp.h>
-#include <linux/init.h>
-#include <linux/skbuff.h>
-#include <linux/pkt_sched.h>
-#include <linux/inetdevice.h>
-#include <linux/lapb.h>
-#include <linux/rtnetlink.h>
 #include <linux/etherdevice.h>
 #include <linux/hdlc.h>
+#include <linux/if_arp.h>
+#include <linux/inetdevice.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/module.h>
+#include <linux/pkt_sched.h>
+#include <linux/poll.h>
+#include <linux/rtnetlink.h>
+#include <linux/skbuff.h>
+#include <linux/slab.h>
 
 #undef DEBUG_PKT
 #undef DEBUG_ECN
@@ -96,7 +95,7 @@ typedef struct {
 	unsigned ea1:	1;
 	unsigned cr:	1;
 	unsigned dlcih:	6;
-  
+
 	unsigned ea2:	1;
 	unsigned de:	1;
 	unsigned becn:	1;
@@ -134,11 +133,6 @@ typedef struct pvc_device_struct {
 		unsigned int bandwidth;	/* Cisco LMI reporting only */
 	}state;
 }pvc_device;
-
-struct pvc_desc {
-	struct net_device_stats stats;
-	pvc_device *pvc;
-};
 
 struct frad_state {
 	fr_proto settings;
@@ -179,15 +173,6 @@ static inline struct frad_state* state(hdlc_device *hdlc)
 	return(struct frad_state *)(hdlc->state);
 }
 
-static inline struct pvc_desc* pvcdev_to_desc(struct net_device *dev)
-{
-	return dev->priv;
-}
-
-static inline struct net_device_stats* pvc_get_stats(struct net_device *dev)
-{
-	return &pvcdev_to_desc(dev)->stats;
-}
 
 static inline pvc_device* find_pvc(hdlc_device *hdlc, u16 dlci)
 {
@@ -293,31 +278,31 @@ static int fr_hard_header(struct sk_buff **skb_p, u16 dlci)
 	struct sk_buff *skb = *skb_p;
 
 	switch (skb->protocol) {
-	case __constant_htons(NLPID_CCITT_ANSI_LMI):
+	case cpu_to_be16(NLPID_CCITT_ANSI_LMI):
 		head_len = 4;
 		skb_push(skb, head_len);
 		skb->data[3] = NLPID_CCITT_ANSI_LMI;
 		break;
 
-	case __constant_htons(NLPID_CISCO_LMI):
+	case cpu_to_be16(NLPID_CISCO_LMI):
 		head_len = 4;
 		skb_push(skb, head_len);
 		skb->data[3] = NLPID_CISCO_LMI;
 		break;
 
-	case __constant_htons(ETH_P_IP):
+	case cpu_to_be16(ETH_P_IP):
 		head_len = 4;
 		skb_push(skb, head_len);
 		skb->data[3] = NLPID_IP;
 		break;
 
-	case __constant_htons(ETH_P_IPV6):
+	case cpu_to_be16(ETH_P_IPV6):
 		head_len = 4;
 		skb_push(skb, head_len);
 		skb->data[3] = NLPID_IPV6;
 		break;
 
-	case __constant_htons(ETH_P_802_3):
+	case cpu_to_be16(ETH_P_802_3):
 		head_len = 10;
 		if (skb_headroom(skb) < head_len) {
 			struct sk_buff *skb2 = skb_realloc_headroom(skb,
@@ -357,7 +342,7 @@ static int fr_hard_header(struct sk_buff **skb_p, u16 dlci)
 
 static int pvc_open(struct net_device *dev)
 {
-	pvc_device *pvc = pvcdev_to_desc(dev)->pvc;
+	pvc_device *pvc = dev->ml_priv;
 
 	if ((pvc->frad->flags & IFF_UP) == 0)
 		return -EIO;  /* Frad must be UP in order to activate PVC */
@@ -377,7 +362,7 @@ static int pvc_open(struct net_device *dev)
 
 static int pvc_close(struct net_device *dev)
 {
-	pvc_device *pvc = pvcdev_to_desc(dev)->pvc;
+	pvc_device *pvc = dev->ml_priv;
 
 	if (--pvc->open_count == 0) {
 		hdlc_device *hdlc = dev_to_hdlc(pvc->frad);
@@ -396,7 +381,7 @@ static int pvc_close(struct net_device *dev)
 
 static int pvc_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 {
-	pvc_device *pvc = pvcdev_to_desc(dev)->pvc;
+	pvc_device *pvc = dev->ml_priv;
 	fr_proto_pvc_info info;
 
 	if (ifr->ifr_settings.type == IF_GET_PROTO) {
@@ -422,10 +407,9 @@ static int pvc_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 	return -EINVAL;
 }
 
-static int pvc_xmit(struct sk_buff *skb, struct net_device *dev)
+static netdev_tx_t pvc_xmit(struct sk_buff *skb, struct net_device *dev)
 {
-	pvc_device *pvc = pvcdev_to_desc(dev)->pvc;
-	struct net_device_stats *stats = pvc_get_stats(dev);
+	pvc_device *pvc = dev->ml_priv;
 
 	if (pvc->state.active) {
 		if (dev->type == ARPHRD_ETHER) {
@@ -435,42 +419,30 @@ static int pvc_xmit(struct sk_buff *skb, struct net_device *dev)
 				if (skb_tailroom(skb) < pad)
 					if (pskb_expand_head(skb, 0, pad,
 							     GFP_ATOMIC)) {
-						stats->tx_dropped++;
+						dev->stats.tx_dropped++;
 						dev_kfree_skb(skb);
-						return 0;
+						return NETDEV_TX_OK;
 					}
 				skb_put(skb, pad);
 				memset(skb->data + len, 0, pad);
 			}
-			skb->protocol = __constant_htons(ETH_P_802_3);
+			skb->protocol = cpu_to_be16(ETH_P_802_3);
 		}
 		if (!fr_hard_header(&skb, pvc->dlci)) {
-			stats->tx_bytes += skb->len;
-			stats->tx_packets++;
+			dev->stats.tx_bytes += skb->len;
+			dev->stats.tx_packets++;
 			if (pvc->state.fecn) /* TX Congestion counter */
-				stats->tx_compressed++;
+				dev->stats.tx_compressed++;
 			skb->dev = pvc->frad;
 			dev_queue_xmit(skb);
-			return 0;
+			return NETDEV_TX_OK;
 		}
 	}
 
-	stats->tx_dropped++;
+	dev->stats.tx_dropped++;
 	dev_kfree_skb(skb);
-	return 0;
+	return NETDEV_TX_OK;
 }
-
-
-
-static int pvc_change_mtu(struct net_device *dev, int new_mtu)
-{
-	if ((new_mtu < 68) || (new_mtu > HDLC_MAX_MTU))
-		return -EINVAL;
-	dev->mtu = new_mtu;
-	return 0;
-}
-
-
 
 static inline void fr_log_dlci_active(pvc_device *pvc)
 {
@@ -524,10 +496,10 @@ static void fr_lmi_send(struct net_device *dev, int fullrep)
 	memset(skb->data, 0, len);
 	skb_reserve(skb, 4);
 	if (lmi == LMI_CISCO) {
-		skb->protocol = __constant_htons(NLPID_CISCO_LMI);
+		skb->protocol = cpu_to_be16(NLPID_CISCO_LMI);
 		fr_hard_header(&skb, LMI_CISCO_DLCI);
 	} else {
-		skb->protocol = __constant_htons(NLPID_CCITT_ANSI_LMI);
+		skb->protocol = cpu_to_be16(NLPID_CCITT_ANSI_LMI);
 		fr_hard_header(&skb, LMI_CCITT_ANSI_DLCI);
 	}
 	data = skb_tail_pointer(skb);
@@ -955,7 +927,7 @@ static int fr_rx(struct sk_buff *skb)
 
 
 	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL) {
-		dev_to_hdlc(frad)->stats.rx_dropped++;
+		frad->stats.rx_dropped++;
 		return NET_RX_DROP;
 	}
 
@@ -1003,11 +975,10 @@ static int fr_rx(struct sk_buff *skb)
 	}
 
 	if (dev) {
-		struct net_device_stats *stats = pvc_get_stats(dev);
-		stats->rx_packets++; /* PVC traffic */
-		stats->rx_bytes += skb->len;
+		dev->stats.rx_packets++; /* PVC traffic */
+		dev->stats.rx_bytes += skb->len;
 		if (pvc->state.becn)
-			stats->rx_compressed++;
+			dev->stats.rx_compressed++;
 		skb->dev = dev;
 		netif_rx(skb);
 		return NET_RX_SUCCESS;
@@ -1017,7 +988,7 @@ static int fr_rx(struct sk_buff *skb)
 	}
 
  rx_error:
-	dev_to_hdlc(frad)->stats.rx_errors++; /* Mark error */
+	frad->stats.rx_errors++; /* Mark error */
 	dev_kfree_skb_any(skb);
 	return NET_RX_DROP;
 }
@@ -1083,12 +1054,21 @@ static void pvc_setup(struct net_device *dev)
 	dev->flags = IFF_POINTOPOINT;
 	dev->hard_header_len = 10;
 	dev->addr_len = 2;
+	dev->priv_flags &= ~IFF_XMIT_DST_RELEASE;
 }
+
+static const struct net_device_ops pvc_ops = {
+	.ndo_open       = pvc_open,
+	.ndo_stop       = pvc_close,
+	.ndo_change_mtu = hdlc_change_mtu,
+	.ndo_start_xmit = pvc_xmit,
+	.ndo_do_ioctl   = pvc_ioctl,
+};
 
 static int fr_add_pvc(struct net_device *frad, unsigned int dlci, int type)
 {
 	hdlc_device *hdlc = dev_to_hdlc(frad);
-	pvc_device *pvc = NULL;
+	pvc_device *pvc;
 	struct net_device *dev;
 	int result, used;
 
@@ -1104,10 +1084,9 @@ static int fr_add_pvc(struct net_device *frad, unsigned int dlci, int type)
 	used = pvc_is_used(pvc);
 
 	if (type == ARPHRD_ETHER)
-		dev = alloc_netdev(sizeof(struct pvc_desc), "pvceth%d",
-				   ether_setup);
+		dev = alloc_netdev(0, "pvceth%d", ether_setup);
 	else
-		dev = alloc_netdev(sizeof(struct pvc_desc), "pvc%d", pvc_setup);
+		dev = alloc_netdev(0, "pvc%d", pvc_setup);
 
 	if (!dev) {
 		printk(KERN_WARNING "%s: Memory squeeze on fr_pvc()\n",
@@ -1122,15 +1101,10 @@ static int fr_add_pvc(struct net_device *frad, unsigned int dlci, int type)
 		*(__be16*)dev->dev_addr = htons(dlci);
 		dlci_to_q922(dev->broadcast, dlci);
 	}
-	dev->hard_start_xmit = pvc_xmit;
-	dev->get_stats = pvc_get_stats;
-	dev->open = pvc_open;
-	dev->stop = pvc_close;
-	dev->do_ioctl = pvc_ioctl;
-	dev->change_mtu = pvc_change_mtu;
+	dev->netdev_ops = &pvc_ops;
 	dev->mtu = HDLC_MAX_MTU;
 	dev->tx_queue_len = 0;
-	pvcdev_to_desc(dev)->pvc = pvc;
+	dev->ml_priv = pvc;
 
 	result = dev_alloc_name(dev, dev->name);
 	if (result < 0) {
@@ -1279,8 +1253,6 @@ static int fr_ioctl(struct net_device *dev, struct ifreq *ifr)
 			state(hdlc)->dce_pvc_count = 0;
 		}
 		memcpy(&state(hdlc)->settings, &new_settings, size);
-
-		dev->hard_start_xmit = hdlc->xmit;
 		dev->type = ARPHRD_FRAD;
 		return 0;
 

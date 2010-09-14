@@ -19,9 +19,11 @@
 #include "types.h"
 #include "io.h"
 #include "stdio.h"
-#include "libfdt/libfdt.h"
+#include <libfdt.h>
 
 BSS_STACK(4*1024);
+
+extern int platform_specific_init(void) __attribute__((weak));
 
 void platform_init(unsigned long r3, unsigned long r4, unsigned long r5,
 		   unsigned long r6, unsigned long r7)
@@ -80,5 +82,9 @@ void platform_init(unsigned long r3, unsigned long r4, unsigned long r5,
 
 	/* prepare the device tree and find the console */
 	fdt_init(_dtb_start);
+
+	if (platform_specific_init)
+		platform_specific_init();
+
 	serial_console_init();
 }

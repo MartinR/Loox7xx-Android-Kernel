@@ -33,6 +33,10 @@
 #include <linux/mqueue.h>
 #include <linux/hardirq.h>
 #include <linux/utsname.h>
+#include <linux/ftrace.h>
+#include <linux/kernel_stat.h>
+#include <linux/personality.h>
+#include <linux/random.h>
 
 #include <asm/pgtable.h>
 #include <asm/uaccess.h>
@@ -47,12 +51,15 @@
 #ifdef CONFIG_PPC64
 #include <asm/firmware.h>
 #endif
+#include <linux/kprobes.h>
+#include <linux/kdebug.h>
 
 extern unsigned long _get_SP(void);
 
 #ifndef CONFIG_SMP
 struct task_struct *last_task_used_math = NULL;
 struct task_struct *last_task_used_altivec = NULL;
+struct task_struct *last_task_used_vsx = NULL;
 struct task_struct *last_task_used_spe = NULL;
 #endif
 
@@ -104,17 +111,6 @@ void enable_kernel_fp(void)
 }
 EXPORT_SYMBOL(enable_kernel_fp);
 
-int dump_task_fpu(struct task_struct *tsk, elf_fpregset_t *fpregs)
-{
-	if (!tsk->thread.regs)
-		return 0;
-	flush_fp_to_thread(current);
-
-	memcpy(fpregs, &tsk->thread.fpr[0], sizeof(*fpregs));
-
-	return 1;
-}
-
 #ifdef CONFIG_ALTIVEC
 void enable_kernel_altivec(void)
 {
@@ -148,36 +144,48 @@ void flush_altivec_to_thread(struct task_struct *tsk)
 		preempt_enable();
 	}
 }
-
-int dump_task_altivec(struct task_struct *tsk, elf_vrregset_t *vrregs)
-{
-	/* ELF_NVRREG includes the VSCR and VRSAVE which we need to save
-	 * separately, see below */
-	const int nregs = ELF_NVRREG - 2;
-	elf_vrreg_t *reg;
-	u32 *dest;
-
-	if (tsk == current)
-		flush_altivec_to_thread(tsk);
-
-	reg = (elf_vrreg_t *)vrregs;
-
-	/* copy the 32 vr registers */
-	memcpy(reg, &tsk->thread.vr[0], nregs * sizeof(*reg));
-	reg += nregs;
-
-	/* copy the vscr */
-	memcpy(reg, &tsk->thread.vscr, sizeof(*reg));
-	reg++;
-
-	/* vrsave is stored in the high 32bit slot of the final 128bits */
-	memset(reg, 0, sizeof(*reg));
-	dest = (u32 *)reg;
-	*dest = tsk->thread.vrsave;
-
-	return 1;
-}
 #endif /* CONFIG_ALTIVEC */
+
+#ifdef CONFIG_VSX
+#if 0
+/* not currently used, but some crazy RAID module might want to later */
+void enable_kernel_vsx(void)
+{
+	WARN_ON(preemptible());
+
+#ifdef CONFIG_SMP
+	if (current->thread.regs && (current->thread.regs->msr & MSR_VSX))
+		giveup_vsx(current);
+	else
+		giveup_vsx(NULL);	/* just enable vsx for kernel - force */
+#else
+	giveup_vsx(last_task_used_vsx);
+#endif /* CONFIG_SMP */
+}
+EXPORT_SYMBOL(enable_kernel_vsx);
+#endif
+
+void giveup_vsx(struct task_struct *tsk)
+{
+	giveup_fpu(tsk);
+	giveup_altivec(tsk);
+	__giveup_vsx(tsk);
+}
+
+void flush_vsx_to_thread(struct task_struct *tsk)
+{
+	if (tsk->thread.regs) {
+		preempt_disable();
+		if (tsk->thread.regs->msr & MSR_VSX) {
+#ifdef CONFIG_SMP
+			BUG_ON(tsk != current);
+#endif
+			giveup_vsx(tsk);
+		}
+		preempt_enable();
+	}
+}
+#endif /* CONFIG_VSX */
 
 #ifdef CONFIG_SPE
 
@@ -209,14 +217,6 @@ void flush_spe_to_thread(struct task_struct *tsk)
 		preempt_enable();
 	}
 }
-
-int dump_spe(struct pt_regs *regs, elf_vrregset_t *evrregs)
-{
-	flush_spe_to_thread(current);
-	/* We copy u32 evr[32] + u64 acc + u32 spefscr -> 35 */
-	memcpy(evrregs, &current->thread.evr[0], sizeof(u32) * 35);
-	return 1;
-}
 #endif /* CONFIG_SPE */
 
 #ifndef CONFIG_SMP
@@ -233,6 +233,10 @@ void discard_lazy_cpu_state(void)
 	if (last_task_used_altivec == current)
 		last_task_used_altivec = NULL;
 #endif /* CONFIG_ALTIVEC */
+#ifdef CONFIG_VSX
+	if (last_task_used_vsx == current)
+		last_task_used_vsx = NULL;
+#endif /* CONFIG_VSX */
 #ifdef CONFIG_SPE
 	if (last_task_used_spe == current)
 		last_task_used_spe = NULL;
@@ -241,21 +245,52 @@ void discard_lazy_cpu_state(void)
 }
 #endif /* CONFIG_SMP */
 
+void do_dabr(struct pt_regs *regs, unsigned long address,
+		    unsigned long error_code)
+{
+	siginfo_t info;
+
+	if (notify_die(DIE_DABR_MATCH, "dabr_match", regs, error_code,
+			11, SIGSEGV) == NOTIFY_STOP)
+		return;
+
+	if (debugger_dabr_match(regs))
+		return;
+
+	/* Clear the DAC and struct entries.  One shot trigger */
+#if defined(CONFIG_BOOKE)
+	mtspr(SPRN_DBCR0, mfspr(SPRN_DBCR0) & ~(DBSR_DAC1R | DBSR_DAC1W
+							| DBCR0_IDM));
+#endif
+
+	/* Clear the DABR */
+	set_dabr(0);
+
+	/* Deliver the signal to userspace */
+	info.si_signo = SIGTRAP;
+	info.si_errno = 0;
+	info.si_code = TRAP_HWBKPT;
+	info.si_addr = (void __user *)address;
+	force_sig_info(SIGTRAP, &info, current);
+}
+
 static DEFINE_PER_CPU(unsigned long, current_dabr);
 
 int set_dabr(unsigned long dabr)
 {
 	__get_cpu_var(current_dabr) = dabr;
 
-#ifdef CONFIG_PPC_MERGE		/* XXX for now */
 	if (ppc_md.set_dabr)
 		return ppc_md.set_dabr(dabr);
-#endif
 
 	/* XXX should we have a CPU_FTR_HAS_DABR ? */
-#if defined(CONFIG_PPC64) || defined(CONFIG_6xx)
+#if defined(CONFIG_BOOKE)
+	mtspr(SPRN_DAC1, dabr);
+#elif defined(CONFIG_PPC_BOOK3S)
 	mtspr(SPRN_DABR, dabr);
 #endif
+
+
 	return 0;
 }
 
@@ -297,6 +332,11 @@ struct task_struct *__switch_to(struct task_struct *prev,
 	if (prev->thread.regs && (prev->thread.regs->msr & MSR_VEC))
 		giveup_altivec(prev);
 #endif /* CONFIG_ALTIVEC */
+#ifdef CONFIG_VSX
+	if (prev->thread.regs && (prev->thread.regs->msr & MSR_VSX))
+		/* VMX and FPU registers are already save here */
+		__giveup_vsx(prev);
+#endif /* CONFIG_VSX */
 #ifdef CONFIG_SPE
 	/*
 	 * If the previous thread used spe in the last quantum
@@ -317,6 +357,10 @@ struct task_struct *__switch_to(struct task_struct *prev,
 	if (new->thread.regs && last_task_used_altivec == new)
 		new->thread.regs->msr |= MSR_VEC;
 #endif /* CONFIG_ALTIVEC */
+#ifdef CONFIG_VSX
+	if (new->thread.regs && last_task_used_vsx == new)
+		new->thread.regs->msr |= MSR_VSX;
+#endif /* CONFIG_VSX */
 #ifdef CONFIG_SPE
 	/* Avoid the trap.  On smp this this never happens since
 	 * we don't set last_task_used_spe
@@ -327,8 +371,15 @@ struct task_struct *__switch_to(struct task_struct *prev,
 
 #endif /* CONFIG_SMP */
 
+#if defined(CONFIG_BOOKE)
+	/* If new thread DAC (HW breakpoint) is the same then leave it */
+	if (new->thread.dabr)
+		set_dabr(new->thread.dabr);
+#else
 	if (unlikely(__get_cpu_var(current_dabr) != new->thread.dabr))
 		set_dabr(new->thread.dabr);
+#endif
+
 
 	new_thread = &new->thread;
 	old_thread = &current->thread;
@@ -417,7 +468,11 @@ static struct regbit {
 	{MSR_EE,	"EE"},
 	{MSR_PR,	"PR"},
 	{MSR_FP,	"FP"},
+	{MSR_VEC,	"VEC"},
+	{MSR_VSX,	"VSX"},
 	{MSR_ME,	"ME"},
+	{MSR_CE,	"CE"},
+	{MSR_DE,	"DE"},
 	{MSR_IR,	"IR"},
 	{MSR_DR,	"DR"},
 	{0,		NULL}
@@ -473,7 +528,7 @@ void show_regs(struct pt_regs * regs)
 
 	for (i = 0;  i < 32;  i++) {
 		if ((i % REGS_PER_LINE) == 0)
-			printk("\n" KERN_INFO "GPR%02d: ", i);
+			printk("\nGPR%02d: ", i);
 		printk(REG " ", regs->gpr[i]);
 		if (i == LAST_VOLATILE && !FULL_REGS(regs))
 			break;
@@ -484,10 +539,8 @@ void show_regs(struct pt_regs * regs)
 	 * Lookup NIP late so we have the best change of getting the
 	 * above info out without failing
 	 */
-	printk("NIP ["REG"] ", regs->nip);
-	print_symbol("%s\n", regs->nip);
-	printk("LR ["REG"] ", regs->link);
-	print_symbol("%s\n", regs->link);
+	printk("NIP ["REG"] %pS\n", regs->nip, (void *)regs->nip);
+	printk("LR ["REG"] %pS\n", regs->link, (void *)regs->link);
 #endif
 	show_stack(current, (unsigned long *) regs->gpr[1]);
 	if (!user_mode(regs))
@@ -518,6 +571,10 @@ void flush_thread(void)
 	if (current->thread.dabr) {
 		current->thread.dabr = 0;
 		set_dabr(0);
+
+#if defined(CONFIG_BOOKE)
+		current->thread.dbcr0 &= ~(DBSR_DAC1R | DBSR_DAC1W);
+#endif
 	}
 }
 
@@ -534,13 +591,14 @@ void prepare_to_copy(struct task_struct *tsk)
 {
 	flush_fp_to_thread(current);
 	flush_altivec_to_thread(current);
+	flush_vsx_to_thread(current);
 	flush_spe_to_thread(current);
 }
 
 /*
  * Copy a thread..
  */
-int copy_thread(int nr, unsigned long clone_flags, unsigned long usp,
+int copy_thread(unsigned long clone_flags, unsigned long usp,
 		unsigned long unused, struct task_struct *p,
 		struct pt_regs *regs)
 {
@@ -592,7 +650,7 @@ int copy_thread(int nr, unsigned long clone_flags, unsigned long usp,
 	p->thread.ksp_limit = (unsigned long)task_stack_page(p) +
 				_ALIGN_UP(sizeof(struct thread_info), 16);
 
-#ifdef CONFIG_PPC64
+#ifdef CONFIG_PPC_STD_MMU_64
 	if (cpu_has_feature(CPU_FTR_SLB)) {
 		unsigned long sp_vsid;
 		unsigned long llp = mmu_psize_defs[mmu_linear_psize].sllp;
@@ -606,6 +664,7 @@ int copy_thread(int nr, unsigned long clone_flags, unsigned long usp,
 		sp_vsid |= SLB_VSID_KERNEL | llp;
 		p->thread.ksp_vsid = sp_vsid;
 	}
+#endif /* CONFIG_PPC_STD_MMU_64 */
 
 	/*
 	 * The PPC64 ABI makes use of a TOC to contain function 
@@ -613,6 +672,7 @@ int copy_thread(int nr, unsigned long clone_flags, unsigned long usp,
 	 * to the TOC entry.  The first entry is a pointer to the actual
 	 * function.
  	 */
+#ifdef CONFIG_PPC64
 	kregs->nip = *((unsigned long *)ret_from_fork);
 #else
 	kregs->nip = (unsigned long)ret_from_fork;
@@ -689,6 +749,9 @@ void start_thread(struct pt_regs *regs, unsigned long start, unsigned long sp)
 #endif
 
 	discard_lazy_cpu_state();
+#ifdef CONFIG_VSX
+	current->thread.used_vsr = 0;
+#endif
 	memset(current->thread.fpr, 0, sizeof(current->thread.fpr));
 	current->thread.fpscr.val = 0;
 #ifdef CONFIG_ALTIVEC
@@ -943,13 +1006,25 @@ unsigned long get_wchan(struct task_struct *p)
 	return 0;
 }
 
-static int kstack_depth_to_print = 64;
+static int kstack_depth_to_print = CONFIG_PRINT_STACK_DEPTH;
 
 void show_stack(struct task_struct *tsk, unsigned long *stack)
 {
 	unsigned long sp, ip, lr, newsp;
 	int count = 0;
 	int firstframe = 1;
+#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+	int curr_frame = current->curr_ret_stack;
+	extern void return_to_handler(void);
+	unsigned long rth = (unsigned long)return_to_handler;
+	unsigned long mrth = -1;
+#ifdef CONFIG_PPC64
+	extern void mod_return_to_handler(void);
+	rth = *(unsigned long *)rth;
+	mrth = (unsigned long)mod_return_to_handler;
+	mrth = *(unsigned long *)mrth;
+#endif
+#endif
 
 	sp = (unsigned long) stack;
 	if (tsk == NULL)
@@ -971,8 +1046,14 @@ void show_stack(struct task_struct *tsk, unsigned long *stack)
 		newsp = stack[0];
 		ip = stack[STACK_FRAME_LR_SAVE];
 		if (!firstframe || ip != lr) {
-			printk("["REG"] ["REG"] ", sp, ip);
-			print_symbol("%s", ip);
+			printk("["REG"] ["REG"] %pS", sp, ip, (void *)ip);
+#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+			if ((ip == rth || ip == mrth) && curr_frame >= 0) {
+				printk(" (%pS)",
+				       (void *)current->ret_stack[curr_frame].ret);
+				curr_frame--;
+			}
+#endif
 			if (firstframe)
 				printk(" (unreliable)");
 			printk("\n");
@@ -987,10 +1068,9 @@ void show_stack(struct task_struct *tsk, unsigned long *stack)
 		    && stack[STACK_FRAME_MARKER] == STACK_FRAME_REGS_MARKER) {
 			struct pt_regs *regs = (struct pt_regs *)
 				(sp + STACK_FRAME_OVERHEAD);
-			printk("--- Exception: %lx", regs->trap);
-			print_symbol(" at %s\n", regs->nip);
 			lr = regs->link;
-			print_symbol("    LR = %s\n", lr);
+			printk("--- Exception: %lx at %pS\n    LR = %pS\n",
+			       regs->trap, (void *)regs->nip, (void *)lr);
 			firstframe = 1;
 		}
 
@@ -1066,3 +1146,58 @@ void thread_info_cache_init(void)
 }
 
 #endif /* THREAD_SHIFT < PAGE_SHIFT */
+
+unsigned long arch_align_stack(unsigned long sp)
+{
+	if (!(current->personality & ADDR_NO_RANDOMIZE) && randomize_va_space)
+		sp -= get_random_int() & ~PAGE_MASK;
+	return sp & ~0xf;
+}
+
+static inline unsigned long brk_rnd(void)
+{
+        unsigned long rnd = 0;
+
+	/* 8MB for 32bit, 1GB for 64bit */
+	if (is_32bit_task())
+		rnd = (long)(get_random_int() % (1<<(23-PAGE_SHIFT)));
+	else
+		rnd = (long)(get_random_int() % (1<<(30-PAGE_SHIFT)));
+
+	return rnd << PAGE_SHIFT;
+}
+
+unsigned long arch_randomize_brk(struct mm_struct *mm)
+{
+	unsigned long base = mm->brk;
+	unsigned long ret;
+
+#ifdef CONFIG_PPC_STD_MMU_64
+	/*
+	 * If we are using 1TB segments and we are allowed to randomise
+	 * the heap, we can put it above 1TB so it is backed by a 1TB
+	 * segment. Otherwise the heap will be in the bottom 1TB
+	 * which always uses 256MB segments and this may result in a
+	 * performance penalty.
+	 */
+	if (!is_32bit_task() && (mmu_highuser_ssize == MMU_SEGSIZE_1T))
+		base = max_t(unsigned long, mm->brk, 1UL << SID_SHIFT_1T);
+#endif
+
+	ret = PAGE_ALIGN(base + brk_rnd());
+
+	if (ret < mm->brk)
+		return mm->brk;
+
+	return ret;
+}
+
+unsigned long randomize_et_dyn(unsigned long base)
+{
+	unsigned long ret = PAGE_ALIGN(base + brk_rnd());
+
+	if (ret < base)
+		return base;
+
+	return ret;
+}

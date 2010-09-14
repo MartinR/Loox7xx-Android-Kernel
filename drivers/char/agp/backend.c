@@ -114,9 +114,9 @@ static int agp_find_max(void)
 	long memory, index, result;
 
 #if PAGE_SHIFT < 20
-	memory = num_physpages >> (20 - PAGE_SHIFT);
+	memory = totalram_pages >> (20 - PAGE_SHIFT);
 #else
-	memory = num_physpages << (PAGE_SHIFT - 20);
+	memory = totalram_pages << (PAGE_SHIFT - 20);
 #endif
 	index = 1;
 
@@ -141,27 +141,40 @@ static int agp_backend_initialize(struct agp_bridge_data *bridge)
 	bridge->version = &agp_current_version;
 
 	if (bridge->driver->needs_scratch_page) {
-		void *addr = bridge->driver->agp_alloc_page(bridge);
+		struct page *page = bridge->driver->agp_alloc_page(bridge);
 
-		if (!addr) {
-			printk(KERN_ERR PFX "unable to get memory for scratch page.\n");
+		if (!page) {
+			dev_err(&bridge->dev->dev,
+				"can't get memory for scratch page\n");
 			return -ENOMEM;
 		}
 
-		bridge->scratch_page_real = virt_to_gart(addr);
-		bridge->scratch_page =
-		    bridge->driver->mask_memory(bridge, bridge->scratch_page_real, 0);
+		bridge->scratch_page_page = page;
+		if (bridge->driver->agp_map_page) {
+			if (bridge->driver->agp_map_page(page,
+							 &bridge->scratch_page_dma)) {
+				dev_err(&bridge->dev->dev,
+					"unable to dma-map scratch page\n");
+				rc = -ENOMEM;
+				goto err_out_nounmap;
+			}
+		} else {
+			bridge->scratch_page_dma = page_to_phys(page);
+		}
+
+		bridge->scratch_page = bridge->driver->mask_memory(bridge,
+						   bridge->scratch_page_dma, 0);
 	}
 
 	size_value = bridge->driver->fetch_size();
 	if (size_value == 0) {
-		printk(KERN_ERR PFX "unable to determine aperture size.\n");
+		dev_err(&bridge->dev->dev, "can't determine aperture size\n");
 		rc = -EINVAL;
 		goto err_out;
 	}
 	if (bridge->driver->create_gatt_table(bridge)) {
-		printk(KERN_ERR PFX
-		    "unable to get memory for graphics translation table.\n");
+		dev_err(&bridge->dev->dev,
+			"can't get memory for graphics translation table\n");
 		rc = -ENOMEM;
 		goto err_out;
 	}
@@ -169,7 +182,8 @@ static int agp_backend_initialize(struct agp_bridge_data *bridge)
 
 	bridge->key_list = vmalloc(PAGE_SIZE * 4);
 	if (bridge->key_list == NULL) {
-		printk(KERN_ERR PFX "error allocating memory for key lists.\n");
+		dev_err(&bridge->dev->dev,
+			"can't allocate memory for key lists\n");
 		rc = -ENOMEM;
 		goto err_out;
 	}
@@ -179,16 +193,24 @@ static int agp_backend_initialize(struct agp_bridge_data *bridge)
 	memset(bridge->key_list, 0, PAGE_SIZE * 4);
 
 	if (bridge->driver->configure()) {
-		printk(KERN_ERR PFX "error configuring host chipset.\n");
+		dev_err(&bridge->dev->dev, "error configuring host chipset\n");
 		rc = -EINVAL;
 		goto err_out;
 	}
+	INIT_LIST_HEAD(&bridge->mapped_list);
+	spin_lock_init(&bridge->mapped_lock);
 
 	return 0;
 
 err_out:
+	if (bridge->driver->needs_scratch_page &&
+	    bridge->driver->agp_unmap_page) {
+		bridge->driver->agp_unmap_page(bridge->scratch_page_page,
+					       bridge->scratch_page_dma);
+	}
+err_out_nounmap:
 	if (bridge->driver->needs_scratch_page) {
-		void *va = gart_to_virt(bridge->scratch_page_real);
+		void *va = page_address(bridge->scratch_page_page);
 
 		bridge->driver->agp_destroy_page(va, AGP_PAGE_DESTROY_UNMAP);
 		bridge->driver->agp_destroy_page(va, AGP_PAGE_DESTROY_FREE);
@@ -215,7 +237,11 @@ static void agp_backend_cleanup(struct agp_bridge_data *bridge)
 
 	if (bridge->driver->agp_destroy_page &&
 	    bridge->driver->needs_scratch_page) {
-		void *va = gart_to_virt(bridge->scratch_page_real);
+		void *va = page_address(bridge->scratch_page_page);
+
+		if (bridge->driver->agp_unmap_page)
+			bridge->driver->agp_unmap_page(bridge->scratch_page_page,
+						       bridge->scratch_page_dma);
 
 		bridge->driver->agp_destroy_page(va, AGP_PAGE_DESTROY_UNMAP);
 		bridge->driver->agp_destroy_page(va, AGP_PAGE_DESTROY_FREE);
@@ -269,25 +295,27 @@ int agp_add_bridge(struct agp_bridge_data *bridge)
 
 	/* Grab reference on the chipset driver. */
 	if (!try_module_get(bridge->driver->owner)) {
-		printk (KERN_INFO PFX "Couldn't lock chipset driver.\n");
+		dev_info(&bridge->dev->dev, "can't lock chipset driver\n");
 		return -EINVAL;
 	}
 
 	error = agp_backend_initialize(bridge);
 	if (error) {
-		printk (KERN_INFO PFX "agp_backend_initialize() failed.\n");
+		dev_info(&bridge->dev->dev,
+			 "agp_backend_initialize() failed\n");
 		goto err_out;
 	}
 
 	if (list_empty(&agp_bridges)) {
 		error = agp_frontend_initialize();
 		if (error) {
-			printk (KERN_INFO PFX "agp_frontend_initialize() failed.\n");
+			dev_info(&bridge->dev->dev,
+				 "agp_frontend_initialize() failed\n");
 			goto frontend_err;
 		}
 
-		printk(KERN_INFO PFX "AGP aperture is %dM @ 0x%lx\n",
-			bridge->driver->fetch_size(), bridge->gart_bus_addr);
+		dev_info(&bridge->dev->dev, "AGP aperture is %dM @ 0x%lx\n",
+			 bridge->driver->fetch_size(), bridge->gart_bus_addr);
 
 	}
 
@@ -343,7 +371,7 @@ static __init int agp_setup(char *s)
 __setup("agp=", agp_setup);
 #endif
 
-MODULE_AUTHOR("Dave Jones <davej@codemonkey.org.uk>");
+MODULE_AUTHOR("Dave Jones <davej@redhat.com>");
 MODULE_DESCRIPTION("AGP GART driver");
 MODULE_LICENSE("GPL and additional rights");
 MODULE_ALIAS_MISCDEV(AGPGART_MINOR);

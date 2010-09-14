@@ -12,8 +12,6 @@
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
-#include <linux/stat.h>
-#include <linux/time.h>
 #include <linux/mm.h>
 #include <linux/mman.h>
 #include <linux/errno.h>
@@ -21,20 +19,15 @@
 #include <linux/binfmts.h>
 #include <linux/string.h>
 #include <linux/file.h>
-#include <linux/fcntl.h>
-#include <linux/ptrace.h>
 #include <linux/slab.h>
-#include <linux/shm.h>
 #include <linux/personality.h>
 #include <linux/elfcore.h>
 #include <linux/init.h>
 #include <linux/highuid.h>
-#include <linux/smp.h>
 #include <linux/compiler.h>
 #include <linux/highmem.h>
 #include <linux/pagemap.h>
 #include <linux/security.h>
-#include <linux/syscalls.h>
 #include <linux/random.h>
 #include <linux/elf.h>
 #include <linux/utsname.h>
@@ -131,6 +124,15 @@ static int padzero(unsigned long elf_bss)
 #define STACK_ALLOC(sp, len) ({ sp -= len ; sp; })
 #endif
 
+#ifndef ELF_BASE_PLATFORM
+/*
+ * AT_BASE_PLATFORM indicates the "real" hardware/microarchitecture.
+ * If the arch defines ELF_BASE_PLATFORM (in asm/elf.h), the value
+ * will be copied to the user stack in the same manner as AT_PLATFORM.
+ */
+#define ELF_BASE_PLATFORM NULL
+#endif
+
 static int
 create_elf_tables(struct linux_binprm *bprm, struct elfhdr *exec,
 		unsigned long load_addr, unsigned long interp_load_addr)
@@ -142,11 +144,15 @@ create_elf_tables(struct linux_binprm *bprm, struct elfhdr *exec,
 	elf_addr_t __user *envp;
 	elf_addr_t __user *sp;
 	elf_addr_t __user *u_platform;
+	elf_addr_t __user *u_base_platform;
+	elf_addr_t __user *u_rand_bytes;
 	const char *k_platform = ELF_PLATFORM;
+	const char *k_base_platform = ELF_BASE_PLATFORM;
+	unsigned char k_rand_bytes[16];
 	int items;
 	elf_addr_t *elf_info;
 	int ei_index = 0;
-	struct task_struct *tsk = current;
+	const struct cred *cred = current_cred();
 	struct vm_area_struct *vma;
 
 	/*
@@ -171,6 +177,28 @@ create_elf_tables(struct linux_binprm *bprm, struct elfhdr *exec,
 		if (__copy_to_user(u_platform, k_platform, len))
 			return -EFAULT;
 	}
+
+	/*
+	 * If this architecture has a "base" platform capability
+	 * string, copy it to userspace.
+	 */
+	u_base_platform = NULL;
+	if (k_base_platform) {
+		size_t len = strlen(k_base_platform) + 1;
+
+		u_base_platform = (elf_addr_t __user *)STACK_ALLOC(p, len);
+		if (__copy_to_user(u_base_platform, k_base_platform, len))
+			return -EFAULT;
+	}
+
+	/*
+	 * Generate 16 random bytes for userspace PRNG seeding.
+	 */
+	get_random_bytes(k_rand_bytes, sizeof(k_rand_bytes));
+	u_rand_bytes = (elf_addr_t __user *)
+		       STACK_ALLOC(p, sizeof(k_rand_bytes));
+	if (__copy_to_user(u_rand_bytes, k_rand_bytes, sizeof(k_rand_bytes)))
+		return -EFAULT;
 
 	/* Create the ELF interpreter info */
 	elf_info = (elf_addr_t *)current->mm->saved_auxv;
@@ -199,14 +227,20 @@ create_elf_tables(struct linux_binprm *bprm, struct elfhdr *exec,
 	NEW_AUX_ENT(AT_BASE, interp_load_addr);
 	NEW_AUX_ENT(AT_FLAGS, 0);
 	NEW_AUX_ENT(AT_ENTRY, exec->e_entry);
-	NEW_AUX_ENT(AT_UID, tsk->uid);
-	NEW_AUX_ENT(AT_EUID, tsk->euid);
-	NEW_AUX_ENT(AT_GID, tsk->gid);
-	NEW_AUX_ENT(AT_EGID, tsk->egid);
+	NEW_AUX_ENT(AT_UID, cred->uid);
+	NEW_AUX_ENT(AT_EUID, cred->euid);
+	NEW_AUX_ENT(AT_GID, cred->gid);
+	NEW_AUX_ENT(AT_EGID, cred->egid);
  	NEW_AUX_ENT(AT_SECURE, security_bprm_secureexec(bprm));
+	NEW_AUX_ENT(AT_RANDOM, (elf_addr_t)(unsigned long)u_rand_bytes);
+	NEW_AUX_ENT(AT_EXECFN, bprm->exec);
 	if (k_platform) {
 		NEW_AUX_ENT(AT_PLATFORM,
 			    (elf_addr_t)(unsigned long)u_platform);
+	}
+	if (k_base_platform) {
+		NEW_AUX_ENT(AT_BASE_PLATFORM,
+			    (elf_addr_t)(unsigned long)u_base_platform);
 	}
 	if (bprm->interp_flags & BINPRM_FLAGS_EXECFD) {
 		NEW_AUX_ENT(AT_EXECFD, bprm->interp_data);
@@ -467,22 +501,22 @@ static unsigned long load_elf_interp(struct elfhdr *interp_elf_ex,
 		}
 	}
 
-	/*
-	 * Now fill out the bss section.  First pad the last page up
-	 * to the page boundary, and then perform a mmap to make sure
-	 * that there are zero-mapped pages up to and including the 
-	 * last bss page.
-	 */
-	if (padzero(elf_bss)) {
-		error = -EFAULT;
-		goto out_close;
-	}
-
-	/* What we have mapped so far */
-	elf_bss = ELF_PAGESTART(elf_bss + ELF_MIN_ALIGN - 1);
-
-	/* Map the last of the bss segment */
 	if (last_bss > elf_bss) {
+		/*
+		 * Now fill out the bss section.  First pad the last page up
+		 * to the page boundary, and then perform a mmap to make sure
+		 * that there are zero-mapped pages up to and including the
+		 * last bss page.
+		 */
+		if (padzero(elf_bss)) {
+			error = -EFAULT;
+			goto out_close;
+		}
+
+		/* What we have mapped so far */
+		elf_bss = ELF_PAGESTART(elf_bss + ELF_MIN_ALIGN - 1);
+
+		/* Map the last of the bss segment */
 		down_write(&current->mm->mmap_sem);
 		error = do_brk(elf_bss, last_bss - elf_bss);
 		up_write(&current->mm->mmap_sem);
@@ -535,7 +569,6 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 	unsigned long error;
 	struct elf_phdr *elf_ppnt, *elf_phdata;
 	unsigned long elf_bss, elf_brk;
-	int elf_exec_fileno;
 	int retval, i;
 	unsigned int size;
 	unsigned long elf_entry;
@@ -590,12 +623,6 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 		goto out_free_ph;
 	}
 
-	retval = get_unused_fd();
-	if (retval < 0)
-		goto out_free_ph;
-	get_file(bprm->file);
-	fd_install(elf_exec_fileno = retval, bprm->file);
-
 	elf_ppnt = elf_phdata;
 	elf_bss = 0;
 	elf_brk = 0;
@@ -614,13 +641,13 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 			retval = -ENOEXEC;
 			if (elf_ppnt->p_filesz > PATH_MAX || 
 			    elf_ppnt->p_filesz < 2)
-				goto out_free_file;
+				goto out_free_ph;
 
 			retval = -ENOMEM;
 			elf_interpreter = kmalloc(elf_ppnt->p_filesz,
 						  GFP_KERNEL);
 			if (!elf_interpreter)
-				goto out_free_file;
+				goto out_free_ph;
 
 			retval = kernel_read(bprm->file, elf_ppnt->p_offset,
 					     elf_interpreter,
@@ -654,7 +681,7 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 			 * switch really is going to happen - do this in
 			 * flush_thread().	- akpm
 			 */
-			SET_PERSONALITY(loc->elf_ex, 0);
+			SET_PERSONALITY(loc->elf_ex);
 
 			interpreter = open_exec(elf_interpreter);
 			retval = PTR_ERR(interpreter);
@@ -705,7 +732,7 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 			goto out_free_dentry;
 	} else {
 		/* Executables without an interpreter also need a personality  */
-		SET_PERSONALITY(loc->elf_ex, 0);
+		SET_PERSONALITY(loc->elf_ex);
 	}
 
 	/* Flush all traces of the currently running executable */
@@ -719,7 +746,7 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 
 	/* Do this immediately, since STACK_TOP as used in setup_arg_pages
 	   may depend on the personality.  */
-	SET_PERSONALITY(loc->elf_ex, 0);
+	SET_PERSONALITY(loc->elf_ex);
 	if (elf_read_implies_exec(loc->elf_ex, executable_stack))
 		current->personality |= READ_IMPLIES_EXEC;
 
@@ -915,19 +942,17 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 
 	kfree(elf_phdata);
 
-	sys_close(elf_exec_fileno);
-
 	set_binfmt(&elf_format);
 
 #ifdef ARCH_HAS_SETUP_ADDITIONAL_PAGES
-	retval = arch_setup_additional_pages(bprm, executable_stack);
+	retval = arch_setup_additional_pages(bprm, !!elf_interpreter);
 	if (retval < 0) {
 		send_sig(SIGKILL, current, 0);
 		goto out;
 	}
 #endif /* ARCH_HAS_SETUP_ADDITIONAL_PAGES */
 
-	compute_creds(bprm);
+	install_exec_creds(bprm);
 	current->flags &= ~PF_FORKNOEXEC;
 	retval = create_elf_tables(bprm, &loc->elf_ex,
 			  load_addr, interp_load_addr);
@@ -974,12 +999,6 @@ static int load_elf_binary(struct linux_binprm *bprm, struct pt_regs *regs)
 #endif
 
 	start_thread(regs, elf_entry, bprm->p);
-	if (unlikely(current->ptrace & PT_PTRACED)) {
-		if (current->ptrace & PT_TRACE_EXEC)
-			ptrace_notify ((PTRACE_EVENT_EXEC << 8) | SIGTRAP);
-		else
-			send_sig(SIGTRAP, current, 0);
-	}
 	retval = 0;
 out:
 	kfree(loc);
@@ -993,8 +1012,6 @@ out_free_dentry:
 		fput(interpreter);
 out_free_interp:
 	kfree(elf_interpreter);
-out_free_file:
-	sys_close(elf_exec_fileno);
 out_free_ph:
 	kfree(elf_phdata);
 	goto out;
@@ -1133,15 +1150,23 @@ static int dump_seek(struct file *file, loff_t off)
 static unsigned long vma_dump_size(struct vm_area_struct *vma,
 				   unsigned long mm_flags)
 {
+#define FILTER(type)	(mm_flags & (1UL << MMF_DUMP_##type))
+
 	/* The vma can be set up to tell us the answer directly.  */
 	if (vma->vm_flags & VM_ALWAYSDUMP)
 		goto whole;
 
+	/* Hugetlb memory check */
+	if (vma->vm_flags & VM_HUGETLB) {
+		if ((vma->vm_flags & VM_SHARED) && FILTER(HUGETLB_SHARED))
+			goto whole;
+		if (!(vma->vm_flags & VM_SHARED) && FILTER(HUGETLB_PRIVATE))
+			goto whole;
+	}
+
 	/* Do not dump I/O mapped devices or special mappings */
 	if (vma->vm_flags & (VM_IO | VM_RESERVED))
 		return 0;
-
-#define FILTER(type)	(mm_flags & (1UL << MMF_DUMP_##type))
 
 	/* By default, dump shared memory if mapped from an anonymous file. */
 	if (vma->vm_flags & VM_SHARED) {
@@ -1165,9 +1190,11 @@ static unsigned long vma_dump_size(struct vm_area_struct *vma,
 	 * check for an ELF header.  If we find one, dump the first page to
 	 * aid in determining what was mapped here.
 	 */
-	if (FILTER(ELF_HEADERS) && vma->vm_file != NULL && vma->vm_pgoff == 0) {
+	if (FILTER(ELF_HEADERS) &&
+	    vma->vm_pgoff == 0 && (vma->vm_flags & VM_READ)) {
 		u32 __user *header = (u32 __user *) vma->vm_start;
 		u32 word;
+		mm_segment_t fs = get_fs();
 		/*
 		 * Doing it this way gets the constant folded by GCC.
 		 */
@@ -1180,7 +1207,15 @@ static unsigned long vma_dump_size(struct vm_area_struct *vma,
 		magic.elfmag[EI_MAG1] = ELFMAG1;
 		magic.elfmag[EI_MAG2] = ELFMAG2;
 		magic.elfmag[EI_MAG3] = ELFMAG3;
-		if (get_user(word, header) == 0 && word == magic.cmp)
+		/*
+		 * Switch to the user "segment" for get_user(),
+		 * then put back what elf_core_dump() had in place.
+		 */
+		set_fs(USER_DS);
+		if (unlikely(get_user(word, header)))
+			word = 0;
+		set_fs(fs);
+		if (word == magic.cmp)
 			return PAGE_SIZE;
 	}
 
@@ -1245,9 +1280,6 @@ static int writenote(struct memelfnote *men, struct file *file,
 #define DUMP_WRITE(addr, nr)	\
 	if ((size += (nr)) > limit || !dump_write(file, (addr), (nr))) \
 		goto end_coredump;
-#define DUMP_SEEK(off)	\
-	if (!dump_seek(file, (off))) \
-		goto end_coredump;
 
 static void fill_elf_header(struct elfhdr *elf, int segs,
 			    u16 machine, u32 flags, u8 osabi)
@@ -1305,25 +1337,22 @@ static void fill_prstatus(struct elf_prstatus *prstatus,
 	prstatus->pr_info.si_signo = prstatus->pr_cursig = signr;
 	prstatus->pr_sigpend = p->pending.signal.sig[0];
 	prstatus->pr_sighold = p->blocked.sig[0];
+	rcu_read_lock();
+	prstatus->pr_ppid = task_pid_vnr(rcu_dereference(p->real_parent));
+	rcu_read_unlock();
 	prstatus->pr_pid = task_pid_vnr(p);
-	prstatus->pr_ppid = task_pid_vnr(p->real_parent);
 	prstatus->pr_pgrp = task_pgrp_vnr(p);
 	prstatus->pr_sid = task_session_vnr(p);
 	if (thread_group_leader(p)) {
+		struct task_cputime cputime;
+
 		/*
-		 * This is the record for the group leader.  Add in the
-		 * cumulative times of previous dead threads.  This total
-		 * won't include the time of each live thread whose state
-		 * is included in the core dump.  The final total reported
-		 * to our parent process when it calls wait4 will include
-		 * those sums as well as the little bit more time it takes
-		 * this and each other thread to finish dying after the
-		 * core dump synchronization phase.
+		 * This is the record for the group leader.  It shows the
+		 * group-wide total, not its individual thread total.
 		 */
-		cputime_to_timeval(cputime_add(p->utime, p->signal->utime),
-				   &prstatus->pr_utime);
-		cputime_to_timeval(cputime_add(p->stime, p->signal->stime),
-				   &prstatus->pr_stime);
+		thread_group_cputime(p, &cputime);
+		cputime_to_timeval(cputime.utime, &prstatus->pr_utime);
+		cputime_to_timeval(cputime.stime, &prstatus->pr_stime);
 	} else {
 		cputime_to_timeval(p->utime, &prstatus->pr_utime);
 		cputime_to_timeval(p->stime, &prstatus->pr_stime);
@@ -1335,6 +1364,7 @@ static void fill_prstatus(struct elf_prstatus *prstatus,
 static int fill_psinfo(struct elf_prpsinfo *psinfo, struct task_struct *p,
 		       struct mm_struct *mm)
 {
+	const struct cred *cred;
 	unsigned int i, len;
 	
 	/* first copy the parameters from user space */
@@ -1351,8 +1381,10 @@ static int fill_psinfo(struct elf_prpsinfo *psinfo, struct task_struct *p,
 			psinfo->pr_psargs[i] = ' ';
 	psinfo->pr_psargs[len] = 0;
 
+	rcu_read_lock();
+	psinfo->pr_ppid = task_pid_vnr(rcu_dereference(p->real_parent));
+	rcu_read_unlock();
 	psinfo->pr_pid = task_pid_vnr(p);
-	psinfo->pr_ppid = task_pid_vnr(p->real_parent);
 	psinfo->pr_pgrp = task_pgrp_vnr(p);
 	psinfo->pr_sid = task_session_vnr(p);
 
@@ -1362,8 +1394,11 @@ static int fill_psinfo(struct elf_prpsinfo *psinfo, struct task_struct *p,
 	psinfo->pr_zomb = psinfo->pr_sname == 'Z';
 	psinfo->pr_nice = task_nice(p);
 	psinfo->pr_flag = p->flags;
-	SET_UID(psinfo->pr_uid, p->uid);
-	SET_GID(psinfo->pr_gid, p->gid);
+	rcu_read_lock();
+	cred = __task_cred(p);
+	SET_UID(psinfo->pr_uid, cred->uid);
+	SET_GID(psinfo->pr_gid, cred->gid);
+	rcu_read_unlock();
 	strncpy(psinfo->pr_fname, p->comm, sizeof(psinfo->pr_fname));
 	
 	return 0;
@@ -1477,17 +1512,17 @@ static int fill_note_info(struct elfhdr *elf, int phdrs,
 	const struct user_regset_view *view = task_user_regset_view(dump_task);
 	struct elf_thread_core_info *t;
 	struct elf_prpsinfo *psinfo;
-	struct task_struct *g, *p;
+	struct core_thread *ct;
 	unsigned int i;
 
 	info->size = 0;
 	info->thread = NULL;
 
 	psinfo = kmalloc(sizeof(*psinfo), GFP_KERNEL);
-	fill_note(&info->psinfo, "CORE", NT_PRPSINFO, sizeof(*psinfo), psinfo);
-
 	if (psinfo == NULL)
 		return 0;
+
+	fill_note(&info->psinfo, "CORE", NT_PRPSINFO, sizeof(*psinfo), psinfo);
 
 	/*
 	 * Figure out how many notes we're going to need for each thread.
@@ -1516,31 +1551,26 @@ static int fill_note_info(struct elfhdr *elf, int phdrs,
 	/*
 	 * Allocate a structure for each thread.
 	 */
-	rcu_read_lock();
-	do_each_thread(g, p)
-		if (p->mm == dump_task->mm) {
-			t = kzalloc(offsetof(struct elf_thread_core_info,
-					     notes[info->thread_notes]),
-				    GFP_ATOMIC);
-			if (unlikely(!t)) {
-				rcu_read_unlock();
-				return 0;
-			}
-			t->task = p;
-			if (p == dump_task || !info->thread) {
-				t->next = info->thread;
-				info->thread = t;
-			} else {
-				/*
-				 * Make sure to keep the original task at
-				 * the head of the list.
-				 */
-				t->next = info->thread->next;
-				info->thread->next = t;
-			}
+	for (ct = &dump_task->mm->core_state->dumper; ct; ct = ct->next) {
+		t = kzalloc(offsetof(struct elf_thread_core_info,
+				     notes[info->thread_notes]),
+			    GFP_KERNEL);
+		if (unlikely(!t))
+			return 0;
+
+		t->task = ct->task;
+		if (ct->task == dump_task || !info->thread) {
+			t->next = info->thread;
+			info->thread = t;
+		} else {
+			/*
+			 * Make sure to keep the original task at
+			 * the head of the list.
+			 */
+			t->next = info->thread->next;
+			info->thread->next = t;
 		}
-	while_each_thread(g, p);
-	rcu_read_unlock();
+	}
 
 	/*
 	 * Now fill in each thread's information.
@@ -1681,58 +1711,66 @@ struct elf_note_info {
 	int numnote;
 };
 
-static int fill_note_info(struct elfhdr *elf, int phdrs,
-			  struct elf_note_info *info,
-			  long signr, struct pt_regs *regs)
+static int elf_note_info_init(struct elf_note_info *info)
 {
-#define	NUM_NOTES	6
-	struct list_head *t;
-	struct task_struct *g, *p;
-
-	info->notes = NULL;
-	info->prstatus = NULL;
-	info->psinfo = NULL;
-	info->fpu = NULL;
-#ifdef ELF_CORE_COPY_XFPREGS
-	info->xfpu = NULL;
-#endif
+	memset(info, 0, sizeof(*info));
 	INIT_LIST_HEAD(&info->thread_list);
 
-	info->notes = kmalloc(NUM_NOTES * sizeof(struct memelfnote),
-			      GFP_KERNEL);
+	/* Allocate space for six ELF notes */
+	info->notes = kmalloc(6 * sizeof(struct memelfnote), GFP_KERNEL);
 	if (!info->notes)
 		return 0;
 	info->psinfo = kmalloc(sizeof(*info->psinfo), GFP_KERNEL);
 	if (!info->psinfo)
-		return 0;
+		goto notes_free;
 	info->prstatus = kmalloc(sizeof(*info->prstatus), GFP_KERNEL);
 	if (!info->prstatus)
-		return 0;
+		goto psinfo_free;
 	info->fpu = kmalloc(sizeof(*info->fpu), GFP_KERNEL);
 	if (!info->fpu)
-		return 0;
+		goto prstatus_free;
 #ifdef ELF_CORE_COPY_XFPREGS
 	info->xfpu = kmalloc(sizeof(*info->xfpu), GFP_KERNEL);
 	if (!info->xfpu)
-		return 0;
+		goto fpu_free;
 #endif
+	return 1;
+#ifdef ELF_CORE_COPY_XFPREGS
+ fpu_free:
+	kfree(info->fpu);
+#endif
+ prstatus_free:
+	kfree(info->prstatus);
+ psinfo_free:
+	kfree(info->psinfo);
+ notes_free:
+	kfree(info->notes);
+	return 0;
+}
 
-	info->thread_status_size = 0;
+static int fill_note_info(struct elfhdr *elf, int phdrs,
+			  struct elf_note_info *info,
+			  long signr, struct pt_regs *regs)
+{
+	struct list_head *t;
+
+	if (!elf_note_info_init(info))
+		return 0;
+
 	if (signr) {
+		struct core_thread *ct;
 		struct elf_thread_status *ets;
-		rcu_read_lock();
-		do_each_thread(g, p)
-			if (current->mm == p->mm && current != p) {
-				ets = kzalloc(sizeof(*ets), GFP_ATOMIC);
-				if (!ets) {
-					rcu_read_unlock();
-					return 0;
-				}
-				ets->thread = p;
-				list_add(&ets->list, &info->thread_list);
-			}
-		while_each_thread(g, p);
-		rcu_read_unlock();
+
+		for (ct = current->mm->core_state->dumper.next;
+						ct; ct = ct->next) {
+			ets = kzalloc(sizeof(*ets), GFP_KERNEL);
+			if (!ets)
+				return 0;
+
+			ets->thread = ct->task;
+			list_add(&ets->list, &info->thread_list);
+		}
+
 		list_for_each(t, &info->thread_list) {
 			int sz;
 
@@ -1778,8 +1816,6 @@ static int fill_note_info(struct elfhdr *elf, int phdrs,
 #endif
 
 	return 1;
-
-#undef NUM_NOTES
 }
 
 static size_t get_note_info_size(struct elf_note_info *info)
@@ -1898,7 +1934,10 @@ static int elf_core_dump(long signr, struct pt_regs *regs, struct file *file, un
 	elf = kmalloc(sizeof(*elf), GFP_KERNEL);
 	if (!elf)
 		goto out;
-	
+	/*
+	 * The number of segs are recored into ELF header as 16bit value.
+	 * Please check DEFAULT_MAX_MAP_COUNT definition when you modify here.
+	 */
 	segs = current->mm->map_count;
 #ifdef ELF_CORE_EXTRA_PHDRS
 	segs += ELF_CORE_EXTRA_PHDRS;
@@ -1982,7 +2021,8 @@ static int elf_core_dump(long signr, struct pt_regs *regs, struct file *file, un
 		goto end_coredump;
 
 	/* Align to page */
-	DUMP_SEEK(dataoff - foffset);
+	if (!dump_seek(file, dataoff - foffset))
+		goto end_coredump;
 
 	for (vma = first_vma(current, gate_vma); vma != NULL;
 			vma = next_vma(vma, gate_vma)) {
@@ -1993,33 +2033,19 @@ static int elf_core_dump(long signr, struct pt_regs *regs, struct file *file, un
 
 		for (addr = vma->vm_start; addr < end; addr += PAGE_SIZE) {
 			struct page *page;
-			struct vm_area_struct *tmp_vma;
+			int stop;
 
-			if (get_user_pages(current, current->mm, addr, 1, 0, 1,
-						&page, &tmp_vma) <= 0) {
-				DUMP_SEEK(PAGE_SIZE);
-			} else {
-				if (page == ZERO_PAGE(0)) {
-					if (!dump_seek(file, PAGE_SIZE)) {
-						page_cache_release(page);
-						goto end_coredump;
-					}
-				} else {
-					void *kaddr;
-					flush_cache_page(tmp_vma, addr,
-							 page_to_pfn(page));
-					kaddr = kmap(page);
-					if ((size += PAGE_SIZE) > limit ||
-					    !dump_write(file, kaddr,
-					    PAGE_SIZE)) {
-						kunmap(page);
-						page_cache_release(page);
-						goto end_coredump;
-					}
-					kunmap(page);
-				}
+			page = get_dump_page(addr);
+			if (page) {
+				void *kaddr = kmap(page);
+				stop = ((size += PAGE_SIZE) > limit) ||
+					!dump_write(file, kaddr, PAGE_SIZE);
+				kunmap(page);
 				page_cache_release(page);
-			}
+			} else
+				stop = !dump_seek(file, PAGE_SIZE);
+			if (stop)
+				goto end_coredump;
 		}
 	}
 

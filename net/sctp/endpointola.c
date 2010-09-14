@@ -103,6 +103,7 @@ static struct sctp_endpoint *sctp_endpoint_init(struct sctp_endpoint *ep,
 
 		/* Initialize the CHUNKS parameter */
 		auth_chunks->param_hdr.type = SCTP_PARAM_CHUNKS;
+		auth_chunks->param_hdr.length = htons(sizeof(sctp_paramhdr_t));
 
 		/* If the Add-IP functionality is enabled, we must
 		 * authenticate, ASCONF and ASCONF-ACK chunks

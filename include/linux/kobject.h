@@ -26,7 +26,6 @@
 #include <linux/wait.h>
 #include <asm/atomic.h>
 
-#define KOBJ_NAME_LEN			20
 #define UEVENT_HELPER_PATH_LEN		256
 #define UEVENT_NUM_ENVP			32	/* number of env pointers */
 #define UEVENT_BUFFER_SIZE		2048	/* buffer for the variables */
@@ -59,20 +58,23 @@ enum kobject_action {
 
 struct kobject {
 	const char		*name;
-	struct kref		kref;
 	struct list_head	entry;
 	struct kobject		*parent;
 	struct kset		*kset;
 	struct kobj_type	*ktype;
 	struct sysfs_dirent	*sd;
+	struct kref		kref;
 	unsigned int state_initialized:1;
 	unsigned int state_in_sysfs:1;
 	unsigned int state_add_uevent_sent:1;
 	unsigned int state_remove_uevent_sent:1;
+	unsigned int uevent_suppress:1;
 };
 
 extern int kobject_set_name(struct kobject *kobj, const char *name, ...)
 			    __attribute__((format(printf, 2, 3)));
+extern int kobject_set_name_vargs(struct kobject *kobj, const char *fmt,
+				  va_list vargs);
 
 static inline const char *kobject_name(const struct kobject *kobj)
 {
@@ -187,6 +189,8 @@ extern struct kobject *kset_find_obj(struct kset *, const char *);
 
 /* The global /sys/kernel/ kobject for people to chain off of */
 extern struct kobject *kernel_kobj;
+/* The global /sys/kernel/mm/ kobject for people to chain off of */
+extern struct kobject *mm_kobj;
 /* The global /sys/hypervisor/ kobject for people to chain off of */
 extern struct kobject *hypervisor_kobj;
 /* The global /sys/power/ kobject for people to chain off of */

@@ -19,19 +19,20 @@
 #include <linux/compiler.h>
 #include <linux/sched.h>
 #include <linux/smp.h>
+#include <linux/smp_lock.h>
 #include <linux/ioctl.h>
 #include <linux/if.h>
 #include <linux/if_bridge.h>
 #include <linux/slab.h>
-#include <linux/raid/md.h>
+#include <linux/raid/md_u.h>
 #include <linux/kd.h>
-#include <linux/dirent.h>
 #include <linux/route.h>
 #include <linux/in6.h>
 #include <linux/ipv6_route.h>
 #include <linux/skbuff.h>
 #include <linux/netlink.h>
 #include <linux/vt.h>
+#include <linux/falloc.h>
 #include <linux/fs.h>
 #include <linux/file.h>
 #include <linux/ppp_defs.h>
@@ -58,9 +59,7 @@
 #include <linux/syscalls.h>
 #include <linux/i2c.h>
 #include <linux/i2c-dev.h>
-#include <linux/wireless.h>
 #include <linux/atalk.h>
-#include <linux/loop.h>
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci.h>
@@ -69,9 +68,12 @@
 #include <linux/capi.h>
 #include <linux/gigaset_dev.h>
 
+#ifdef CONFIG_BLOCK
+#include <linux/loop.h>
 #include <scsi/scsi.h>
 #include <scsi/scsi_ioctl.h>
 #include <scsi/sg.h>
+#endif
 
 #include <asm/uaccess.h>
 #include <linux/ethtool.h>
@@ -94,7 +96,6 @@
 #include <linux/atm_tcp.h>
 #include <linux/sonet.h>
 #include <linux/atm_suni.h>
-#include <linux/mtd/mtd.h>
 
 #include <linux/usb.h>
 #include <linux/usbdevice_fs.h>
@@ -522,6 +523,11 @@ static int dev_ifsioc(unsigned int fd, unsigned int cmd, unsigned long arg)
 		if (err)
 			return -EFAULT;
 		break;
+	case SIOCSHWTSTAMP:
+		if (copy_from_user(&ifr, uifr32, sizeof(*uifr32)))
+			return -EFAULT;
+		ifr.ifr_data = compat_ptr(uifr32->ifr_ifru.ifru_data);
+		break;
 	default:
 		if (copy_from_user(&ifr, uifr32, sizeof(*uifr32)))
 			return -EFAULT;
@@ -538,6 +544,7 @@ static int dev_ifsioc(unsigned int fd, unsigned int cmd, unsigned long arg)
 		 * cannot be fixed without breaking all existing apps.
 		 */
 		case TUNSETIFF:
+		case TUNGETIFF:
 		case SIOCGIFFLAGS:
 		case SIOCGIFMETRIC:
 		case SIOCGIFMTU:
@@ -780,12 +787,6 @@ static int sg_ioctl_trans(unsigned int fd, unsigned int cmd, unsigned long arg)
 	if (get_user(data, &sgio32->usr_ptr))
 		return -EFAULT;
 	if (put_user(compat_ptr(data), &sgio->usr_ptr))
-		return -EFAULT;
-
-	if (copy_in_user(&sgio->status, &sgio32->status,
-			 (4 * sizeof(unsigned char)) +
-			 (2 * sizeof(unsigned (short))) +
-			 (3 * sizeof(int))))
 		return -EFAULT;
 
 	err = sys_ioctl(fd, cmd, (unsigned long) sgio);
@@ -1405,46 +1406,6 @@ static int ioc_settimeout(unsigned int fd, unsigned int cmd, unsigned long arg)
 #define HIDPGETCONNLIST	_IOR('H', 210, int)
 #define HIDPGETCONNINFO	_IOR('H', 211, int)
 
-struct mtd_oob_buf32 {
-	u_int32_t start;
-	u_int32_t length;
-	compat_caddr_t ptr;	/* unsigned char* */
-};
-
-#define MEMWRITEOOB32 	_IOWR('M',3,struct mtd_oob_buf32)
-#define MEMREADOOB32 	_IOWR('M',4,struct mtd_oob_buf32)
-
-static int mtd_rw_oob(unsigned int fd, unsigned int cmd, unsigned long arg)
-{
-	struct mtd_oob_buf __user *buf = compat_alloc_user_space(sizeof(*buf));
-	struct mtd_oob_buf32 __user *buf32 = compat_ptr(arg);
-	u32 data;
-	char __user *datap;
-	unsigned int real_cmd;
-	int err;
-
-	real_cmd = (cmd == MEMREADOOB32) ?
-		MEMREADOOB : MEMWRITEOOB;
-
-	if (copy_in_user(&buf->start, &buf32->start,
-			 2 * sizeof(u32)) ||
-	    get_user(data, &buf32->ptr))
-		return -EFAULT;
-	datap = compat_ptr(data);
-	if (put_user(datap, &buf->ptr))
-		return -EFAULT;
-
-	err = sys_ioctl(fd, real_cmd, (unsigned long) buf);
-
-	if (!err) {
-		if (copy_in_user(&buf32->start, &buf->start,
-				 2 * sizeof(u32)))
-			err = -EFAULT;
-	}
-
-	return err;
-}	
-
 #ifdef CONFIG_BLOCK
 struct raw32_config_request
 {
@@ -1757,67 +1718,9 @@ static int do_i2c_smbus_ioctl(unsigned int fd, unsigned int cmd, unsigned long a
 	return sys_ioctl(fd, cmd, (unsigned long)tdata);
 }
 
-struct compat_iw_point {
-	compat_caddr_t pointer;
-	__u16 length;
-	__u16 flags;
-};
-
-static int do_wireless_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg)
-{
-	struct iwreq __user *iwr;
-	struct iwreq __user *iwr_u;
-	struct iw_point __user *iwp;
-	struct compat_iw_point __user *iwp_u;
-	compat_caddr_t pointer_u;
-	void __user *pointer;
-	__u16 length, flags;
-	int ret;
-
-	iwr_u = compat_ptr(arg);
-	iwp_u = (struct compat_iw_point __user *) &iwr_u->u.data;
-	iwr = compat_alloc_user_space(sizeof(*iwr));
-	if (iwr == NULL)
-		return -ENOMEM;
-
-	iwp = &iwr->u.data;
-
-	if (!access_ok(VERIFY_WRITE, iwr, sizeof(*iwr)))
-		return -EFAULT;
-
-	if (__copy_in_user(&iwr->ifr_ifrn.ifrn_name[0],
-			   &iwr_u->ifr_ifrn.ifrn_name[0],
-			   sizeof(iwr->ifr_ifrn.ifrn_name)))
-		return -EFAULT;
-
-	if (__get_user(pointer_u, &iwp_u->pointer) ||
-	    __get_user(length, &iwp_u->length) ||
-	    __get_user(flags, &iwp_u->flags))
-		return -EFAULT;
-
-	if (__put_user(compat_ptr(pointer_u), &iwp->pointer) ||
-	    __put_user(length, &iwp->length) ||
-	    __put_user(flags, &iwp->flags))
-		return -EFAULT;
-
-	ret = sys_ioctl(fd, cmd, (unsigned long) iwr);
-
-	if (__get_user(pointer, &iwp->pointer) ||
-	    __get_user(length, &iwp->length) ||
-	    __get_user(flags, &iwp->flags))
-		return -EFAULT;
-
-	if (__put_user(ptr_to_compat(pointer), &iwp_u->pointer) ||
-	    __put_user(length, &iwp_u->length) ||
-	    __put_user(flags, &iwp_u->flags))
-		return -EFAULT;
-
-	return ret;
-}
-
 /* Since old style bridge ioctl's endup using SIOCDEVPRIVATE
  * for some operations; this forces use of the newer bridge-utils that
- * use compatiable ioctls
+ * use compatible ioctls
  */
 static int old_bridge_ioctl(unsigned int fd, unsigned int cmd, unsigned long arg)
 {
@@ -1877,6 +1780,41 @@ lp_timeout_trans(unsigned int fd, unsigned int cmd, unsigned long arg)
 		return -EFAULT;
 	return sys_ioctl(fd, cmd, (unsigned long)tn);
 }
+
+/* on ia32 l_start is on a 32-bit boundary */
+#if defined(CONFIG_IA64) || defined(CONFIG_X86_64)
+struct space_resv_32 {
+	__s16		l_type;
+	__s16		l_whence;
+	__s64		l_start	__attribute__((packed));
+			/* len == 0 means until end of file */
+	__s64		l_len __attribute__((packed));
+	__s32		l_sysid;
+	__u32		l_pid;
+	__s32		l_pad[4];	/* reserve area */
+};
+
+#define FS_IOC_RESVSP_32		_IOW ('X', 40, struct space_resv_32)
+#define FS_IOC_RESVSP64_32	_IOW ('X', 42, struct space_resv_32)
+
+/* just account for different alignment */
+static int compat_ioctl_preallocate(struct file *file, unsigned long arg)
+{
+	struct space_resv_32	__user *p32 = compat_ptr(arg);
+	struct space_resv	__user *p = compat_alloc_user_space(sizeof(*p));
+
+	if (copy_in_user(&p->l_type,	&p32->l_type,	sizeof(s16)) ||
+	    copy_in_user(&p->l_whence,	&p32->l_whence, sizeof(s16)) ||
+	    copy_in_user(&p->l_start,	&p32->l_start,	sizeof(s64)) ||
+	    copy_in_user(&p->l_len,	&p32->l_len,	sizeof(s64)) ||
+	    copy_in_user(&p->l_sysid,	&p32->l_sysid,	sizeof(s32)) ||
+	    copy_in_user(&p->l_pid,	&p32->l_pid,	sizeof(u32)) ||
+	    copy_in_user(&p->l_pad,	&p32->l_pad,	4*sizeof(u32)))
+		return -EFAULT;
+
+	return ioctl_preallocate(file, p);
+}
+#endif
 
 
 typedef int (*ioctl_trans_handler_t)(unsigned int, unsigned int,
@@ -1967,9 +1905,13 @@ COMPATIBLE_IOCTL(FIONCLEX)
 COMPATIBLE_IOCTL(FIOASYNC)
 COMPATIBLE_IOCTL(FIONBIO)
 COMPATIBLE_IOCTL(FIONREAD)  /* This is also TIOCINQ */
+COMPATIBLE_IOCTL(FS_IOC_FIEMAP)
 /* 0x00 */
 COMPATIBLE_IOCTL(FIBMAP)
 COMPATIBLE_IOCTL(FIGETBSZ)
+/* 'X' - originally XFS but some now in the VFS */
+COMPATIBLE_IOCTL(FIFREEZE)
+COMPATIBLE_IOCTL(FITHAW)
 /* RAID */
 COMPATIBLE_IOCTL(RAID_VERSION)
 COMPATIBLE_IOCTL(GET_ARRAY_INFO)
@@ -1995,6 +1937,8 @@ ULONG_IOCTL(SET_BITMAP_FILE)
 /* Big K */
 COMPATIBLE_IOCTL(PIO_FONT)
 COMPATIBLE_IOCTL(GIO_FONT)
+COMPATIBLE_IOCTL(PIO_CMAP)
+COMPATIBLE_IOCTL(GIO_CMAP)
 ULONG_IOCTL(KDSIGACCEPT)
 COMPATIBLE_IOCTL(KDGETKEYCODE)
 COMPATIBLE_IOCTL(KDSETKEYCODE)
@@ -2024,6 +1968,7 @@ COMPATIBLE_IOCTL(GIO_UNISCRNMAP)
 COMPATIBLE_IOCTL(PIO_UNISCRNMAP)
 COMPATIBLE_IOCTL(PIO_FONTRESET)
 COMPATIBLE_IOCTL(PIO_UNIMAPCLR)
+#ifdef CONFIG_BLOCK
 /* Big S */
 COMPATIBLE_IOCTL(SCSI_IOCTL_GET_IDLUN)
 COMPATIBLE_IOCTL(SCSI_IOCTL_DOORLOCK)
@@ -2033,11 +1978,19 @@ COMPATIBLE_IOCTL(SCSI_IOCTL_GET_BUS_NUMBER)
 COMPATIBLE_IOCTL(SCSI_IOCTL_SEND_COMMAND)
 COMPATIBLE_IOCTL(SCSI_IOCTL_PROBE_HOST)
 COMPATIBLE_IOCTL(SCSI_IOCTL_GET_PCI)
+#endif
 /* Big T */
 COMPATIBLE_IOCTL(TUNSETNOCSUM)
 COMPATIBLE_IOCTL(TUNSETDEBUG)
 COMPATIBLE_IOCTL(TUNSETPERSIST)
 COMPATIBLE_IOCTL(TUNSETOWNER)
+COMPATIBLE_IOCTL(TUNSETLINK)
+COMPATIBLE_IOCTL(TUNSETGROUP)
+COMPATIBLE_IOCTL(TUNGETFEATURES)
+COMPATIBLE_IOCTL(TUNSETOFFLOAD)
+COMPATIBLE_IOCTL(TUNSETTXFILTER)
+COMPATIBLE_IOCTL(TUNGETSNDBUF)
+COMPATIBLE_IOCTL(TUNSETSNDBUF)
 /* Big V */
 COMPATIBLE_IOCTL(VT_SETMODE)
 COMPATIBLE_IOCTL(VT_GETMODE)
@@ -2103,6 +2056,7 @@ COMPATIBLE_IOCTL(SIOCGIFVLAN)
 COMPATIBLE_IOCTL(SIOCSIFVLAN)
 COMPATIBLE_IOCTL(SIOCBRADDBR)
 COMPATIBLE_IOCTL(SIOCBRDELBR)
+#ifdef CONFIG_BLOCK
 /* SG stuff */
 COMPATIBLE_IOCTL(SG_SET_TIMEOUT)
 COMPATIBLE_IOCTL(SG_GET_TIMEOUT)
@@ -2127,6 +2081,7 @@ COMPATIBLE_IOCTL(SG_SCSI_RESET)
 COMPATIBLE_IOCTL(SG_GET_REQUEST_TABLE)
 COMPATIBLE_IOCTL(SG_SET_KEEP_ORPHAN)
 COMPATIBLE_IOCTL(SG_GET_KEEP_ORPHAN)
+#endif
 /* PPP stuff */
 COMPATIBLE_IOCTL(PPPIOCGFLAGS)
 COMPATIBLE_IOCTL(PPPIOCSFLAGS)
@@ -2350,8 +2305,6 @@ COMPATIBLE_IOCTL(AUTOFS_IOC_PROTOVER)
 COMPATIBLE_IOCTL(AUTOFS_IOC_EXPIRE)
 COMPATIBLE_IOCTL(AUTOFS_IOC_EXPIRE_MULTI)
 COMPATIBLE_IOCTL(AUTOFS_IOC_PROTOSUBVER)
-COMPATIBLE_IOCTL(AUTOFS_IOC_ASKREGHOST)
-COMPATIBLE_IOCTL(AUTOFS_IOC_TOGGLEREGHOST)
 COMPATIBLE_IOCTL(AUTOFS_IOC_ASKUMOUNT)
 /* Raw devices */
 COMPATIBLE_IOCTL(RAW_SETBIND)
@@ -2399,6 +2352,7 @@ COMPATIBLE_IOCTL(HCIGETDEVLIST)
 COMPATIBLE_IOCTL(HCIGETDEVINFO)
 COMPATIBLE_IOCTL(HCIGETCONNLIST)
 COMPATIBLE_IOCTL(HCIGETCONNINFO)
+COMPATIBLE_IOCTL(HCIGETAUTHINFO)
 COMPATIBLE_IOCTL(HCISETRAW)
 COMPATIBLE_IOCTL(HCISETSCAN)
 COMPATIBLE_IOCTL(HCISETAUTH)
@@ -2469,15 +2423,6 @@ COMPATIBLE_IOCTL(USBDEVFS_SUBMITURB32)
 COMPATIBLE_IOCTL(USBDEVFS_REAPURB32)
 COMPATIBLE_IOCTL(USBDEVFS_REAPURBNDELAY32)
 COMPATIBLE_IOCTL(USBDEVFS_CLEAR_HALT)
-/* MTD */
-COMPATIBLE_IOCTL(MEMGETINFO)
-COMPATIBLE_IOCTL(MEMERASE)
-COMPATIBLE_IOCTL(MEMLOCK)
-COMPATIBLE_IOCTL(MEMUNLOCK)
-COMPATIBLE_IOCTL(MEMGETREGIONCOUNT)
-COMPATIBLE_IOCTL(MEMGETREGIONINFO)
-COMPATIBLE_IOCTL(MEMGETBADBLOCK)
-COMPATIBLE_IOCTL(MEMSETBADBLOCK)
 /* NBD */
 ULONG_IOCTL(NBD_SET_SOCK)
 ULONG_IOCTL(NBD_SET_BLKSIZE)
@@ -2495,36 +2440,6 @@ COMPATIBLE_IOCTL(I2C_TENBIT)
 COMPATIBLE_IOCTL(I2C_PEC)
 COMPATIBLE_IOCTL(I2C_RETRIES)
 COMPATIBLE_IOCTL(I2C_TIMEOUT)
-/* wireless */
-COMPATIBLE_IOCTL(SIOCSIWCOMMIT)
-COMPATIBLE_IOCTL(SIOCGIWNAME)
-COMPATIBLE_IOCTL(SIOCSIWNWID)
-COMPATIBLE_IOCTL(SIOCGIWNWID)
-COMPATIBLE_IOCTL(SIOCSIWFREQ)
-COMPATIBLE_IOCTL(SIOCGIWFREQ)
-COMPATIBLE_IOCTL(SIOCSIWMODE)
-COMPATIBLE_IOCTL(SIOCGIWMODE)
-COMPATIBLE_IOCTL(SIOCSIWSENS)
-COMPATIBLE_IOCTL(SIOCGIWSENS)
-COMPATIBLE_IOCTL(SIOCSIWRANGE)
-COMPATIBLE_IOCTL(SIOCSIWPRIV)
-COMPATIBLE_IOCTL(SIOCSIWSTATS)
-COMPATIBLE_IOCTL(SIOCSIWAP)
-COMPATIBLE_IOCTL(SIOCGIWAP)
-COMPATIBLE_IOCTL(SIOCSIWRATE)
-COMPATIBLE_IOCTL(SIOCGIWRATE)
-COMPATIBLE_IOCTL(SIOCSIWRTS)
-COMPATIBLE_IOCTL(SIOCGIWRTS)
-COMPATIBLE_IOCTL(SIOCSIWFRAG)
-COMPATIBLE_IOCTL(SIOCGIWFRAG)
-COMPATIBLE_IOCTL(SIOCSIWTXPOW)
-COMPATIBLE_IOCTL(SIOCGIWTXPOW)
-COMPATIBLE_IOCTL(SIOCSIWRETRY)
-COMPATIBLE_IOCTL(SIOCGIWRETRY)
-COMPATIBLE_IOCTL(SIOCSIWPOWER)
-COMPATIBLE_IOCTL(SIOCGIWPOWER)
-COMPATIBLE_IOCTL(SIOCSIWAUTH)
-COMPATIBLE_IOCTL(SIOCGIWAUTH)
 /* hiddev */
 COMPATIBLE_IOCTL(HIDIOCGVERSION)
 COMPATIBLE_IOCTL(HIDIOCAPPLICATION)
@@ -2617,8 +2532,6 @@ COMPATIBLE_IOCTL(JSIOCGBUTTONS)
 COMPATIBLE_IOCTL(JSIOCGNAME(0))
 
 /* now things that need handlers */
-HANDLE_IOCTL(MEMREADOOB32, mtd_rw_oob)
-HANDLE_IOCTL(MEMWRITEOOB32, mtd_rw_oob)
 #ifdef CONFIG_NET
 HANDLE_IOCTL(SIOCGIFNAME, dev_ifname32)
 HANDLE_IOCTL(SIOCGIFCONF, dev_ifconf)
@@ -2640,6 +2553,7 @@ HANDLE_IOCTL(SIOCSIFMAP, dev_ifsioc)
 HANDLE_IOCTL(SIOCGIFADDR, dev_ifsioc)
 HANDLE_IOCTL(SIOCSIFADDR, dev_ifsioc)
 HANDLE_IOCTL(SIOCSIFHWBROADCAST, dev_ifsioc)
+HANDLE_IOCTL(SIOCSHWTSTAMP, dev_ifsioc)
 
 /* ioctls used by appletalk ddp.c */
 HANDLE_IOCTL(SIOCATALKDIFADDR, dev_ifsioc)
@@ -2658,6 +2572,7 @@ HANDLE_IOCTL(SIOCGIFPFLAGS, dev_ifsioc)
 HANDLE_IOCTL(SIOCGIFTXQLEN, dev_ifsioc)
 HANDLE_IOCTL(SIOCSIFTXQLEN, dev_ifsioc)
 HANDLE_IOCTL(TUNSETIFF, dev_ifsioc)
+HANDLE_IOCTL(TUNGETIFF, dev_ifsioc)
 HANDLE_IOCTL(SIOCETHTOOL, ethtool_ioctl)
 HANDLE_IOCTL(SIOCBONDENSLAVE, bond_ioctl)
 HANDLE_IOCTL(SIOCBONDRELEASE, bond_ioctl)
@@ -2725,6 +2640,8 @@ HANDLE_IOCTL(SONET_GETFRAMING, do_atm_ioctl)
 HANDLE_IOCTL(SONET_GETFRSENSE, do_atm_ioctl)
 /* block stuff */
 #ifdef CONFIG_BLOCK
+/* loop */
+IGNORE_IOCTL(LOOP_CLR_FD)
 /* Raw devices */
 HANDLE_IOCTL(RAW_SETBIND, raw_ioctl)
 HANDLE_IOCTL(RAW_GETBIND, raw_ioctl)
@@ -2755,29 +2672,7 @@ COMPATIBLE_IOCTL(USBDEVFS_IOCTL32)
 HANDLE_IOCTL(I2C_FUNCS, w_long)
 HANDLE_IOCTL(I2C_RDWR, do_i2c_rdwr_ioctl)
 HANDLE_IOCTL(I2C_SMBUS, do_i2c_smbus_ioctl)
-/* wireless */
-HANDLE_IOCTL(SIOCGIWRANGE, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCGIWPRIV, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCGIWSTATS, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCSIWSPY, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCGIWSPY, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCSIWTHRSPY, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCGIWTHRSPY, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCSIWMLME, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCGIWAPLIST, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCSIWSCAN, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCGIWSCAN, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCSIWESSID, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCGIWESSID, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCSIWNICKN, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCGIWNICKN, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCSIWENCODE, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCGIWENCODE, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCSIWGENIE, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCGIWGENIE, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCSIWENCODEEXT, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCGIWENCODEEXT, do_wireless_ioctl)
-HANDLE_IOCTL(SIOCSIWPMKSA, do_wireless_ioctl)
+/* bridge */
 HANDLE_IOCTL(SIOCSIFBR, old_bridge_ioctl)
 HANDLE_IOCTL(SIOCGIFBR, old_bridge_ioctl)
 /* Not implemented in the native kernel */
@@ -2814,9 +2709,6 @@ HANDLE_IOCTL(LPSETTIMEOUT, lp_timeout_trans)
 
 IGNORE_IOCTL(VFAT_IOCTL_READDIR_BOTH32)
 IGNORE_IOCTL(VFAT_IOCTL_READDIR_SHORT32)
-
-/* loop */
-IGNORE_IOCTL(LOOP_CLR_FD)
 
 #ifdef CONFIG_SPARC
 /* Sparc framebuffers, handled in sbusfb_compat_ioctl() */
@@ -2901,6 +2793,18 @@ asmlinkage long compat_sys_ioctl(unsigned int fd, unsigned int cmd,
 	case FIOASYNC:
 	case FIOQSIZE:
 		break;
+
+#if defined(CONFIG_IA64) || defined(CONFIG_X86_64)
+	case FS_IOC_RESVSP_32:
+	case FS_IOC_RESVSP64_32:
+		error = compat_ioctl_preallocate(filp, arg);
+		goto out_fput;
+#else
+	case FS_IOC_RESVSP:
+	case FS_IOC_RESVSP64:
+		error = ioctl_preallocate(filp, compat_ptr(arg));
+		goto out_fput;
+#endif
 
 	case FIBMAP:
 	case FIGETBSZ:

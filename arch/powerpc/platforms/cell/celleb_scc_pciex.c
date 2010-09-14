@@ -281,7 +281,7 @@ static int __init scc_pciex_iowa_init(struct iowa_bus *bus, void *data)
 
 	dummy_page_da = dma_map_single(bus->phb->parent, dummy_page_va,
 				       PAGE_SIZE, DMA_FROM_DEVICE);
-	if (dma_mapping_error(dummy_page_da)) {
+	if (dma_mapping_error(bus->phb->parent, dummy_page_da)) {
 		pr_err("PCIEX:Map dummy page failed.\n");
 		kfree(dummy_page_va);
 		return -1;
@@ -366,11 +366,7 @@ static void config_write_pciex_rc(unsigned int __iomem *base, uint32_t where,
 static int scc_pciex_read_config(struct pci_bus *bus, unsigned int devfn,
 				 int where, int size, unsigned int *val)
 {
-	struct device_node *dn;
-	struct pci_controller *phb;
-
-	dn = bus->sysdata;
-	phb = pci_find_hose_for_OF_device(dn);
+	struct pci_controller *phb = pci_bus_to_host(bus);
 
 	if (bus->number == phb->first_busno && PCI_SLOT(devfn) != 1) {
 		*val = ~0;
@@ -389,11 +385,7 @@ static int scc_pciex_read_config(struct pci_bus *bus, unsigned int devfn,
 static int scc_pciex_write_config(struct pci_bus *bus, unsigned int devfn,
 				  int where, int size, unsigned int val)
 {
-	struct device_node *dn;
-	struct pci_controller *phb;
-
-	dn = bus->sysdata;
-	phb = pci_find_hose_for_OF_device(dn);
+	struct pci_controller *phb = pci_bus_to_host(bus);
 
 	if (bus->number == phb->first_busno && PCI_SLOT(devfn) != 1)
 		return PCIBIOS_DEVICE_NOT_FOUND;

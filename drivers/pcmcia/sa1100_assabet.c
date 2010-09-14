@@ -11,11 +11,11 @@
 #include <linux/device.h>
 #include <linux/init.h>
 
-#include <asm/hardware.h>
+#include <mach/hardware.h>
 #include <asm/mach-types.h>
 #include <asm/irq.h>
 #include <asm/signal.h>
-#include <asm/arch/assabet.h>
+#include <mach/assabet.h>
 
 #include "sa1100_generic.h"
 
@@ -130,7 +130,7 @@ static struct pcmcia_low_level assabet_pcmcia_ops = {
 	.socket_suspend		= assabet_pcmcia_socket_suspend,
 };
 
-int __init pcmcia_assabet_init(struct device *dev)
+int pcmcia_assabet_init(struct device *dev)
 {
 	int ret = -ENODEV;
 

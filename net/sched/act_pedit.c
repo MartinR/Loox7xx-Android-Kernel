@@ -34,7 +34,7 @@ static struct tcf_hashinfo pedit_hash_info = {
 };
 
 static const struct nla_policy pedit_policy[TCA_PEDIT_MAX + 1] = {
-	[TCA_PEDIT_PARMS]	= { .len = sizeof(struct tcf_pedit) },
+	[TCA_PEDIT_PARMS]	= { .len = sizeof(struct tc_pedit) },
 };
 
 static int tcf_pedit_init(struct nlattr *nla, struct nlattr *est,
@@ -68,8 +68,8 @@ static int tcf_pedit_init(struct nlattr *nla, struct nlattr *est,
 			return -EINVAL;
 		pc = tcf_hash_create(parm->index, est, a, sizeof(*p), bind,
 				     &pedit_idx_gen, &pedit_hash_info);
-		if (unlikely(!pc))
-			return -ENOMEM;
+		if (IS_ERR(pc))
+		    return PTR_ERR(pc);
 		p = to_pedit(pc);
 		keys = kmalloc(ksize, GFP_KERNEL);
 		if (keys == NULL) {
@@ -182,7 +182,7 @@ static int tcf_pedit(struct sk_buff *skb, struct tc_action *a,
 bad:
 	p->tcf_qstats.overlimits++;
 done:
-	p->tcf_bstats.bytes += skb->len;
+	p->tcf_bstats.bytes += qdisc_pkt_len(skb);
 	p->tcf_bstats.packets++;
 	spin_unlock(&p->tcf_lock);
 	return p->tcf_action;

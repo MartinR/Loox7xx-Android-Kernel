@@ -10,12 +10,11 @@
 #include <linux/wireless.h>
 #include <linux/ethtool.h>
 #include <linux/debugfs.h>
-#include <net/ieee80211.h>
 
 #include "defs.h"
 #include "hostcmd.h"
 
-extern struct ethtool_ops lbs_ethtool_ops;
+extern const struct ethtool_ops lbs_ethtool_ops;
 
 #define	MAX_BSSID_PER_CHANNEL		16
 
@@ -58,6 +57,7 @@ struct lbs_802_11_security {
 	u8 WPA2enabled;
 	u8 wep_enabled;
 	u8 auth_mode;
+	u32 key_mgmt;
 };
 
 /** Current Basic Service Set State Structure */
@@ -101,6 +101,7 @@ struct lbs_mesh_stats {
 /** Private structure for the MV device */
 struct lbs_private {
 	int mesh_open;
+	int mesh_fw_ver;
 	int infra_open;
 	int mesh_autostart_enabled;
 
@@ -109,7 +110,6 @@ struct lbs_private {
 	void *card;
 	struct net_device *dev;
 
-	struct net_device_stats stats;
 	struct net_device *mesh_dev; /* Virtual device */
 	struct net_device *rtap_net_dev;
 
@@ -140,6 +140,8 @@ struct lbs_private {
 	wait_queue_head_t waitq;
 	struct workqueue_struct *work_thread;
 
+	struct work_struct mcast_work;
+
 	/** Scanning */
 	struct delayed_work scan_work;
 	struct delayed_work assoc_work;
@@ -151,6 +153,7 @@ struct lbs_private {
 
 	/** Hardware access */
 	int (*hw_host_to_card) (struct lbs_private *priv, u8 type, u8 *payload, u16 nb);
+	void (*reset_card) (struct lbs_private *priv);
 
 	/* Wake On LAN */
 	uint32_t wol_criteria;
@@ -234,11 +237,8 @@ struct lbs_private {
 	/** 802.11 statistics */
 //	struct cmd_DS_802_11_GET_STAT wlan802_11Stat;
 
-	u16 enablehwauto;
-	u16 ratebitmap;
-
-	u32 fragthsd;
-	u32 rtsthsd;
+	uint16_t enablehwauto;
+	uint16_t ratebitmap;
 
 	u8 txretrycount;
 
@@ -250,7 +250,9 @@ struct lbs_private {
 	u32 connect_status;
 	u32 mesh_connect_status;
 	u16 regioncode;
-	u16 txpowerlevel;
+	s16 txpower_cur;
+	s16 txpower_min;
+	s16 txpower_max;
 
 	/** POWER MANAGEMENT AND PnP SUPPORT */
 	u8 surpriseremoved;
@@ -258,7 +260,6 @@ struct lbs_private {
 	u16 psmode;		/* Wlan802_11PowermodeCAM=disable
 				   Wlan802_11PowermodeMAX_PSP=enable */
 	u32 psstate;
-	char ps_supported;
 	u8 needtowakeup;
 
 	struct assoc_request * pending_assoc_req;
@@ -275,6 +276,12 @@ struct lbs_private {
 	struct enc_key wpa_mcast_key;
 	struct enc_key wpa_unicast_key;
 
+/*
+ * In theory, the IE is limited to the IE length, 255,
+ * but in practice 64 bytes are enough.
+ */
+#define MAX_WPA_IE_LEN 64
+
 	/** WPA Information Elements*/
 	u8 wpa_ie[MAX_WPA_IE_LEN];
 	u8 wpa_ie_len;
@@ -288,12 +295,10 @@ struct lbs_private {
 	u16 nextSNRNF;
 	u16 numSNRNF;
 
-	u8 radioon;
-	u32 preamble;
+	u8 radio_on;
 
 	/** data rate stuff */
 	u8 cur_rate;
-	u8 auto_rate;
 
 	/** RF calibration data */
 
@@ -332,7 +337,7 @@ struct bss_descriptor {
 	u32 rssi;
 	u32 channel;
 	u16 beaconperiod;
-	u32 atimwindow;
+	__le16 atimwindow;
 
 	/* IW_MODE_AUTO, IW_MODE_ADHOC, IW_MODE_INFRA */
 	u8 mode;
@@ -342,10 +347,10 @@ struct bss_descriptor {
 
 	unsigned long last_scanned;
 
-	union ieeetypes_phyparamset phyparamset;
-	union IEEEtypes_ssparamset ssparamset;
+	union ieee_phy_param_set phy;
+	union ieee_ss_param_set ss;
 
-	struct ieeetypes_countryinfofullset countryinfo;
+	struct ieee_ie_country_info_full_set countryinfo;
 
 	u8 wpa_ie[MAX_WPA_IE_LEN];
 	size_t wpa_ie_len;

@@ -24,7 +24,7 @@ static int
 indirect_read_config(struct pci_bus *bus, unsigned int devfn, int offset,
 		     int len, u32 *val)
 {
-	struct pci_controller *hose = bus->sysdata;
+	struct pci_controller *hose = pci_bus_to_host(bus);
 	volatile void __iomem *cfg_data;
 	u8 cfg_type = 0;
 	u32 bus_no, reg;
@@ -82,7 +82,7 @@ static int
 indirect_write_config(struct pci_bus *bus, unsigned int devfn, int offset,
 		      int len, u32 val)
 {
-	struct pci_controller *hose = bus->sysdata;
+	struct pci_controller *hose = pci_bus_to_host(bus);
 	volatile void __iomem *cfg_data;
 	u8 cfg_type = 0;
 	u32 bus_no, reg;
@@ -122,6 +122,12 @@ indirect_write_config(struct pci_bus *bus, unsigned int devfn, int offset,
 		if ((offset == PCI_PRIMARY_BUS) &&
 			(bus->number == hose->first_busno))
 		val &= 0xffffff00;
+
+	/* Workaround for PCI_28 Errata in 440EPx/GRx */
+	if ((hose->indirect_type & PPC_INDIRECT_TYPE_BROKEN_MRM) &&
+			offset == PCI_CACHE_LINE_SIZE) {
+		val = 0;
+	}
 
 	/*
 	 * Note: the caller has already checked that offset is

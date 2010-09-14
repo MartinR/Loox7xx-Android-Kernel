@@ -163,6 +163,7 @@ static int alloc_small_queue_page(struct ipz_queue *queue, struct ehca_pd *pd)
 
 out:
 	ehca_err(pd->ib_pd.device, "failed to allocate small queue page");
+	mutex_unlock(&pd->lock);
 	return 0;
 }
 
@@ -219,10 +220,13 @@ int ipz_queue_ctor(struct ehca_pd *pd, struct ipz_queue *queue,
 	queue->small_page = NULL;
 
 	/* allocate queue page pointers */
-	queue->queue_pages = vmalloc(nr_of_pages * sizeof(void *));
+	queue->queue_pages = kmalloc(nr_of_pages * sizeof(void *), GFP_KERNEL);
 	if (!queue->queue_pages) {
-		ehca_gen_err("Couldn't allocate queue page list");
-		return 0;
+		queue->queue_pages = vmalloc(nr_of_pages * sizeof(void *));
+		if (!queue->queue_pages) {
+			ehca_gen_err("Couldn't allocate queue page list");
+			return 0;
+		}
 	}
 	memset(queue->queue_pages, 0, nr_of_pages * sizeof(void *));
 
@@ -239,7 +243,10 @@ int ipz_queue_ctor(struct ehca_pd *pd, struct ipz_queue *queue,
 ipz_queue_ctor_exit0:
 	ehca_gen_err("Couldn't alloc pages queue=%p "
 		 "nr_of_pages=%x",  queue, nr_of_pages);
-	vfree(queue->queue_pages);
+	if (is_vmalloc_addr(queue->queue_pages))
+		vfree(queue->queue_pages);
+	else
+		kfree(queue->queue_pages);
 
 	return 0;
 }
@@ -261,7 +268,10 @@ int ipz_queue_dtor(struct ehca_pd *pd, struct ipz_queue *queue)
 			free_page((unsigned long)queue->queue_pages[i]);
 	}
 
-	vfree(queue->queue_pages);
+	if (is_vmalloc_addr(queue->queue_pages))
+		vfree(queue->queue_pages);
+	else
+		kfree(queue->queue_pages);
 
 	return 1;
 }

@@ -6,8 +6,6 @@
  *
  * Generic platfrom device based RAM map
  *
- * $Id: plat-ram.c,v 1.7 2005/11/07 11:14:28 gleixner Exp $
- *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
@@ -177,7 +175,7 @@ static int platram_probe(struct platform_device *pdev)
 	/* setup map parameters */
 
 	info->map.phys = res->start;
-	info->map.size = (res->end - res->start) + 1;
+	info->map.size = resource_size(res);
 	info->map.name = pdata->mapname != NULL ?
 			(char *)pdata->mapname : (char *)pdev->name;
 	info->map.bankwidth = pdata->bankwidth;
@@ -226,6 +224,7 @@ static int platram_probe(struct platform_device *pdev)
 	}
 
 	info->mtd->owner = THIS_MODULE;
+	info->mtd->dev.parent = &pdev->dev;
 
 	platram_setrw(info, PLATRAM_RW);
 

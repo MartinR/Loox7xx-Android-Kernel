@@ -147,9 +147,10 @@ static void dart_flush(struct iommu_table *tbl)
 	}
 }
 
-static void dart_build(struct iommu_table *tbl, long index,
+static int dart_build(struct iommu_table *tbl, long index,
 		       long npages, unsigned long uaddr,
-		       enum dma_data_direction direction)
+		       enum dma_data_direction direction,
+		       struct dma_attrs *attrs)
 {
 	unsigned int *dp;
 	unsigned int rpn;
@@ -183,6 +184,7 @@ static void dart_build(struct iommu_table *tbl, long index,
 	} else {
 		dart_dirty = 1;
 	}
+	return 0;
 }
 
 
@@ -295,7 +297,7 @@ static void pci_dma_dev_setup_dart(struct pci_dev *dev)
 	/* We only have one iommu table on the mac for now, which makes
 	 * things simple. Setup all PCI devices to point to this table
 	 */
-	dev->dev.archdata.dma_data = &iommu_table_dart;
+	set_iommu_table_base(&dev->dev, &iommu_table_dart);
 }
 
 static void pci_dma_bus_setup_dart(struct pci_bus *bus)

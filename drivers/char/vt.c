@@ -59,7 +59,7 @@
  * by Martin Mares <mj@atrey.karlin.mff.cuni.cz>, July 1998
  *
  * Removed old-style timers, introduced console_timer, made timer
- * deletion SMP-safe.  17Jun00, Andrew Morton <andrewm@uow.edu.au>
+ * deletion SMP-safe.  17Jun00, Andrew Morton
  *
  * Removed console_lock, enabled interrupts across all console operations
  * 13 March 2001, Andrew Morton
@@ -89,21 +89,21 @@
 #include <linux/mutex.h>
 #include <linux/vt_kern.h>
 #include <linux/selection.h>
+#include <linux/smp_lock.h>
 #include <linux/tiocl.h>
 #include <linux/kbd_kern.h>
 #include <linux/consolemap.h>
 #include <linux/timer.h>
 #include <linux/interrupt.h>
 #include <linux/workqueue.h>
-#include <linux/bootmem.h>
 #include <linux/pm.h>
 #include <linux/font.h>
 #include <linux/bitops.h>
 #include <linux/notifier.h>
-
-#include <asm/io.h>
+#include <linux/device.h>
+#include <linux/io.h>
 #include <asm/system.h>
-#include <asm/uaccess.h>
+#include <linux/uaccess.h>
 
 #define MAX_NR_CON_DRIVER 16
 
@@ -172,8 +172,9 @@ int do_poke_blanked_console;
 int console_blanked;
 
 static int vesa_blank_mode; /* 0:none 1:suspendV 2:suspendH 3:powerdown */
-static int blankinterval = 10*60*HZ;
 static int vesa_off_interval;
+static int blankinterval = 10*60;
+core_param(consoleblank, blankinterval, int, 0444);
 
 static DECLARE_WORK(console_work, console_callback);
 
@@ -251,7 +252,6 @@ static void notify_update(struct vc_data *vc)
 	struct vt_notifier_param param = { .vc = vc };
 	atomic_notifier_call_chain(&vt_notifier_list, VT_UPDATE, &param);
 }
-
 /*
  *	Low-Level Functions
  */
@@ -261,7 +261,7 @@ static void notify_update(struct vc_data *vc)
 #ifdef VT_BUF_VRAM_ONLY
 #define DO_UPDATE(vc)	0
 #else
-#define DO_UPDATE(vc)	CON_IS_VISIBLE(vc)
+#define DO_UPDATE(vc)	(CON_IS_VISIBLE(vc) && !console_blanked)
 #endif
 
 static inline unsigned short *screenpos(struct vc_data *vc, int offset, int viewed)
@@ -301,7 +301,7 @@ static void scrup(struct vc_data *vc, unsigned int t, unsigned int b, int nr)
 	d = (unsigned short *)(vc->vc_origin + vc->vc_size_row * t);
 	s = (unsigned short *)(vc->vc_origin + vc->vc_size_row * (t + nr));
 	scr_memmovew(d, s, (b - t - nr) * vc->vc_size_row);
-	scr_memsetw(d + (b - t - nr) * vc->vc_cols, vc->vc_scrl_erase_char,
+	scr_memsetw(d + (b - t - nr) * vc->vc_cols, vc->vc_video_erase_char,
 		    vc->vc_size_row * nr);
 }
 
@@ -319,7 +319,7 @@ static void scrdown(struct vc_data *vc, unsigned int t, unsigned int b, int nr)
 	s = (unsigned short *)(vc->vc_origin + vc->vc_size_row * t);
 	step = vc->vc_cols * nr;
 	scr_memmovew(s + step, s, (b - t - nr) * vc->vc_size_row);
-	scr_memsetw(s, vc->vc_scrl_erase_char, 2 * step);
+	scr_memsetw(s, vc->vc_video_erase_char, 2 * step);
 }
 
 static void do_update_region(struct vc_data *vc, unsigned long start, int count)
@@ -434,7 +434,6 @@ static void update_attr(struct vc_data *vc)
 	              vc->vc_blink, vc->vc_underline,
 	              vc->vc_reverse ^ vc->vc_decscnm, vc->vc_italic);
 	vc->vc_video_erase_char = (build_attr(vc, vc->vc_color, 1, vc->vc_blink, 0, vc->vc_decscnm, 0) << 8) | ' ';
-	vc->vc_scrl_erase_char = (build_attr(vc, vc->vc_def_color, 1, false, false, vc->vc_decscnm, false) << 8) | ' ';
 }
 
 /* Note: inverting the screen twice should revert to the original state */
@@ -770,15 +769,14 @@ int vc_allocate(unsigned int currcons)	/* return 0 on success */
 	    visual_init(vc, currcons, 1);
 	    if (!*vc->vc_uni_pagedir_loc)
 		con_set_default_unimap(vc);
-	    if (!vc->vc_kmalloced)
-		vc->vc_screenbuf = kmalloc(vc->vc_screenbuf_size, GFP_KERNEL);
+	    vc->vc_screenbuf = kmalloc(vc->vc_screenbuf_size, GFP_KERNEL);
 	    if (!vc->vc_screenbuf) {
 		kfree(vc);
 		vc_cons[currcons].d = NULL;
 		return -ENOMEM;
 	    }
-	    vc->vc_kmalloced = 1;
 	    vc_init(vc, vc->vc_rows, vc->vc_cols, 1);
+	    vcs_make_sysfs(currcons);
 	    atomic_notifier_call_chain(&vt_notifier_list, VT_ALLOCATE, &param);
 	}
 	return 0;
@@ -803,7 +801,25 @@ static inline int resize_screen(struct vc_data *vc, int width, int height,
  */
 #define VC_RESIZE_MAXCOL (32767)
 #define VC_RESIZE_MAXROW (32767)
-int vc_resize(struct vc_data *vc, unsigned int cols, unsigned int lines)
+
+/**
+ *	vc_do_resize	-	resizing method for the tty
+ *	@tty: tty being resized
+ *	@real_tty: real tty (different to tty if a pty/tty pair)
+ *	@vc: virtual console private data
+ *	@cols: columns
+ *	@lines: lines
+ *
+ *	Resize a virtual console, clipping according to the actual constraints.
+ *	If the caller passes a tty structure then update the termios winsize
+ *	information and perform any neccessary signal handling.
+ *
+ *	Caller must hold the console semaphore. Takes the termios mutex and
+ *	ctrl_lock of the tty IFF a tty is passed.
+ */
+
+static int vc_do_resize(struct tty_struct *tty, struct vc_data *vc,
+				unsigned int cols, unsigned int lines)
 {
 	unsigned long old_origin, new_origin, new_scr_end, rlth, rrem, err = 0;
 	unsigned int old_cols, old_rows, old_row_size, old_screen_size;
@@ -894,10 +910,8 @@ int vc_resize(struct vc_data *vc, unsigned int cols, unsigned int lines)
 	if (new_scr_end > new_origin)
 		scr_memsetw((void *)new_origin, vc->vc_video_erase_char,
 			    new_scr_end - new_origin);
-	if (vc->vc_kmalloced)
-		kfree(vc->vc_screenbuf);
+	kfree(vc->vc_screenbuf);
 	vc->vc_screenbuf = newscreen;
-	vc->vc_kmalloced = 1;
 	vc->vc_screenbuf_size = new_screen_size;
 	set_origin(vc);
 
@@ -907,41 +921,61 @@ int vc_resize(struct vc_data *vc, unsigned int cols, unsigned int lines)
 	gotoxy(vc, vc->vc_x, vc->vc_y);
 	save_cur(vc);
 
-	if (vc->vc_tty) {
-		struct winsize ws, *cws = &vc->vc_tty->winsize;
-		struct pid *pgrp = NULL;
-
+	if (tty) {
+		/* Rewrite the requested winsize data with the actual
+		   resulting sizes */
+		struct winsize ws;
 		memset(&ws, 0, sizeof(ws));
 		ws.ws_row = vc->vc_rows;
 		ws.ws_col = vc->vc_cols;
 		ws.ws_ypixel = vc->vc_scan_lines;
-
-		mutex_lock(&vc->vc_tty->termios_mutex);
-		spin_lock_irq(&vc->vc_tty->ctrl_lock);
-		if ((ws.ws_row != cws->ws_row || ws.ws_col != cws->ws_col))
-			pgrp = get_pid(vc->vc_tty->pgrp);
-		spin_unlock_irq(&vc->vc_tty->ctrl_lock);
-		if (pgrp) {
-			kill_pgrp(vc->vc_tty->pgrp, SIGWINCH, 1);
-			put_pid(pgrp);
-		}
-		*cws = ws;
-		mutex_unlock(&vc->vc_tty->termios_mutex);
+		tty_do_resize(tty, &ws);
 	}
 
 	if (CON_IS_VISIBLE(vc))
 		update_screen(vc);
+	vt_event_post(VT_EVENT_RESIZE, vc->vc_num, vc->vc_num);
 	return err;
 }
 
-int vc_lock_resize(struct vc_data *vc, unsigned int cols, unsigned int lines)
+/**
+ *	vc_resize		-	resize a VT
+ *	@vc: virtual console
+ *	@cols: columns
+ *	@rows: rows
+ *
+ *	Resize a virtual console as seen from the console end of things. We
+ *	use the common vc_do_resize methods to update the structures. The
+ *	caller must hold the console sem to protect console internals and
+ *	vc->vc_tty
+ */
+
+int vc_resize(struct vc_data *vc, unsigned int cols, unsigned int rows)
 {
-	int rc;
+	return vc_do_resize(vc->vc_tty, vc, cols, rows);
+}
+
+/**
+ *	vt_resize		-	resize a VT
+ *	@tty: tty to resize
+ *	@ws: winsize attributes
+ *
+ *	Resize a virtual terminal. This is called by the tty layer as we
+ *	register our own handler for resizing. The mutual helper does all
+ *	the actual work.
+ *
+ *	Takes the console sem and the called methods then take the tty
+ *	termios_mutex and the tty ctrl_lock in that order.
+ */
+static int vt_resize(struct tty_struct *tty, struct winsize *ws)
+{
+	struct vc_data *vc = tty->driver_data;
+	int ret;
 
 	acquire_console_sem();
-	rc = vc_resize(vc, cols, lines);
+	ret = vc_do_resize(tty, vc, ws->ws_col, ws->ws_row);
 	release_console_sem();
-	return rc;
+	return ret;
 }
 
 void vc_deallocate(unsigned int currcons)
@@ -951,12 +985,13 @@ void vc_deallocate(unsigned int currcons)
 	if (vc_cons_allocated(currcons)) {
 		struct vc_data *vc = vc_cons[currcons].d;
 		struct vt_notifier_param param = { .vc = vc };
+
 		atomic_notifier_call_chain(&vt_notifier_list, VT_DEALLOCATE, &param);
+		vcs_remove_sysfs(currcons);
 		vc->vc_sw->con_deinit(vc);
 		put_pid(vc->vt_pid);
 		module_put(vc->vc_sw->owner);
-		if (vc->vc_kmalloced)
-			kfree(vc->vc_screenbuf);
+		kfree(vc->vc_screenbuf);
 		if (currcons >= MIN_NR_CONSOLES)
 			kfree(vc);
 		vc_cons[currcons].d = NULL;
@@ -1447,7 +1482,7 @@ static void setterm_command(struct vc_data *vc)
 			update_attr(vc);
 			break;
 		case 9:	/* set blanking interval */
-			blankinterval = ((vc->vc_par[1] < 60) ? vc->vc_par[1] : 60) * 60 * HZ;
+			blankinterval = ((vc->vc_par[1] < 60) ? vc->vc_par[1] : 60) * 60;
 			poke_blanked_console();
 			break;
 		case 10: /* set bell frequency in Hz */
@@ -1605,7 +1640,10 @@ static void reset_terminal(struct vc_data *vc, int do_clear)
 	vc->vc_tab_stop[1]	=
 	vc->vc_tab_stop[2]	=
 	vc->vc_tab_stop[3]	=
-	vc->vc_tab_stop[4]	= 0x01010101;
+	vc->vc_tab_stop[4]	=
+	vc->vc_tab_stop[5]	=
+	vc->vc_tab_stop[6]	=
+	vc->vc_tab_stop[7]	= 0x01010101;
 
 	vc->vc_bell_pitch = DEFAULT_BELL_PITCH;
 	vc->vc_bell_duration = DEFAULT_BELL_DURATION;
@@ -1896,7 +1934,10 @@ static void do_con_trol(struct tty_struct *tty, struct vc_data *vc, int c)
 					vc->vc_tab_stop[1] =
 					vc->vc_tab_stop[2] =
 					vc->vc_tab_stop[3] =
-					vc->vc_tab_stop[4] = 0;
+					vc->vc_tab_stop[4] =
+					vc->vc_tab_stop[5] =
+					vc->vc_tab_stop[6] =
+					vc->vc_tab_stop[7] = 0;
 			}
 			return;
 		case 'm':
@@ -2088,34 +2129,12 @@ static int do_con_write(struct tty_struct *tty, const unsigned char *buf, int co
 	currcons = vc->vc_num;
 	if (!vc_cons_allocated(currcons)) {
 	    /* could this happen? */
-	    static int error = 0;
-	    if (!error) {
-		error = 1;
-		printk("con_write: tty %d not allocated\n", currcons+1);
-	    }
+		printk_once("con_write: tty %d not allocated\n", currcons+1);
 	    release_console_sem();
 	    return 0;
 	}
-	release_console_sem();
-
 	orig_buf = buf;
 	orig_count = count;
-
-	/* At this point 'buf' is guaranteed to be a kernel buffer
-	 * and therefore no access to userspace (and therefore sleeping)
-	 * will be needed.  The con_buf_mtx serializes all tty based
-	 * console rendering and vcs write/read operations.  We hold
-	 * the console spinlock during the entire write.
-	 */
-
-	acquire_console_sem();
-
-	vc = tty->driver_data;
-	if (vc == NULL) {
-		printk(KERN_ERR "vt: argh, driver_data _became_ NULL !\n");
-		release_console_sem();
-		goto out;
-	}
 
 	himask = vc->vc_hi_font_mask;
 	charmask = himask ? 0x1ff : 0xff;
@@ -2211,7 +2230,7 @@ rescan_last_byte:
 			c = 0xfffd;
 		    tc = c;
 		} else {	/* no utf or alternate charset mode */
-		    tc = vc->vc_translate[vc->vc_toggle_meta ? (c | 0x80) : c];
+		    tc = vc_translate(vc, c);
 		}
 
 		param.c = tc;
@@ -2330,8 +2349,6 @@ rescan_last_byte:
 	FLUSH
 	console_conditional_schedule();
 	release_console_sem();
-
-out:
 	notify_update(vc);
 	return n;
 #undef FLUSH
@@ -2543,8 +2560,6 @@ int tioclinux(struct tty_struct *tty, unsigned long arg)
 	int lines;
 	int ret;
 
-	if (tty->driver->type != TTY_DRIVER_TYPE_CONSOLE)
-		return -EINVAL;
 	if (current->signal->tty != tty && !capable(CAP_SYS_ADMIN))
 		return -EPERM;
 	if (get_user(type, p))
@@ -2656,7 +2671,7 @@ static int con_write_room(struct tty_struct *tty)
 {
 	if (tty->stopped)
 		return 0;
-	return 4096;		/* No limit, really; we're not buffering */
+	return 32768;		/* No limit, really; we're not buffering */
 }
 
 static int con_chars_in_buffer(struct tty_struct *tty)
@@ -2738,6 +2753,12 @@ static int con_open(struct tty_struct *tty, struct file *filp)
 		ret = vc_allocate(currcons);
 		if (ret == 0) {
 			struct vc_data *vc = vc_cons[currcons].d;
+
+			/* Still being freed */
+			if (vc->vc_tty) {
+				release_console_sem();
+				return -ERESTARTSYS;
+			}
 			tty->driver_data = vc;
 			vc->vc_tty = tty;
 
@@ -2750,7 +2771,6 @@ static int con_open(struct tty_struct *tty, struct file *filp)
 			else
 				tty->termios->c_iflag &= ~IUTF8;
 			release_console_sem();
-			vcs_make_sysfs(tty);
 			return ret;
 		}
 	}
@@ -2758,34 +2778,19 @@ static int con_open(struct tty_struct *tty, struct file *filp)
 	return ret;
 }
 
-/*
- * We take tty_mutex in here to prevent another thread from coming in via init_dev
- * and taking a ref against the tty while we're in the process of forgetting
- * about it and cleaning things up.
- *
- * This is because vcs_remove_sysfs() can sleep and will drop the BKL.
- */
 static void con_close(struct tty_struct *tty, struct file *filp)
 {
-	mutex_lock(&tty_mutex);
-	acquire_console_sem();
-	if (tty && tty->count == 1) {
-		struct vc_data *vc = tty->driver_data;
+	/* Nothing to do - we defer to shutdown */
+}
 
-		if (vc)
-			vc->vc_tty = NULL;
-		tty->driver_data = NULL;
-		release_console_sem();
-		vcs_remove_sysfs(tty);
-		mutex_unlock(&tty_mutex);
-		/*
-		 * tty_mutex is released, but we still hold BKL, so there is
-		 * still exclusion against init_dev()
-		 */
-		return;
-	}
+static void con_shutdown(struct tty_struct *tty)
+{
+	struct vc_data *vc = tty->driver_data;
+	BUG_ON(vc == NULL);
+	acquire_console_sem();
+	vc->vc_tty = NULL;
 	release_console_sem();
-	mutex_unlock(&tty_mutex);
+	tty_shutdown(tty);
 }
 
 static int default_italic_color    = 2; // green (ASCII)
@@ -2859,18 +2864,14 @@ static int __init con_init(void)
 
 	if (blankinterval) {
 		blank_state = blank_normal_wait;
-		mod_timer(&console_timer, jiffies + blankinterval);
+		mod_timer(&console_timer, jiffies + (blankinterval * HZ));
 	}
 
-	/*
-	 * kmalloc is not running yet - we use the bootmem allocator.
-	 */
 	for (currcons = 0; currcons < MIN_NR_CONSOLES; currcons++) {
-		vc_cons[currcons].d = vc = alloc_bootmem(sizeof(struct vc_data));
+		vc_cons[currcons].d = vc = kzalloc(sizeof(struct vc_data), GFP_NOWAIT);
 		INIT_WORK(&vc_cons[currcons].SAK_work, vc_SAK);
 		visual_init(vc, currcons, 1);
-		vc->vc_screenbuf = (unsigned short *)alloc_bootmem(vc->vc_screenbuf_size);
-		vc->vc_kmalloced = 0;
+		vc->vc_screenbuf = kzalloc(vc->vc_screenbuf_size, GFP_NOWAIT);
 		vc_init(vc, vc->vc_rows, vc->vc_cols,
 			currcons || !vc->vc_sw->con_save_screen);
 	}
@@ -2905,14 +2906,27 @@ static const struct tty_operations con_ops = {
 	.flush_chars = con_flush_chars,
 	.chars_in_buffer = con_chars_in_buffer,
 	.ioctl = vt_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl = vt_compat_ioctl,
+#endif
 	.stop = con_stop,
 	.start = con_start,
 	.throttle = con_throttle,
 	.unthrottle = con_unthrottle,
+	.resize = vt_resize,
+	.shutdown = con_shutdown
 };
 
-int __init vty_init(void)
+static struct cdev vc0_cdev;
+
+int __init vty_init(const struct file_operations *console_fops)
 {
+	cdev_init(&vc0_cdev, console_fops);
+	if (cdev_add(&vc0_cdev, MKDEV(TTY_MAJOR, 0), 1) ||
+	    register_chrdev_region(MKDEV(TTY_MAJOR, 0), 1, "/dev/vc/0") < 0)
+		panic("Couldn't register /dev/tty0 driver\n");
+	device_create(tty_class, NULL, MKDEV(TTY_MAJOR, 0), NULL, "tty0");
+
 	vcs_init();
 
 	console_driver = alloc_tty_driver(MAX_NR_CONSOLES);
@@ -2931,12 +2945,8 @@ int __init vty_init(void)
 	tty_set_operations(console_driver, &con_ops);
 	if (tty_register_driver(console_driver))
 		panic("Couldn't register console driver\n");
-
 	kbd_init();
 	console_map_init();
-#ifdef CONFIG_PROM_CONSOLE
-	prom_con_init();
-#endif
 #ifdef CONFIG_MDA_CONSOLE
 	mda_console_init();
 #endif
@@ -2944,7 +2954,6 @@ int __init vty_init(void)
 }
 
 #ifndef VT_SINGLE_DRIVER
-#include <linux/device.h>
 
 static struct class *vtconsole_class;
 
@@ -3426,8 +3435,9 @@ int register_con_driver(const struct consw *csw, int first, int last)
 		goto err;
 
 	con_driver->dev = device_create(vtconsole_class, NULL,
-					MKDEV(0, con_driver->node),
-					"vtcon%i", con_driver->node);
+						MKDEV(0, con_driver->node),
+						NULL, "vtcon%i",
+						con_driver->node);
 
 	if (IS_ERR(con_driver->dev)) {
 		printk(KERN_WARNING "Unable to create device for %s; "
@@ -3536,8 +3546,9 @@ static int __init vtconsole_class_init(void)
 
 		if (con->con && !con->dev) {
 			con->dev = device_create(vtconsole_class, NULL,
-						 MKDEV(0, con->node),
-						 "vtcon%i", con->node);
+							 MKDEV(0, con->node),
+							 NULL, "vtcon%i",
+							 con->node);
 
 			if (IS_ERR(con->dev)) {
 				printk(KERN_WARNING "Unable to create "
@@ -3625,6 +3636,7 @@ void do_blank_screen(int entering_gfx)
 		blank_state = blank_vesa_wait;
 		mod_timer(&console_timer, jiffies + vesa_off_interval);
 	}
+	vt_event_post(VT_EVENT_BLANK, vc->vc_num, vc->vc_num);
 }
 EXPORT_SYMBOL(do_blank_screen);
 
@@ -3657,7 +3669,7 @@ void do_unblank_screen(int leaving_gfx)
 		return; /* but leave console_blanked != 0 */
 
 	if (blankinterval) {
-		mod_timer(&console_timer, jiffies + blankinterval);
+		mod_timer(&console_timer, jiffies + (blankinterval * HZ));
 		blank_state = blank_normal_wait;
 	}
 
@@ -3669,6 +3681,7 @@ void do_unblank_screen(int leaving_gfx)
 		console_blank_hook(0);
 	set_palette(vc);
 	set_cursor(vc);
+	vt_event_post(VT_EVENT_UNBLANK, vc->vc_num, vc->vc_num);
 }
 EXPORT_SYMBOL(do_unblank_screen);
 
@@ -3691,7 +3704,7 @@ void unblank_screen(void)
 static void blank_screen_t(unsigned long dummy)
 {
 	if (unlikely(!keventd_up())) {
-		mod_timer(&console_timer, jiffies + blankinterval);
+		mod_timer(&console_timer, jiffies + (blankinterval * HZ));
 		return;
 	}
 	blank_timer_expired = 1;
@@ -3721,7 +3734,7 @@ void poke_blanked_console(void)
 	if (console_blanked)
 		unblank_screen();
 	else if (blankinterval) {
-		mod_timer(&console_timer, jiffies + blankinterval);
+		mod_timer(&console_timer, jiffies + (blankinterval * HZ));
 		blank_state = blank_normal_wait;
 	}
 }
@@ -4061,7 +4074,6 @@ EXPORT_SYMBOL(default_blu);
 EXPORT_SYMBOL(update_region);
 EXPORT_SYMBOL(redraw_screen);
 EXPORT_SYMBOL(vc_resize);
-EXPORT_SYMBOL(vc_lock_resize);
 EXPORT_SYMBOL(fg_console);
 EXPORT_SYMBOL(console_blank_hook);
 EXPORT_SYMBOL(console_blanked);

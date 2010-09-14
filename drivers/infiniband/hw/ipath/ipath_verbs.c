@@ -35,6 +35,7 @@
 #include <rdma/ib_user_verbs.h>
 #include <linux/io.h>
 #include <linux/utsname.h>
+#include <linux/rculist.h>
 
 #include "ipath_kernel.h"
 #include "ipath_verbs.h"
@@ -339,8 +340,15 @@ static int ipath_post_one_send(struct ipath_qp *qp, struct ib_send_wr *wr)
 	int acc;
 	int ret;
 	unsigned long flags;
+	struct ipath_devdata *dd = to_idev(qp->ibqp.device)->dd;
 
 	spin_lock_irqsave(&qp->s_lock, flags);
+
+	if (qp->ibqp.qp_type != IB_QPT_SMI &&
+	    !(dd->ipath_flags & IPATH_LINKACTIVE)) {
+		ret = -ENETDOWN;
+		goto bail;
+	}
 
 	/* Check that state is OK to post send. */
 	if (unlikely(!(ib_ipath_state_ops[qp->state] & IPATH_POST_SEND_OK)))
@@ -1020,7 +1028,7 @@ static void sdma_complete(void *cookie, int status)
 	struct ipath_verbs_txreq *tx = cookie;
 	struct ipath_qp *qp = tx->qp;
 	struct ipath_ibdev *dev = to_idev(qp->ibqp.device);
-	unsigned int flags;
+	unsigned long flags;
 	enum ib_wc_status ibs = status == IPATH_SDMA_TXREQ_S_OK ?
 		IB_WC_SUCCESS : IB_WC_WR_FLUSH_ERR;
 
@@ -1050,7 +1058,7 @@ static void sdma_complete(void *cookie, int status)
 
 static void decrement_dma_busy(struct ipath_qp *qp)
 {
-	unsigned int flags;
+	unsigned long flags;
 
 	if (atomic_dec_and_test(&qp->s_dma_busy)) {
 		spin_lock_irqsave(&qp->s_lock, flags);
@@ -1220,7 +1228,7 @@ static int ipath_verbs_send_pio(struct ipath_qp *qp,
 	unsigned flush_wc;
 	u32 control;
 	int ret;
-	unsigned int flags;
+	unsigned long flags;
 
 	piobuf = ipath_getpiobuf(dd, plen, NULL);
 	if (unlikely(piobuf == NULL)) {
@@ -1497,7 +1505,8 @@ static int ipath_query_device(struct ib_device *ibdev,
 		IB_DEVICE_SYS_IMAGE_GUID | IB_DEVICE_RC_RNR_NAK_GEN |
 		IB_DEVICE_PORT_ACTIVE_EVENT | IB_DEVICE_SRQ_RESIZE;
 	props->page_size_cap = PAGE_SIZE;
-	props->vendor_id = dev->dd->ipath_vendorid;
+	props->vendor_id =
+		IPATH_SRC_OUI_1 << 16 | IPATH_SRC_OUI_2 << 8 | IPATH_SRC_OUI_3;
 	props->vendor_part_id = dev->dd->ipath_deviceid;
 	props->hw_ver = dev->dd->ipath_pcirev;
 
@@ -1576,7 +1585,7 @@ static int ipath_query_port(struct ib_device *ibdev,
 	u64 ibcstat;
 
 	memset(props, 0, sizeof(*props));
-	props->lid = lid ? lid : __constant_be16_to_cpu(IB_LID_PERMISSIVE);
+	props->lid = lid ? lid : be16_to_cpu(IB_LID_PERMISSIVE);
 	props->lmc = dd->ipath_lmc;
 	props->sm_lid = dev->sm_lid;
 	props->sm_sl = dev->sm_sl;
@@ -1843,7 +1852,7 @@ unsigned ipath_get_npkeys(struct ipath_devdata *dd)
 }
 
 /**
- * ipath_get_pkey - return the indexed PKEY from the port 0 PKEY table
+ * ipath_get_pkey - return the indexed PKEY from the port PKEY table
  * @dd: the infinipath device
  * @index: the PKEY index
  */
@@ -1851,6 +1860,7 @@ unsigned ipath_get_pkey(struct ipath_devdata *dd, unsigned index)
 {
 	unsigned ret;
 
+	/* always a kernel port, no locking needed */
 	if (index >= ARRAY_SIZE(dd->ipath_pd[0]->port_pkeys))
 		ret = 0;
 	else

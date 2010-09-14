@@ -28,7 +28,7 @@
 #include <linux/spi/spi.h>
 #include <linux/spi/flash.h>
 
-#include <asm/hardware.h>
+#include <mach/hardware.h>
 #include <asm/setup.h>
 #include <asm/mach-types.h>
 #include <asm/irq.h>
@@ -37,9 +37,11 @@
 #include <asm/mach/map.h>
 #include <asm/mach/irq.h>
 
-#include <asm/arch/board.h>
-#include <asm/arch/gpio.h>
+#include <mach/board.h>
+#include <mach/gpio.h>
+#include <mach/at91sam9_smc.h>
 
+#include "sam9_smc.h"
 #include "generic.h"
 
 
@@ -48,7 +50,7 @@ static void __init cam60_map_io(void)
 	/* Initialize processor: 10 MHz crystal */
 	at91sam9260_initialize(10000000);
 
-	/* DGBU on ttyS0. (Rx & Tx only) */
+	/* DBGU on ttyS0. (Rx & Tx only) */
 	at91_register_uart(0, 0, 0);
 
 	/* set serial console to ttyS0 (ie, DBGU) */
@@ -142,7 +144,7 @@ static struct mtd_partition * __init nand_partitions(int size, int *num_partitio
 	return cam60_nand_partition;
 }
 
-static struct at91_nand_data __initdata cam60_nand_data = {
+static struct atmel_nand_data __initdata cam60_nand_data = {
 	.ale		= 21,
 	.cle		= 22,
 	// .det_pin	= ... not there
@@ -150,6 +152,32 @@ static struct at91_nand_data __initdata cam60_nand_data = {
 	.enable_pin	= AT91_PIN_PA7,
 	.partition_info	= nand_partitions,
 };
+
+static struct sam9_smc_config __initdata cam60_nand_smc_config = {
+	.ncs_read_setup		= 0,
+	.nrd_setup		= 1,
+	.ncs_write_setup	= 0,
+	.nwe_setup		= 1,
+
+	.ncs_read_pulse		= 3,
+	.nrd_pulse		= 3,
+	.ncs_write_pulse	= 3,
+	.nwe_pulse		= 3,
+
+	.read_cycle		= 5,
+	.write_cycle		= 5,
+
+	.mode			= AT91_SMC_READMODE | AT91_SMC_WRITEMODE | AT91_SMC_EXNWMODE_DISABLE | AT91_SMC_DBW_8,
+	.tdf_cycles		= 2,
+};
+
+static void __init cam60_add_device_nand(void)
+{
+	/* configure chip-select 3 (NAND) */
+	sam9_smc_configure(3, &cam60_nand_smc_config);
+
+	at91_add_device_nand(&cam60_nand_data);
+}
 
 
 static void __init cam60_board_init(void)
@@ -165,7 +193,7 @@ static void __init cam60_board_init(void)
 	at91_set_gpio_output(AT91_PIN_PB18, 1);
 	at91_add_device_usbh(&cam60_usbh_data);
 	/* NAND */
-	at91_add_device_nand(&cam60_nand_data);
+	cam60_add_device_nand();
 }
 
 MACHINE_START(CAM60, "KwikByte CAM60")

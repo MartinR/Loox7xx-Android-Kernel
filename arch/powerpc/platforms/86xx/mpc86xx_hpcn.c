@@ -19,16 +19,16 @@
 #include <linux/delay.h>
 #include <linux/seq_file.h>
 #include <linux/of_platform.h>
+#include <linux/lmb.h>
 
 #include <asm/system.h>
 #include <asm/time.h>
 #include <asm/machdep.h>
 #include <asm/pci-bridge.h>
-#include <asm/mpc86xx.h>
 #include <asm/prom.h>
 #include <mm/mmu_decl.h>
 #include <asm/udbg.h>
-#include <asm/i8259.h>
+#include <asm/swiotlb.h>
 
 #include <asm/mpic.h>
 
@@ -46,68 +46,6 @@
 #endif
 
 #ifdef CONFIG_PCI
-static void mpc86xx_8259_cascade(unsigned int irq, struct irq_desc *desc)
-{
-	unsigned int cascade_irq = i8259_irq();
-	if (cascade_irq != NO_IRQ)
-		generic_handle_irq(cascade_irq);
-	desc->chip->eoi(irq);
-}
-#endif	/* CONFIG_PCI */
-
-static void __init
-mpc86xx_hpcn_init_irq(void)
-{
-	struct mpic *mpic1;
-	struct device_node *np;
-	struct resource res;
-#ifdef CONFIG_PCI
-	struct device_node *cascade_node = NULL;
-	int cascade_irq;
-#endif
-
-	/* Determine PIC address. */
-	np = of_find_node_by_type(NULL, "open-pic");
-	if (np == NULL)
-		return;
-	of_address_to_resource(np, 0, &res);
-
-	/* Alloc mpic structure and per isu has 16 INT entries. */
-	mpic1 = mpic_alloc(np, res.start,
-			MPIC_PRIMARY | MPIC_WANTS_RESET | MPIC_BIG_ENDIAN,
-			0, 256, " MPIC     ");
-	BUG_ON(mpic1 == NULL);
-
-	mpic_init(mpic1);
-
-#ifdef CONFIG_PCI
-	/* Initialize i8259 controller */
-	for_each_node_by_type(np, "interrupt-controller")
-		if (of_device_is_compatible(np, "chrp,iic")) {
-			cascade_node = np;
-			break;
-		}
-	if (cascade_node == NULL) {
-		printk(KERN_DEBUG "mpc86xxhpcn: no ISA interrupt controller\n");
-		return;
-	}
-
-	cascade_irq = irq_of_parse_and_map(cascade_node, 0);
-	if (cascade_irq == NO_IRQ) {
-		printk(KERN_ERR "mpc86xxhpcn: failed to map cascade interrupt");
-		return;
-	}
-	DBG("mpc86xxhpcn: cascade mapped to irq %d\n", cascade_irq);
-
-	i8259_init(cascade_node, 0);
-	of_node_put(cascade_node);
-
-	set_irq_chained_handler(cascade_irq, mpc86xx_8259_cascade);
-#endif
-}
-
-#ifdef CONFIG_PCI
-extern int uses_fsl_uli_m1575;
 extern int uli_exclude_device(struct pci_controller *hose,
 				u_char bus, u_char devfn);
 
@@ -134,7 +72,9 @@ mpc86xx_hpcn_setup_arch(void)
 {
 #ifdef CONFIG_PCI
 	struct device_node *np;
+	struct pci_controller *hose;
 #endif
+	dma_addr_t max = 0xffffffff;
 
 	if (ppc_md.progress)
 		ppc_md.progress("mpc86xx_hpcn_setup_arch()", 0);
@@ -147,9 +87,11 @@ mpc86xx_hpcn_setup_arch(void)
 			fsl_add_bridge(np, 1);
 		else
 			fsl_add_bridge(np, 0);
+		hose = pci_find_hose_for_OF_device(np);
+		max = min(max, hose->dma_window_base_cur +
+			  hose->dma_window_size);
 	}
 
-	uses_fsl_uli_m1575 = 1;
 	ppc_md.pci_exclude_device = mpc86xx_exclude_device;
 
 #endif
@@ -159,27 +101,25 @@ mpc86xx_hpcn_setup_arch(void)
 #ifdef CONFIG_SMP
 	mpc86xx_smp_init();
 #endif
+
+#ifdef CONFIG_SWIOTLB
+	if (lmb_end_of_DRAM() > max) {
+		ppc_swiotlb_enable = 1;
+		set_pci_dma_ops(&swiotlb_dma_ops);
+		ppc_md.pci_dma_dev_setup = pci_dma_dev_setup_swiotlb;
+	}
+#endif
 }
 
 
 static void
 mpc86xx_hpcn_show_cpuinfo(struct seq_file *m)
 {
-	struct device_node *root;
-	uint memsize = total_memory;
-	const char *model = "";
 	uint svid = mfspr(SPRN_SVR);
 
 	seq_printf(m, "Vendor\t\t: Freescale Semiconductor\n");
 
-	root = of_find_node_by_path("/");
-	if (root)
-		model = of_get_property(root, "model", NULL);
-	seq_printf(m, "Machine\t\t: %s\n", model);
-	of_node_put(root);
-
 	seq_printf(m, "SVR\t\t: 0x%x\n", svid);
-	seq_printf(m, "Memory\t\t: %d MB\n", memsize / (1024 * 1024));
 }
 
 
@@ -222,6 +162,7 @@ mpc86xx_time_init(void)
 static __initdata struct of_device_id of_bus_ids[] = {
 	{ .compatible = "simple-bus", },
 	{ .compatible = "fsl,rapidio-delta", },
+	{ .compatible = "gianfar", },
 	{},
 };
 
@@ -232,12 +173,13 @@ static int __init declare_of_platform_devices(void)
 	return 0;
 }
 machine_device_initcall(mpc86xx_hpcn, declare_of_platform_devices);
+machine_arch_initcall(mpc86xx_hpcn, swiotlb_setup_bus_notifier);
 
 define_machine(mpc86xx_hpcn) {
 	.name			= "MPC86xx HPCN",
 	.probe			= mpc86xx_hpcn_probe,
 	.setup_arch		= mpc86xx_hpcn_setup_arch,
-	.init_IRQ		= mpc86xx_hpcn_init_irq,
+	.init_IRQ		= mpc86xx_init_irq,
 	.show_cpuinfo		= mpc86xx_hpcn_show_cpuinfo,
 	.get_irq		= mpic_get_irq,
 	.restart		= fsl_rstcr_restart,

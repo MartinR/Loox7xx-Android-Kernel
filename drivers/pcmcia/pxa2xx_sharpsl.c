@@ -19,7 +19,7 @@
 #include <linux/platform_device.h>
 
 #include <asm/mach-types.h>
-#include <asm/hardware.h>
+#include <mach/hardware.h>
 #include <asm/irq.h>
 #include <asm/hardware/scoop.h>
 
@@ -222,7 +222,7 @@ static void sharpsl_pcmcia_socket_suspend(struct soc_pcmcia_socket *skt)
 	sharpsl_pcmcia_init_reset(skt);
 }
 
-static struct pcmcia_low_level sharpsl_pcmcia_ops = {
+static struct pcmcia_low_level sharpsl_pcmcia_ops __initdata = {
 	.owner                  = THIS_MODULE,
 	.hw_init                = sharpsl_pcmcia_hw_init,
 	.hw_shutdown            = sharpsl_pcmcia_hw_shutdown,
@@ -255,16 +255,21 @@ static int __init sharpsl_pcmcia_init(void)
 {
 	int ret;
 
+	if (!platform_scoop_config)
+		return -ENODEV;
+
 	sharpsl_pcmcia_ops.nr = platform_scoop_config->num_devs;
 	sharpsl_pcmcia_device = platform_device_alloc("pxa2xx-pcmcia", -1);
 
 	if (!sharpsl_pcmcia_device)
 		return -ENOMEM;
 
-	sharpsl_pcmcia_device->dev.platform_data = &sharpsl_pcmcia_ops;
-	sharpsl_pcmcia_device->dev.parent = platform_scoop_config->devs[0].dev;
-
-	ret = platform_device_add(sharpsl_pcmcia_device);
+	ret = platform_device_add_data(sharpsl_pcmcia_device,
+			&sharpsl_pcmcia_ops, sizeof(sharpsl_pcmcia_ops));
+	if (ret == 0) {
+		sharpsl_pcmcia_device->dev.parent = platform_scoop_config->devs[0].dev;
+		ret = platform_device_add(sharpsl_pcmcia_device);
+	}
 
 	if (ret)
 		platform_device_put(sharpsl_pcmcia_device);

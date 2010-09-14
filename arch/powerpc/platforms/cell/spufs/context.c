@@ -28,6 +28,7 @@
 #include <asm/spu.h>
 #include <asm/spu_csa.h>
 #include "spufs.h"
+#include "sputrace.h"
 
 
 atomic_t nr_spu_contexts = ATOMIC_INIT(0);
@@ -35,6 +36,8 @@ atomic_t nr_spu_contexts = ATOMIC_INIT(0);
 struct spu_context *alloc_spu_context(struct spu_gang *gang)
 {
 	struct spu_context *ctx;
+	struct timespec ts;
+
 	ctx = kzalloc(sizeof *ctx, GFP_KERNEL);
 	if (!ctx)
 		goto out;
@@ -64,6 +67,8 @@ struct spu_context *alloc_spu_context(struct spu_gang *gang)
 	__spu_update_sched_info(ctx);
 	spu_set_timeslice(ctx);
 	ctx->stats.util_state = SPU_UTIL_IDLE_LOADED;
+	ktime_get_ts(&ts);
+	ctx->stats.tstamp = timespec_to_ns(&ts);
 
 	atomic_inc(&nr_spu_contexts);
 	goto out;
@@ -130,17 +135,17 @@ void spu_unmap_mappings(struct spu_context *ctx)
 	if (ctx->local_store)
 		unmap_mapping_range(ctx->local_store, 0, LS_SIZE, 1);
 	if (ctx->mfc)
-		unmap_mapping_range(ctx->mfc, 0, 0x1000, 1);
+		unmap_mapping_range(ctx->mfc, 0, SPUFS_MFC_MAP_SIZE, 1);
 	if (ctx->cntl)
-		unmap_mapping_range(ctx->cntl, 0, 0x1000, 1);
+		unmap_mapping_range(ctx->cntl, 0, SPUFS_CNTL_MAP_SIZE, 1);
 	if (ctx->signal1)
-		unmap_mapping_range(ctx->signal1, 0, PAGE_SIZE, 1);
+		unmap_mapping_range(ctx->signal1, 0, SPUFS_SIGNAL_MAP_SIZE, 1);
 	if (ctx->signal2)
-		unmap_mapping_range(ctx->signal2, 0, PAGE_SIZE, 1);
+		unmap_mapping_range(ctx->signal2, 0, SPUFS_SIGNAL_MAP_SIZE, 1);
 	if (ctx->mss)
-		unmap_mapping_range(ctx->mss, 0, 0x1000, 1);
+		unmap_mapping_range(ctx->mss, 0, SPUFS_MSS_MAP_SIZE, 1);
 	if (ctx->psmap)
-		unmap_mapping_range(ctx->psmap, 0, 0x20000, 1);
+		unmap_mapping_range(ctx->psmap, 0, SPUFS_PS_MAP_SIZE, 1);
 	mutex_unlock(&ctx->mapping_lock);
 }
 

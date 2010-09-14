@@ -11,6 +11,7 @@
 #include <linux/string.h>
 #include <linux/fs.h>
 #include <linux/mm.h>
+#include <linux/smp_lock.h>
 #include <linux/spinlock.h>
 #include <linux/stddef.h>
 
@@ -1394,7 +1395,7 @@ static int create_md5_pad(int alloc_flag, unsigned long long hashed_length, char
 	if (padlen < MD5_MIN_PAD_LENGTH) padlen += MD5_BLOCK_LENGTH;
 
 	p = kmalloc(padlen, alloc_flag);
-	if (!pad) return -ENOMEM;
+	if (!p) return -ENOMEM;
 
 	*p = 0x80;
 	memset(p+1, 0, padlen - 1);
@@ -1426,7 +1427,7 @@ static int create_sha1_pad(int alloc_flag, unsigned long long hashed_length, cha
 	if (padlen < SHA1_MIN_PAD_LENGTH) padlen += SHA1_BLOCK_LENGTH;
 
 	p = kmalloc(padlen, alloc_flag);
-	if (!pad) return -ENOMEM;
+	if (!p) return -ENOMEM;
 
 	*p = 0x80;
 	memset(p+1, 0, padlen - 1);
@@ -2302,11 +2303,11 @@ static int cryptocop_job_setup(struct cryptocop_prio_job **pj, struct cryptocop_
 	return 0;
 }
 
-
 static int cryptocop_open(struct inode *inode, struct file *filp)
 {
 	int p = iminor(inode);
 
+	cycle_kernel_lock();
 	if (p != CRYPTOCOP_MINOR) return -EINVAL;
 
 	filp->private_data = NULL;

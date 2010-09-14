@@ -1,6 +1,4 @@
 /*
- * $Id: h3600_ts_input.c,v 1.4 2002/01/23 06:39:37 jsimmons Exp $
- *
  *  Copyright (c) 2001 "Crazy" James Simmons jsimmons@transvirtual.com
  *
  *  Sponsored by Transvirtual Technology.
@@ -41,8 +39,8 @@
 #include <linux/delay.h>
 
 /* SA1100 serial defines */
-#include <asm/arch/hardware.h>
-#include <asm/arch/irqs.h>
+#include <mach/hardware.h>
+#include <mach/irqs.h>
 
 #define DRIVER_DESC	"H3600 touchscreen driver"
 
@@ -150,9 +148,10 @@ unsigned int h3600_flite_power(struct input_dev *dev, enum flite_pwr pwr)
 	struct h3600_dev *ts = input_get_drvdata(dev);
 
 	/* Must be in this order */
-	ts->serio->write(ts->serio, 1);
-	ts->serio->write(ts->serio, pwr);
-	ts->serio->write(ts->serio, brightness);
+	serio_write(ts->serio, 1);
+	serio_write(ts->serio, pwr);
+	serio_write(ts->serio, brightness);
+
 	return 0;
 }
 
@@ -264,7 +263,7 @@ static int h3600ts_event(struct input_dev *dev, unsigned int type,
 
 	switch (type) {
 		case EV_LED: {
-		//	ts->serio->write(ts->serio, SOME_CMD);
+		//	serio_write(ts->serio, SOME_CMD);
 			return 0;
 		}
 	}

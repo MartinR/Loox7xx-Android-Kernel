@@ -93,8 +93,9 @@ enum sctp_optname {
 #define SCTP_STATUS SCTP_STATUS
 	SCTP_GET_PEER_ADDR_INFO,
 #define SCTP_GET_PEER_ADDR_INFO SCTP_GET_PEER_ADDR_INFO
-	SCTP_DELAYED_ACK_TIME,
-#define SCTP_DELAYED_ACK_TIME SCTP_DELAYED_ACK_TIME
+	SCTP_DELAYED_ACK,
+#define SCTP_DELAYED_ACK_TIME SCTP_DELAYED_ACK
+#define SCTP_DELAYED_ACK SCTP_DELAYED_ACK
 	SCTP_CONTEXT,	/* Receive Context */
 #define SCTP_CONTEXT SCTP_CONTEXT
 	SCTP_FRAGMENT_INTERLEAVE,
@@ -117,6 +118,8 @@ enum sctp_optname {
 #define SCTP_PEER_AUTH_CHUNKS SCTP_PEER_AUTH_CHUNKS
 	SCTP_LOCAL_AUTH_CHUNKS,		/* Read only */
 #define SCTP_LOCAL_AUTH_CHUNKS SCTP_LOCAL_AUTH_CHUNKS
+	SCTP_GET_ASSOC_NUMBER,		/* Read only */
+#define SCTP_GET_ASSOC_NUMBER SCTP_GET_ASSOC_NUMBER
 
 
 	/* Internal Socket Options. Some of the sctp library functions are 
@@ -136,12 +139,16 @@ enum sctp_optname {
 #define SCTP_GET_LOCAL_ADDRS_NUM_OLD	SCTP_GET_LOCAL_ADDRS_NUM_OLD
 	SCTP_GET_LOCAL_ADDRS_OLD, 	/* Get all local addresss. */
 #define SCTP_GET_LOCAL_ADDRS_OLD	SCTP_GET_LOCAL_ADDRS_OLD
-	SCTP_SOCKOPT_CONNECTX, /* CONNECTX requests. */
-#define SCTP_SOCKOPT_CONNECTX	SCTP_SOCKOPT_CONNECTX
+	SCTP_SOCKOPT_CONNECTX_OLD, /* CONNECTX old requests. */
+#define SCTP_SOCKOPT_CONNECTX_OLD	SCTP_SOCKOPT_CONNECTX_OLD
 	SCTP_GET_PEER_ADDRS, 	/* Get all peer addresss. */
 #define SCTP_GET_PEER_ADDRS	SCTP_GET_PEER_ADDRS
 	SCTP_GET_LOCAL_ADDRS, 	/* Get all local addresss. */
 #define SCTP_GET_LOCAL_ADDRS	SCTP_GET_LOCAL_ADDRS
+	SCTP_SOCKOPT_CONNECTX, /* CONNECTX requests. */
+#define SCTP_SOCKOPT_CONNECTX	SCTP_SOCKOPT_CONNECTX
+	SCTP_SOCKOPT_CONNECTX3, /* CONNECTX requests. (new implementation) */
+#define SCTP_SOCKOPT_CONNECTX3	SCTP_SOCKOPT_CONNECTX3
 };
 
 /*
@@ -202,12 +209,6 @@ enum sctp_sinfo_flags {
 	SCTP_EOF=MSG_FIN,    /* Initiate graceful shutdown process. */	
 };
 
-
-typedef union {
-	__u8   			raw;
-	struct sctp_initmsg	init;
-	struct sctp_sndrcvinfo	sndrcv;
-} sctp_cmsg_data_t;
 
 /* These are cmsg_types.  */
 typedef enum sctp_cmsg_type {
@@ -618,13 +619,26 @@ struct sctp_authkeyid {
 };
 
 
-/* 7.1.23. Delayed Ack Timer (SCTP_DELAYED_ACK_TIME)
+/*
+ * 7.1.23.  Get or set delayed ack timer (SCTP_DELAYED_SACK)
  *
- *   This options will get or set the delayed ack timer.  The time is set
- *   in milliseconds.  If the assoc_id is 0, then this sets or gets the
- *   endpoints default delayed ack timer value.  If the assoc_id field is
- *   non-zero, then the set or get effects the specified association.
+ * This option will effect the way delayed acks are performed.  This
+ * option allows you to get or set the delayed ack time, in
+ * milliseconds.  It also allows changing the delayed ack frequency.
+ * Changing the frequency to 1 disables the delayed sack algorithm.  If
+ * the assoc_id is 0, then this sets or gets the endpoints default
+ * values.  If the assoc_id field is non-zero, then the set or get
+ * effects the specified association for the one to many model (the
+ * assoc_id field is ignored by the one to one model).  Note that if
+ * sack_delay or sack_freq are 0 when setting this option, then the
+ * current values will remain unchanged.
  */
+struct sctp_sack_info {
+	sctp_assoc_t	sack_assoc_id;
+	uint32_t	sack_delay;
+	uint32_t	sack_freq;
+};
+
 struct sctp_assoc_value {
     sctp_assoc_t            assoc_id;
     uint32_t                assoc_value;

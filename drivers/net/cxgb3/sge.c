@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2005-2007 Chelsio, Inc. All rights reserved.
+ * Copyright (c) 2005-2008 Chelsio, Inc. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -36,6 +36,7 @@
 #include <linux/ip.h>
 #include <linux/tcp.h>
 #include <linux/dma-mapping.h>
+#include <net/arp.h>
 #include "common.h"
 #include "regs.h"
 #include "sge_defs.h"
@@ -49,20 +50,33 @@
 #define SGE_RX_COPY_THRES  256
 #define SGE_RX_PULL_LEN    128
 
+#define SGE_PG_RSVD SMP_CACHE_BYTES
 /*
  * Page chunk size for FL0 buffers if FL0 is to be populated with page chunks.
  * It must be a divisor of PAGE_SIZE.  If set to 0 FL0 will use sk_buffs
  * directly.
  */
 #define FL0_PG_CHUNK_SIZE  2048
+#define FL0_PG_ORDER 0
+#define FL0_PG_ALLOC_SIZE (PAGE_SIZE << FL0_PG_ORDER)
+#define FL1_PG_CHUNK_SIZE (PAGE_SIZE > 8192 ? 16384 : 8192)
+#define FL1_PG_ORDER (PAGE_SIZE > 8192 ? 0 : 1)
+#define FL1_PG_ALLOC_SIZE (PAGE_SIZE << FL1_PG_ORDER)
 
 #define SGE_RX_DROP_THRES 16
+#define RX_RECLAIM_PERIOD (HZ/4)
 
+/*
+ * Max number of Rx buffers we replenish at a time.
+ */
+#define MAX_RX_REFILL 16U
 /*
  * Period of the Tx buffer reclaim timer.  This timer does not need to run
  * frequently as Tx buffers are usually reclaimed by new Tx packets.
  */
 #define TX_RECLAIM_PERIOD (HZ / 4)
+#define TX_RECLAIM_TIMER_CHUNK 64U
+#define TX_RECLAIM_CHUNK 16U
 
 /* WR size in bytes */
 #define WR_LEN (WR_FLITS * 8)
@@ -300,21 +314,25 @@ static void free_tx_desc(struct adapter *adapter, struct sge_txq *q,
  *	reclaim_completed_tx - reclaims completed Tx descriptors
  *	@adapter: the adapter
  *	@q: the Tx queue to reclaim completed descriptors from
+ *	@chunk: maximum number of descriptors to reclaim
  *
  *	Reclaims Tx descriptors that the SGE has indicated it has processed,
  *	and frees the associated buffers if possible.  Called with the Tx
  *	queue's lock held.
  */
-static inline void reclaim_completed_tx(struct adapter *adapter,
-					struct sge_txq *q)
+static inline unsigned int reclaim_completed_tx(struct adapter *adapter,
+						struct sge_txq *q,
+						unsigned int chunk)
 {
 	unsigned int reclaim = q->processed - q->cleaned;
 
+	reclaim = min(chunk, reclaim);
 	if (reclaim) {
 		free_tx_desc(adapter, q, reclaim);
 		q->cleaned += reclaim;
 		q->in_use -= reclaim;
 	}
+	return q->processed - q->cleaned;
 }
 
 /**
@@ -328,6 +346,26 @@ static inline int should_restart_tx(const struct sge_txq *q)
 	unsigned int r = q->processed - q->cleaned;
 
 	return q->in_use - r < (q->size >> 1);
+}
+
+static void clear_rx_desc(struct pci_dev *pdev, const struct sge_fl *q,
+			  struct rx_sw_desc *d)
+{
+	if (q->use_pages && d->pg_chunk.page) {
+		(*d->pg_chunk.p_cnt)--;
+		if (!*d->pg_chunk.p_cnt)
+			pci_unmap_page(pdev,
+				       d->pg_chunk.mapping,
+				       q->alloc_size, PCI_DMA_FROMDEVICE);
+
+		put_page(d->pg_chunk.page);
+		d->pg_chunk.page = NULL;
+	} else {
+		pci_unmap_single(pdev, pci_unmap_addr(d, dma_addr),
+				 q->buf_size, PCI_DMA_FROMDEVICE);
+		kfree_skb(d->skb);
+		d->skb = NULL;
+	}
 }
 
 /**
@@ -345,21 +383,14 @@ static void free_rx_bufs(struct pci_dev *pdev, struct sge_fl *q)
 	while (q->credits--) {
 		struct rx_sw_desc *d = &q->sdesc[cidx];
 
-		pci_unmap_single(pdev, pci_unmap_addr(d, dma_addr),
-				 q->buf_size, PCI_DMA_FROMDEVICE);
-		if (q->use_pages) {
-			put_page(d->pg_chunk.page);
-			d->pg_chunk.page = NULL;
-		} else {
-			kfree_skb(d->skb);
-			d->skb = NULL;
-		}
+
+		clear_rx_desc(pdev, q, d);
 		if (++cidx == q->size)
 			cidx = 0;
 	}
 
 	if (q->pg_chunk.page) {
-		__free_page(q->pg_chunk.page);
+		__free_pages(q->pg_chunk.page, q->order);
 		q->pg_chunk.page = NULL;
 	}
 }
@@ -376,13 +407,16 @@ static void free_rx_bufs(struct pci_dev *pdev, struct sge_fl *q)
  *	Add a buffer of the given length to the supplied HW and SW Rx
  *	descriptors.
  */
-static inline void add_one_rx_buf(void *va, unsigned int len,
-				  struct rx_desc *d, struct rx_sw_desc *sd,
-				  unsigned int gen, struct pci_dev *pdev)
+static inline int add_one_rx_buf(void *va, unsigned int len,
+				 struct rx_desc *d, struct rx_sw_desc *sd,
+				 unsigned int gen, struct pci_dev *pdev)
 {
 	dma_addr_t mapping;
 
 	mapping = pci_map_single(pdev, va, len, PCI_DMA_FROMDEVICE);
+	if (unlikely(pci_dma_mapping_error(pdev, mapping)))
+		return -ENOMEM;
+
 	pci_unmap_addr_set(sd, dma_addr, mapping);
 
 	d->addr_lo = cpu_to_be32(mapping);
@@ -390,27 +424,64 @@ static inline void add_one_rx_buf(void *va, unsigned int len,
 	wmb();
 	d->len_gen = cpu_to_be32(V_FLD_GEN1(gen));
 	d->gen2 = cpu_to_be32(V_FLD_GEN2(gen));
+	return 0;
 }
 
-static int alloc_pg_chunk(struct sge_fl *q, struct rx_sw_desc *sd, gfp_t gfp)
+static inline int add_one_rx_chunk(dma_addr_t mapping, struct rx_desc *d,
+				   unsigned int gen)
+{
+	d->addr_lo = cpu_to_be32(mapping);
+	d->addr_hi = cpu_to_be32((u64) mapping >> 32);
+	wmb();
+	d->len_gen = cpu_to_be32(V_FLD_GEN1(gen));
+	d->gen2 = cpu_to_be32(V_FLD_GEN2(gen));
+	return 0;
+}
+
+static int alloc_pg_chunk(struct adapter *adapter, struct sge_fl *q,
+			  struct rx_sw_desc *sd, gfp_t gfp,
+			  unsigned int order)
 {
 	if (!q->pg_chunk.page) {
-		q->pg_chunk.page = alloc_page(gfp);
+		dma_addr_t mapping;
+
+		q->pg_chunk.page = alloc_pages(gfp, order);
 		if (unlikely(!q->pg_chunk.page))
 			return -ENOMEM;
 		q->pg_chunk.va = page_address(q->pg_chunk.page);
+		q->pg_chunk.p_cnt = q->pg_chunk.va + (PAGE_SIZE << order) -
+				    SGE_PG_RSVD;
 		q->pg_chunk.offset = 0;
+		mapping = pci_map_page(adapter->pdev, q->pg_chunk.page,
+				       0, q->alloc_size, PCI_DMA_FROMDEVICE);
+		q->pg_chunk.mapping = mapping;
 	}
 	sd->pg_chunk = q->pg_chunk;
 
+	prefetch(sd->pg_chunk.p_cnt);
+
 	q->pg_chunk.offset += q->buf_size;
-	if (q->pg_chunk.offset == PAGE_SIZE)
+	if (q->pg_chunk.offset == (PAGE_SIZE << order))
 		q->pg_chunk.page = NULL;
 	else {
 		q->pg_chunk.va += q->buf_size;
 		get_page(q->pg_chunk.page);
 	}
+
+	if (sd->pg_chunk.offset == 0)
+		*sd->pg_chunk.p_cnt = 1;
+	else
+		*sd->pg_chunk.p_cnt += 1;
+
 	return 0;
+}
+
+static inline void ring_fl_db(struct adapter *adap, struct sge_fl *q)
+{
+	if (q->pend_cred >= q->credits / 4) {
+		q->pend_cred = 0;
+		t3_write_reg(adap, A_SG_KDOORBELL, V_EGRCNTX(q->cntxt_id));
+	}
 }
 
 /**
@@ -424,31 +495,46 @@ static int alloc_pg_chunk(struct sge_fl *q, struct rx_sw_desc *sd, gfp_t gfp)
  *	allocated with the supplied gfp flags.  The caller must assure that
  *	@n does not exceed the queue's capacity.
  */
-static void refill_fl(struct adapter *adap, struct sge_fl *q, int n, gfp_t gfp)
+static int refill_fl(struct adapter *adap, struct sge_fl *q, int n, gfp_t gfp)
 {
-	void *buf_start;
 	struct rx_sw_desc *sd = &q->sdesc[q->pidx];
 	struct rx_desc *d = &q->desc[q->pidx];
+	unsigned int count = 0;
 
 	while (n--) {
+		dma_addr_t mapping;
+		int err;
+
 		if (q->use_pages) {
-			if (unlikely(alloc_pg_chunk(q, sd, gfp))) {
+			if (unlikely(alloc_pg_chunk(adap, q, sd, gfp,
+						    q->order))) {
 nomem:				q->alloc_failed++;
 				break;
 			}
-			buf_start = sd->pg_chunk.va;
-		} else {
-			struct sk_buff *skb = alloc_skb(q->buf_size, gfp);
+			mapping = sd->pg_chunk.mapping + sd->pg_chunk.offset;
+			pci_unmap_addr_set(sd, dma_addr, mapping);
 
+			add_one_rx_chunk(mapping, d, q->gen);
+			pci_dma_sync_single_for_device(adap->pdev, mapping,
+						q->buf_size - SGE_PG_RSVD,
+						PCI_DMA_FROMDEVICE);
+		} else {
+			void *buf_start;
+
+			struct sk_buff *skb = alloc_skb(q->buf_size, gfp);
 			if (!skb)
 				goto nomem;
 
 			sd->skb = skb;
 			buf_start = skb->data;
+			err = add_one_rx_buf(buf_start, q->buf_size, d, sd,
+					     q->gen, adap->pdev);
+			if (unlikely(err)) {
+				clear_rx_desc(adap->pdev, q, sd);
+				break;
+			}
 		}
 
-		add_one_rx_buf(buf_start, q->buf_size, d, sd, q->gen,
-			       adap->pdev);
 		d++;
 		sd++;
 		if (++q->pidx == q->size) {
@@ -457,15 +543,20 @@ nomem:				q->alloc_failed++;
 			sd = q->sdesc;
 			d = q->desc;
 		}
-		q->credits++;
+		count++;
 	}
-	wmb();
-	t3_write_reg(adap, A_SG_KDOORBELL, V_EGRCNTX(q->cntxt_id));
+
+	q->credits += count;
+	q->pend_cred += count;
+	ring_fl_db(adap, q);
+
+	return count;
 }
 
 static inline void __refill_fl(struct adapter *adap, struct sge_fl *fl)
 {
-	refill_fl(adap, fl, min(16U, fl->size - fl->credits), GFP_ATOMIC);
+	refill_fl(adap, fl, min(MAX_RX_REFILL, fl->size - fl->credits),
+		  GFP_ATOMIC | __GFP_COMP);
 }
 
 /**
@@ -489,13 +580,15 @@ static void recycle_rx_buf(struct adapter *adap, struct sge_fl *q,
 	wmb();
 	to->len_gen = cpu_to_be32(V_FLD_GEN1(q->gen));
 	to->gen2 = cpu_to_be32(V_FLD_GEN2(q->gen));
-	q->credits++;
 
 	if (++q->pidx == q->size) {
 		q->pidx = 0;
 		q->gen ^= 1;
 	}
-	t3_write_reg(adap, A_SG_KDOORBELL, V_EGRCNTX(q->cntxt_id));
+
+	q->credits++;
+	q->pend_cred++;
+	ring_fl_db(adap, q);
 }
 
 /**
@@ -524,16 +617,15 @@ static void *alloc_ring(struct pci_dev *pdev, size_t nelem, size_t elem_size,
 
 	if (!p)
 		return NULL;
-	if (sw_size) {
+	if (sw_size && metadata) {
 		s = kcalloc(nelem, sw_size, GFP_KERNEL);
 
 		if (!s) {
 			dma_free_coherent(&pdev->dev, len, p, *phys);
 			return NULL;
 		}
-	}
-	if (metadata)
 		*(void **)metadata = s;
+	}
 	memset(p, 0, len);
 	return p;
 }
@@ -559,7 +651,10 @@ static void t3_reset_qset(struct sge_qset *q)
 	memset(q->fl, 0, sizeof(struct sge_fl) * SGE_RXQ_PER_SET);
 	memset(q->txq, 0, sizeof(struct sge_txq) * SGE_TXQ_PER_SET);
 	q->txq_stopped = 0;
-	memset(&q->tx_reclaim_timer, 0, sizeof(q->tx_reclaim_timer));
+	q->tx_reclaim_timer.function = NULL; /* for t3_stop_sge_timers() */
+	q->rx_reclaim_timer.function = NULL;
+	q->nomem = 0;
+	napi_free_frags(&q->napi);
 }
 
 
@@ -576,9 +671,6 @@ static void t3_free_qset(struct adapter *adapter, struct sge_qset *q)
 {
 	int i;
 	struct pci_dev *pdev = adapter->pdev;
-
-	if (q->tx_reclaim_timer.function)
-		del_timer_sync(&q->tx_reclaim_timer);
 
 	for (i = 0; i < SGE_RXQ_PER_SET; ++i)
 		if (q->fl[i].desc) {
@@ -709,7 +801,9 @@ recycle:
 		return skb;
 	}
 
-	if (unlikely(fl->credits < drop_thres))
+	if (unlikely(fl->credits < drop_thres) &&
+	    refill_fl(adap, fl, min(MAX_RX_REFILL, fl->size - fl->credits - 1),
+		      GFP_ATOMIC | __GFP_COMP) == 0)
 		goto recycle;
 
 use_orig_buf:
@@ -740,57 +834,80 @@ use_orig_buf:
  * 	that are page chunks rather than sk_buffs.
  */
 static struct sk_buff *get_packet_pg(struct adapter *adap, struct sge_fl *fl,
-				     unsigned int len, unsigned int drop_thres)
+				     struct sge_rspq *q, unsigned int len,
+				     unsigned int drop_thres)
 {
-	struct sk_buff *skb = NULL;
+	struct sk_buff *newskb, *skb;
 	struct rx_sw_desc *sd = &fl->sdesc[fl->cidx];
 
-	if (len <= SGE_RX_COPY_THRES) {
-		skb = alloc_skb(len, GFP_ATOMIC);
-		if (likely(skb != NULL)) {
-			__skb_put(skb, len);
-			pci_dma_sync_single_for_cpu(adap->pdev,
-					    pci_unmap_addr(sd, dma_addr), len,
+	dma_addr_t dma_addr = pci_unmap_addr(sd, dma_addr);
+
+	newskb = skb = q->pg_skb;
+	if (!skb && (len <= SGE_RX_COPY_THRES)) {
+		newskb = alloc_skb(len, GFP_ATOMIC);
+		if (likely(newskb != NULL)) {
+			__skb_put(newskb, len);
+			pci_dma_sync_single_for_cpu(adap->pdev, dma_addr, len,
 					    PCI_DMA_FROMDEVICE);
-			memcpy(skb->data, sd->pg_chunk.va, len);
-			pci_dma_sync_single_for_device(adap->pdev,
-					    pci_unmap_addr(sd, dma_addr), len,
-					    PCI_DMA_FROMDEVICE);
+			memcpy(newskb->data, sd->pg_chunk.va, len);
+			pci_dma_sync_single_for_device(adap->pdev, dma_addr,
+						       len,
+						       PCI_DMA_FROMDEVICE);
 		} else if (!drop_thres)
 			return NULL;
 recycle:
 		fl->credits--;
 		recycle_rx_buf(adap, fl, fl->cidx);
-		return skb;
+		q->rx_recycle_buf++;
+		return newskb;
 	}
 
-	if (unlikely(fl->credits <= drop_thres))
+	if (unlikely(q->rx_recycle_buf || (!skb && fl->credits <= drop_thres)))
 		goto recycle;
 
-	skb = alloc_skb(SGE_RX_PULL_LEN, GFP_ATOMIC);
-	if (unlikely(!skb)) {
+	prefetch(sd->pg_chunk.p_cnt);
+
+	if (!skb)
+		newskb = alloc_skb(SGE_RX_PULL_LEN, GFP_ATOMIC);
+
+	if (unlikely(!newskb)) {
 		if (!drop_thres)
 			return NULL;
 		goto recycle;
 	}
 
-	pci_unmap_single(adap->pdev, pci_unmap_addr(sd, dma_addr),
-			 fl->buf_size, PCI_DMA_FROMDEVICE);
-	__skb_put(skb, SGE_RX_PULL_LEN);
-	memcpy(skb->data, sd->pg_chunk.va, SGE_RX_PULL_LEN);
-	skb_fill_page_desc(skb, 0, sd->pg_chunk.page,
-			   sd->pg_chunk.offset + SGE_RX_PULL_LEN,
-			   len - SGE_RX_PULL_LEN);
-	skb->len = len;
-	skb->data_len = len - SGE_RX_PULL_LEN;
-	skb->truesize += skb->data_len;
+	pci_dma_sync_single_for_cpu(adap->pdev, dma_addr, len,
+				    PCI_DMA_FROMDEVICE);
+	(*sd->pg_chunk.p_cnt)--;
+	if (!*sd->pg_chunk.p_cnt && sd->pg_chunk.page != fl->pg_chunk.page)
+		pci_unmap_page(adap->pdev,
+			       sd->pg_chunk.mapping,
+			       fl->alloc_size,
+			       PCI_DMA_FROMDEVICE);
+	if (!skb) {
+		__skb_put(newskb, SGE_RX_PULL_LEN);
+		memcpy(newskb->data, sd->pg_chunk.va, SGE_RX_PULL_LEN);
+		skb_fill_page_desc(newskb, 0, sd->pg_chunk.page,
+				   sd->pg_chunk.offset + SGE_RX_PULL_LEN,
+				   len - SGE_RX_PULL_LEN);
+		newskb->len = len;
+		newskb->data_len = len - SGE_RX_PULL_LEN;
+		newskb->truesize += newskb->data_len;
+	} else {
+		skb_fill_page_desc(newskb, skb_shinfo(newskb)->nr_frags,
+				   sd->pg_chunk.page,
+				   sd->pg_chunk.offset, len);
+		newskb->len += len;
+		newskb->data_len += len;
+		newskb->truesize += len;
+	}
 
 	fl->credits--;
 	/*
 	 * We do not refill FLs here, we let the caller do it to overlap a
 	 * prefetch.
 	 */
-	return skb;
+	return newskb;
 }
 
 /**
@@ -1026,7 +1143,7 @@ static void write_tx_pkt_wr(struct adapter *adap, struct sk_buff *skb,
 	struct tx_desc *d = &q->desc[pidx];
 	struct cpl_tx_pkt *cpl = (struct cpl_tx_pkt *)d;
 
-	cpl->len = htonl(skb->len | 0x80000000);
+	cpl->len = htonl(skb->len);
 	cntrl = V_TXPKT_INTF(pi->port_id);
 
 	if (vlan_tx_tag_present(skb) && pi->vlan_grp)
@@ -1084,10 +1201,10 @@ static void write_tx_pkt_wr(struct adapter *adap, struct sk_buff *skb,
 			 htonl(V_WR_TID(q->token)));
 }
 
-static inline void t3_stop_queue(struct net_device *dev, struct sge_qset *qs,
-				 struct sge_txq *q)
+static inline void t3_stop_tx_queue(struct netdev_queue *txq,
+				    struct sge_qset *qs, struct sge_txq *q)
 {
-	netif_stop_queue(dev);
+	netif_tx_stop_queue(txq);
 	set_bit(TXQ_ETH, &qs->txq_stopped);
 	q->stops++;
 }
@@ -1099,13 +1216,15 @@ static inline void t3_stop_queue(struct net_device *dev, struct sge_qset *qs,
  *
  *	Add a packet to an SGE Tx queue.  Runs with softirqs disabled.
  */
-int t3_eth_xmit(struct sk_buff *skb, struct net_device *dev)
+netdev_tx_t t3_eth_xmit(struct sk_buff *skb, struct net_device *dev)
 {
+	int qidx;
 	unsigned int ndesc, pidx, credits, gen, compl;
 	const struct port_info *pi = netdev_priv(dev);
 	struct adapter *adap = pi->adapter;
-	struct sge_qset *qs = pi->qs;
-	struct sge_txq *q = &qs->txq[TXQ_ETH];
+	struct netdev_queue *txq;
+	struct sge_qset *qs;
+	struct sge_txq *q;
 
 	/*
 	 * The chip min packet length is 9 octets but play safe and reject
@@ -1116,29 +1235,32 @@ int t3_eth_xmit(struct sk_buff *skb, struct net_device *dev)
 		return NETDEV_TX_OK;
 	}
 
-	spin_lock(&q->lock);
-	reclaim_completed_tx(adap, q);
+	qidx = skb_get_queue_mapping(skb);
+	qs = &pi->qs[qidx];
+	q = &qs->txq[TXQ_ETH];
+	txq = netdev_get_tx_queue(dev, qidx);
+
+	reclaim_completed_tx(adap, q, TX_RECLAIM_CHUNK);
 
 	credits = q->size - q->in_use;
 	ndesc = calc_tx_descs(skb);
 
 	if (unlikely(credits < ndesc)) {
-		t3_stop_queue(dev, qs, q);
+		t3_stop_tx_queue(txq, qs, q);
 		dev_err(&adap->pdev->dev,
 			"%s: Tx ring %u full while queue awake!\n",
 			dev->name, q->cntxt_id & 7);
-		spin_unlock(&q->lock);
 		return NETDEV_TX_BUSY;
 	}
 
 	q->in_use += ndesc;
 	if (unlikely(credits - ndesc < q->stop_thres)) {
-		t3_stop_queue(dev, qs, q);
+		t3_stop_tx_queue(txq, qs, q);
 
 		if (should_restart_tx(q) &&
 		    test_and_clear_bit(TXQ_ETH, &qs->txq_stopped)) {
 			q->restarts++;
-			netif_wake_queue(dev);
+			netif_tx_wake_queue(txq);
 		}
 	}
 
@@ -1160,9 +1282,6 @@ int t3_eth_xmit(struct sk_buff *skb, struct net_device *dev)
 		qs->port_stats[SGE_PSTAT_TSO]++;
 	if (vlan_tx_tag_present(skb) && pi->vlan_grp)
 		qs->port_stats[SGE_PSTAT_VLANINS]++;
-
-	dev->trans_start = jiffies;
-	spin_unlock(&q->lock);
 
 	/*
 	 * We do not use Tx completion interrupts to free DMAd Tx packets.
@@ -1526,7 +1645,7 @@ static int ofld_xmit(struct adapter *adap, struct sge_txq *q,
 	unsigned int ndesc = calc_tx_descs_ofld(skb), pidx, gen;
 
 	spin_lock(&q->lock);
-      again:reclaim_completed_tx(adap, q);
+again:	reclaim_completed_tx(adap, q, TX_RECLAIM_CHUNK);
 
 	ret = check_desc_avail(adap, q, skb, ndesc, TXQ_OFLD);
 	if (unlikely(ret)) {
@@ -1568,7 +1687,7 @@ static void restart_offloadq(unsigned long data)
 	struct adapter *adap = pi->adapter;
 
 	spin_lock(&q->lock);
-      again:reclaim_completed_tx(adap, q);
+again:	reclaim_completed_tx(adap, q, TX_RECLAIM_CHUNK);
 
 	while ((skb = skb_peek(&q->sendq)) != NULL) {
 		unsigned int gen, pidx;
@@ -1665,16 +1784,15 @@ int t3_offload_tx(struct t3cdev *tdev, struct sk_buff *skb)
  */
 static inline void offload_enqueue(struct sge_rspq *q, struct sk_buff *skb)
 {
-	skb->next = skb->prev = NULL;
-	if (q->rx_tail)
-		q->rx_tail->next = skb;
-	else {
+	int was_empty = skb_queue_empty(&q->rx_queue);
+
+	__skb_queue_tail(&q->rx_queue, skb);
+
+	if (was_empty) {
 		struct sge_qset *qs = rspq_to_qset(q);
 
 		napi_schedule(&qs->napi);
-		q->rx_head = skb;
 	}
-	q->rx_tail = skb;
 }
 
 /**
@@ -1715,26 +1833,29 @@ static int ofld_poll(struct napi_struct *napi, int budget)
 	int work_done = 0;
 
 	while (work_done < budget) {
-		struct sk_buff *head, *tail, *skbs[RX_BUNDLE_SIZE];
+		struct sk_buff *skb, *tmp, *skbs[RX_BUNDLE_SIZE];
+		struct sk_buff_head queue;
 		int ngathered;
 
 		spin_lock_irq(&q->lock);
-		head = q->rx_head;
-		if (!head) {
+		__skb_queue_head_init(&queue);
+		skb_queue_splice_init(&q->rx_queue, &queue);
+		if (skb_queue_empty(&queue)) {
 			napi_complete(napi);
 			spin_unlock_irq(&q->lock);
 			return work_done;
 		}
-
-		tail = q->rx_tail;
-		q->rx_head = q->rx_tail = NULL;
 		spin_unlock_irq(&q->lock);
 
-		for (ngathered = 0; work_done < budget && head; work_done++) {
-			prefetch(head->data);
-			skbs[ngathered] = head;
-			head = head->next;
-			skbs[ngathered]->next = NULL;
+		ngathered = 0;
+		skb_queue_walk_safe(&queue, skb, tmp) {
+			if (work_done >= budget)
+				break;
+			work_done++;
+
+			__skb_unlink(skb, &queue);
+			prefetch(skb->data);
+			skbs[ngathered] = skb;
 			if (++ngathered == RX_BUNDLE_SIZE) {
 				q->offload_bundles++;
 				adapter->tdev.recv(&adapter->tdev, skbs,
@@ -1742,12 +1863,10 @@ static int ofld_poll(struct napi_struct *napi, int budget)
 				ngathered = 0;
 			}
 		}
-		if (head) {	/* splice remaining packets back onto Rx queue */
+		if (!skb_queue_empty(&queue)) {
+			/* splice remaining packets back onto Rx queue */
 			spin_lock_irq(&q->lock);
-			tail->next = q->rx_head;
-			if (!q->rx_head)
-				q->rx_tail = tail;
-			q->rx_head = head;
+			skb_queue_splice(&queue, &q->rx_queue);
 			spin_unlock_irq(&q->lock);
 		}
 		deliver_partial_bundle(&adapter->tdev, q, skbs, ngathered);
@@ -1802,7 +1921,7 @@ static void restart_tx(struct sge_qset *qs)
 	    test_and_clear_bit(TXQ_ETH, &qs->txq_stopped)) {
 		qs->txq[TXQ_ETH].restarts++;
 		if (netif_running(qs->netdev))
-			netif_wake_queue(qs->netdev);
+			netif_tx_wake_queue(qs->tx_q);
 	}
 
 	if (test_bit(TXQ_OFLD, &qs->txq_stopped) &&
@@ -1820,6 +1939,54 @@ static void restart_tx(struct sge_qset *qs)
 }
 
 /**
+ *	cxgb3_arp_process - process an ARP request probing a private IP address
+ *	@adapter: the adapter
+ *	@skb: the skbuff containing the ARP request
+ *
+ *	Check if the ARP request is probing the private IP address
+ *	dedicated to iSCSI, generate an ARP reply if so.
+ */
+static void cxgb3_arp_process(struct adapter *adapter, struct sk_buff *skb)
+{
+	struct net_device *dev = skb->dev;
+	struct port_info *pi;
+	struct arphdr *arp;
+	unsigned char *arp_ptr;
+	unsigned char *sha;
+	__be32 sip, tip;
+
+	if (!dev)
+		return;
+
+	skb_reset_network_header(skb);
+	arp = arp_hdr(skb);
+
+	if (arp->ar_op != htons(ARPOP_REQUEST))
+		return;
+
+	arp_ptr = (unsigned char *)(arp + 1);
+	sha = arp_ptr;
+	arp_ptr += dev->addr_len;
+	memcpy(&sip, arp_ptr, sizeof(sip));
+	arp_ptr += sizeof(sip);
+	arp_ptr += dev->addr_len;
+	memcpy(&tip, arp_ptr, sizeof(tip));
+
+	pi = netdev_priv(dev);
+	if (tip != pi->iscsi_ipv4addr)
+		return;
+
+	arp_send(ARPOP_REPLY, ETH_P_ARP, sip, dev, tip, sha,
+		 dev->dev_addr, sha);
+
+}
+
+static inline int is_arp(struct sk_buff *skb)
+{
+	return skb->protocol == htons(ETH_P_ARP);
+}
+
+/**
  *	rx_eth - process an ingress ethernet packet
  *	@adap: the adapter
  *	@rq: the response queue that received the packet
@@ -1831,35 +1998,147 @@ static void restart_tx(struct sge_qset *qs)
  *	if it was immediate data in a response.
  */
 static void rx_eth(struct adapter *adap, struct sge_rspq *rq,
-		   struct sk_buff *skb, int pad)
+		   struct sk_buff *skb, int pad, int lro)
 {
 	struct cpl_rx_pkt *p = (struct cpl_rx_pkt *)(skb->data + pad);
+	struct sge_qset *qs = rspq_to_qset(rq);
 	struct port_info *pi;
 
 	skb_pull(skb, sizeof(*p) + pad);
 	skb->protocol = eth_type_trans(skb, adap->port[p->iff]);
-	skb->dev->last_rx = jiffies;
 	pi = netdev_priv(skb->dev);
-	if (pi->rx_csum_offload && p->csum_valid && p->csum == htons(0xffff) &&
-	    !p->fragment) {
-		rspq_to_qset(rq)->port_stats[SGE_PSTAT_RX_CSUM_GOOD]++;
+	if ((pi->rx_offload & T3_RX_CSUM) && p->csum_valid &&
+	    p->csum == htons(0xffff) && !p->fragment) {
+		qs->port_stats[SGE_PSTAT_RX_CSUM_GOOD]++;
 		skb->ip_summed = CHECKSUM_UNNECESSARY;
 	} else
 		skb->ip_summed = CHECKSUM_NONE;
+	skb_record_rx_queue(skb, qs - &adap->sge.qs[0]);
 
 	if (unlikely(p->vlan_valid)) {
 		struct vlan_group *grp = pi->vlan_grp;
 
-		rspq_to_qset(rq)->port_stats[SGE_PSTAT_VLANEX]++;
+		qs->port_stats[SGE_PSTAT_VLANEX]++;
 		if (likely(grp))
-			__vlan_hwaccel_rx(skb, grp, ntohs(p->vlan),
-					  rq->polling);
+			if (lro)
+				vlan_gro_receive(&qs->napi, grp,
+						 ntohs(p->vlan), skb);
+			else {
+				if (unlikely(pi->iscsi_ipv4addr &&
+				    is_arp(skb))) {
+					unsigned short vtag = ntohs(p->vlan) &
+								VLAN_VID_MASK;
+					skb->dev = vlan_group_get_device(grp,
+									 vtag);
+					cxgb3_arp_process(adap, skb);
+				}
+				__vlan_hwaccel_rx(skb, grp, ntohs(p->vlan),
+					  	  rq->polling);
+			}
 		else
 			dev_kfree_skb_any(skb);
-	} else if (rq->polling)
-		netif_receive_skb(skb);
-	else
+	} else if (rq->polling) {
+		if (lro)
+			napi_gro_receive(&qs->napi, skb);
+		else {
+			if (unlikely(pi->iscsi_ipv4addr && is_arp(skb)))
+				cxgb3_arp_process(adap, skb);
+			netif_receive_skb(skb);
+		}
+	} else
 		netif_rx(skb);
+}
+
+static inline int is_eth_tcp(u32 rss)
+{
+	return G_HASHTYPE(ntohl(rss)) == RSS_HASH_4_TUPLE;
+}
+
+/**
+ *	lro_add_page - add a page chunk to an LRO session
+ *	@adap: the adapter
+ *	@qs: the associated queue set
+ *	@fl: the free list containing the page chunk to add
+ *	@len: packet length
+ *	@complete: Indicates the last fragment of a frame
+ *
+ *	Add a received packet contained in a page chunk to an existing LRO
+ *	session.
+ */
+static void lro_add_page(struct adapter *adap, struct sge_qset *qs,
+			 struct sge_fl *fl, int len, int complete)
+{
+	struct rx_sw_desc *sd = &fl->sdesc[fl->cidx];
+	struct sk_buff *skb = NULL;
+	struct cpl_rx_pkt *cpl;
+	struct skb_frag_struct *rx_frag;
+	int nr_frags;
+	int offset = 0;
+
+	if (!qs->nomem) {
+		skb = napi_get_frags(&qs->napi);
+		qs->nomem = !skb;
+	}
+
+	fl->credits--;
+
+	pci_dma_sync_single_for_cpu(adap->pdev,
+				    pci_unmap_addr(sd, dma_addr),
+				    fl->buf_size - SGE_PG_RSVD,
+				    PCI_DMA_FROMDEVICE);
+
+	(*sd->pg_chunk.p_cnt)--;
+	if (!*sd->pg_chunk.p_cnt && sd->pg_chunk.page != fl->pg_chunk.page)
+		pci_unmap_page(adap->pdev,
+			       sd->pg_chunk.mapping,
+			       fl->alloc_size,
+			       PCI_DMA_FROMDEVICE);
+
+	if (!skb) {
+		put_page(sd->pg_chunk.page);
+		if (complete)
+			qs->nomem = 0;
+		return;
+	}
+
+	rx_frag = skb_shinfo(skb)->frags;
+	nr_frags = skb_shinfo(skb)->nr_frags;
+
+	if (!nr_frags) {
+		offset = 2 + sizeof(struct cpl_rx_pkt);
+		qs->lro_va = sd->pg_chunk.va + 2;
+	}
+	len -= offset;
+
+	prefetch(qs->lro_va);
+
+	rx_frag += nr_frags;
+	rx_frag->page = sd->pg_chunk.page;
+	rx_frag->page_offset = sd->pg_chunk.offset + offset;
+	rx_frag->size = len;
+
+	skb->len += len;
+	skb->data_len += len;
+	skb->truesize += len;
+	skb_shinfo(skb)->nr_frags++;
+
+	if (!complete)
+		return;
+
+	skb->ip_summed = CHECKSUM_UNNECESSARY;
+	cpl = qs->lro_va;
+
+	if (unlikely(cpl->vlan_valid)) {
+		struct net_device *dev = qs->netdev;
+		struct port_info *pi = netdev_priv(dev);
+		struct vlan_group *grp = pi->vlan_grp;
+
+		if (likely(grp != NULL)) {
+			vlan_gro_frags(&qs->napi, grp, ntohs(cpl->vlan));
+			return;
+		}
+	}
+	napi_gro_frags(&qs->napi);
 }
 
 /**
@@ -1947,6 +2226,12 @@ static inline int is_new_response(const struct rsp_desc *r,
 	return (r->intr_gen & F_RSPD_GEN2) == q->gen;
 }
 
+static inline void clear_rspq_bufstate(struct sge_rspq * const q)
+{
+	q->pg_skb = NULL;
+	q->rx_recycle_buf = 0;
+}
+
 #define RSPD_GTS_MASK  (F_RSPD_TXQ0_GTS | F_RSPD_TXQ1_GTS)
 #define RSPD_CTRL_MASK (RSPD_GTS_MASK | \
 			V_RSPD_TXQ0_CR(M_RSPD_TXQ0_CR) | \
@@ -1984,10 +2269,11 @@ static int process_responses(struct adapter *adap, struct sge_qset *qs,
 	q->next_holdoff = q->holdoff_tmr;
 
 	while (likely(budget_left && is_new_response(r, q))) {
-		int eth, ethpad = 2;
+		int packet_complete, eth, ethpad = 2, lro = qs->lro_enabled;
 		struct sk_buff *skb = NULL;
 		u32 len, flags = ntohl(r->flags);
-		__be32 rss_hi = *(const __be32 *)r, rss_lo = r->rss_hdr.rss_hash_val;
+		__be32 rss_hi = *(const __be32 *)r,
+		       rss_lo = r->rss_hdr.rss_hash_val;
 
 		eth = r->rss_hdr.opcode == CPL_RX_PKT;
 
@@ -2015,6 +2301,8 @@ no_mem:
 		} else if ((len = ntohl(r->len_cq)) != 0) {
 			struct sge_fl *fl;
 
+			lro &= eth && is_eth_tcp(rss_hi);
+
 			fl = (len & F_RSPD_FLQ) ? &qs->fl[1] : &qs->fl[0];
 			if (fl->use_pages) {
 				void *addr = fl->sdesc[fl->cidx].pg_chunk.va;
@@ -2024,9 +2312,18 @@ no_mem:
 				prefetch(addr + L1_CACHE_BYTES);
 #endif
 				__refill_fl(adap, fl);
+				if (lro > 0) {
+					lro_add_page(adap, qs, fl,
+						     G_RSPD_LEN(len),
+						     flags & F_RSPD_EOP);
+					 goto next_fl;
+				}
 
-				skb = get_packet_pg(adap, fl, G_RSPD_LEN(len),
-						 eth ? SGE_RX_DROP_THRES : 0);
+				skb = get_packet_pg(adap, fl, q,
+						    G_RSPD_LEN(len),
+						    eth ?
+						    SGE_RX_DROP_THRES : 0);
+				q->pg_skb = skb;
 			} else
 				skb = get_packet(adap, fl, G_RSPD_LEN(len),
 						 eth ? SGE_RX_DROP_THRES : 0);
@@ -2036,7 +2333,7 @@ no_mem:
 				q->rx_drops++;
 			} else if (unlikely(r->rss_hdr.opcode == CPL_TRACE_PKT))
 				__skb_pull(skb, 2);
-
+next_fl:
 			if (++fl->cidx == fl->size)
 				fl->cidx = 0;
 		} else
@@ -2060,9 +2357,13 @@ no_mem:
 			q->credits = 0;
 		}
 
-		if (likely(skb != NULL)) {
+		packet_complete = flags &
+				  (F_RSPD_EOP | F_RSPD_IMM_DATA_VALID |
+				   F_RSPD_ASYNC_NOTIF);
+
+		if (skb != NULL && packet_complete) {
 			if (eth)
-				rx_eth(adap, q, skb, ethpad);
+				rx_eth(adap, q, skb, ethpad, lro);
 			else {
 				q->offload_pkts++;
 				/* Preserve the RSS info in csum & priority */
@@ -2072,11 +2373,15 @@ no_mem:
 						       offload_skbs,
 						       ngathered);
 			}
+
+			if (flags & F_RSPD_EOP)
+				clear_rspq_bufstate(q);
 		}
 		--budget_left;
 	}
 
 	deliver_partial_bundle(&adap->tdev, q, offload_skbs, ngathered);
+
 	if (sleeping)
 		check_ring_db(adap, qs, sleeping);
 
@@ -2090,7 +2395,7 @@ no_mem:
 
 static inline int is_pure_response(const struct rsp_desc *r)
 {
-	u32 n = ntohl(r->flags) & (F_RSPD_ASYNC_NOTIF | F_RSPD_IMM_DATA_VALID);
+	__be32 n = r->flags & htonl(F_RSPD_ASYNC_NOTIF | F_RSPD_IMM_DATA_VALID);
 
 	return (n | r->len_cq) == 0;
 }
@@ -2491,7 +2796,8 @@ irq_handler_t t3_intr_handler(struct adapter *adap, int polling)
  */
 void t3_sge_err_intr_handler(struct adapter *adapter)
 {
-	unsigned int v, status = t3_read_reg(adapter, A_SG_INT_CAUSE);
+	unsigned int v, status = t3_read_reg(adapter, A_SG_INT_CAUSE) &
+				 ~F_FLEMPTY;
 
 	if (status & SGE_PARERR)
 		CH_ALERT(adapter, "SGE parity error (0x%x)\n",
@@ -2521,13 +2827,13 @@ void t3_sge_err_intr_handler(struct adapter *adapter)
 }
 
 /**
- *	sge_timer_cb - perform periodic maintenance of an SGE qset
+ *	sge_timer_tx - perform periodic maintenance of an SGE qset
  *	@data: the SGE queue set to maintain
  *
  *	Runs periodically from a timer to perform maintenance of an SGE queue
  *	set.  It performs two tasks:
  *
- *	a) Cleans up any completed Tx descriptors that may still be pending.
+ *	Cleans up any completed Tx descriptors that may still be pending.
  *	Normal descriptor cleanup happens when new packets are added to a Tx
  *	queue so this timer is relatively infrequent and does any cleanup only
  *	if the Tx queue has not seen any new packets in a while.  We make a
@@ -2537,51 +2843,88 @@ void t3_sge_err_intr_handler(struct adapter *adapter)
  *	up).  Since control queues use immediate data exclusively we don't
  *	bother cleaning them up here.
  *
- *	b) Replenishes Rx queues that have run out due to memory shortage.
+ */
+static void sge_timer_tx(unsigned long data)
+{
+	struct sge_qset *qs = (struct sge_qset *)data;
+	struct port_info *pi = netdev_priv(qs->netdev);
+	struct adapter *adap = pi->adapter;
+	unsigned int tbd[SGE_TXQ_PER_SET] = {0, 0};
+	unsigned long next_period;
+
+	if (__netif_tx_trylock(qs->tx_q)) {
+                tbd[TXQ_ETH] = reclaim_completed_tx(adap, &qs->txq[TXQ_ETH],
+                                                     TX_RECLAIM_TIMER_CHUNK);
+		__netif_tx_unlock(qs->tx_q);
+	}
+
+	if (spin_trylock(&qs->txq[TXQ_OFLD].lock)) {
+		tbd[TXQ_OFLD] = reclaim_completed_tx(adap, &qs->txq[TXQ_OFLD],
+						     TX_RECLAIM_TIMER_CHUNK);
+		spin_unlock(&qs->txq[TXQ_OFLD].lock);
+	}
+
+	next_period = TX_RECLAIM_PERIOD >>
+                      (max(tbd[TXQ_ETH], tbd[TXQ_OFLD]) /
+                      TX_RECLAIM_TIMER_CHUNK);
+	mod_timer(&qs->tx_reclaim_timer, jiffies + next_period);
+}
+
+/*
+ *	sge_timer_rx - perform periodic maintenance of an SGE qset
+ *	@data: the SGE queue set to maintain
+ *
+ *	a) Replenishes Rx queues that have run out due to memory shortage.
  *	Normally new Rx buffers are added when existing ones are consumed but
  *	when out of memory a queue can become empty.  We try to add only a few
  *	buffers here, the queue will be replenished fully as these new buffers
  *	are used up if memory shortage has subsided.
+ *
+ *	b) Return coalesced response queue credits in case a response queue is
+ *	starved.
+ *
  */
-static void sge_timer_cb(unsigned long data)
+static void sge_timer_rx(unsigned long data)
 {
 	spinlock_t *lock;
 	struct sge_qset *qs = (struct sge_qset *)data;
-	struct adapter *adap = qs->adap;
+	struct port_info *pi = netdev_priv(qs->netdev);
+	struct adapter *adap = pi->adapter;
+	u32 status;
 
-	if (spin_trylock(&qs->txq[TXQ_ETH].lock)) {
-		reclaim_completed_tx(adap, &qs->txq[TXQ_ETH]);
-		spin_unlock(&qs->txq[TXQ_ETH].lock);
-	}
-	if (spin_trylock(&qs->txq[TXQ_OFLD].lock)) {
-		reclaim_completed_tx(adap, &qs->txq[TXQ_OFLD]);
-		spin_unlock(&qs->txq[TXQ_OFLD].lock);
-	}
-	lock = (adap->flags & USING_MSIX) ? &qs->rspq.lock :
-					    &adap->sge.qs[0].rspq.lock;
-	if (spin_trylock_irq(lock)) {
-		if (!napi_is_scheduled(&qs->napi)) {
-			u32 status = t3_read_reg(adap, A_SG_RSPQ_FL_STATUS);
+	lock = adap->params.rev > 0 ?
+	       &qs->rspq.lock : &adap->sge.qs[0].rspq.lock;
 
-			if (qs->fl[0].credits < qs->fl[0].size)
-				__refill_fl(adap, &qs->fl[0]);
-			if (qs->fl[1].credits < qs->fl[1].size)
-				__refill_fl(adap, &qs->fl[1]);
+	if (!spin_trylock_irq(lock))
+		goto out;
 
-			if (status & (1 << qs->rspq.cntxt_id)) {
-				qs->rspq.starved++;
-				if (qs->rspq.credits) {
-					refill_rspq(adap, &qs->rspq, 1);
-					qs->rspq.credits--;
-					qs->rspq.restarted++;
-					t3_write_reg(adap, A_SG_RSPQ_FL_STATUS,
-						     1 << qs->rspq.cntxt_id);
-				}
+	if (napi_is_scheduled(&qs->napi))
+		goto unlock;
+
+	if (adap->params.rev < 4) {
+		status = t3_read_reg(adap, A_SG_RSPQ_FL_STATUS);
+
+		if (status & (1 << qs->rspq.cntxt_id)) {
+			qs->rspq.starved++;
+			if (qs->rspq.credits) {
+				qs->rspq.credits--;
+				refill_rspq(adap, &qs->rspq, 1);
+				qs->rspq.restarted++;
+				t3_write_reg(adap, A_SG_RSPQ_FL_STATUS,
+					     1 << qs->rspq.cntxt_id);
 			}
 		}
-		spin_unlock_irq(lock);
 	}
-	mod_timer(&qs->tx_reclaim_timer, jiffies + TX_RECLAIM_PERIOD);
+
+	if (qs->fl[0].credits < qs->fl[0].size)
+		__refill_fl(adap, &qs->fl[0]);
+	if (qs->fl[1].credits < qs->fl[1].size)
+		__refill_fl(adap, &qs->fl[1]);
+
+unlock:
+	spin_unlock_irq(lock);
+out:
+	mod_timer(&qs->rx_reclaim_timer, jiffies + RX_RECLAIM_PERIOD);
 }
 
 /**
@@ -2608,6 +2951,7 @@ void t3_update_qset_coalesce(struct sge_qset *qs, const struct qset_params *p)
  *	@p: configuration parameters for this queue set
  *	@ntxq: number of Tx queues for the queue set
  *	@netdev: net device associated with this queue set
+ *	@netdevq: net device TX queue associated with this queue set
  *
  *	Allocate resources and initialize an SGE queue set.  A queue set
  *	comprises a response queue, two Rx free-buffer queues, and up to 3
@@ -2616,15 +2960,15 @@ void t3_update_qset_coalesce(struct sge_qset *qs, const struct qset_params *p)
  */
 int t3_sge_alloc_qset(struct adapter *adapter, unsigned int id, int nports,
 		      int irq_vec_idx, const struct qset_params *p,
-		      int ntxq, struct net_device *dev)
+		      int ntxq, struct net_device *dev,
+		      struct netdev_queue *netdevq)
 {
-	int i, ret = -ENOMEM;
+	int i, avail, ret = -ENOMEM;
 	struct sge_qset *q = &adapter->sge.qs[id];
 
 	init_qset_cntxt(q, id);
-	init_timer(&q->tx_reclaim_timer);
-	q->tx_reclaim_timer.data = (unsigned long)q;
-	q->tx_reclaim_timer.function = sge_timer_cb;
+	setup_timer(&q->tx_reclaim_timer, sge_timer_tx, (unsigned long)q);
+	setup_timer(&q->rx_reclaim_timer, sge_timer_rx, (unsigned long)q);
 
 	q->fl[0].desc = alloc_ring(adapter->pdev, p->fl_size,
 				   sizeof(struct rx_desc),
@@ -2678,6 +3022,7 @@ int t3_sge_alloc_qset(struct adapter *adapter, unsigned int id, int nports,
 	q->rspq.gen = 1;
 	q->rspq.size = p->rspq_size;
 	spin_lock_init(&q->rspq.lock);
+	skb_queue_head_init(&q->rspq.rx_queue);
 
 	q->txq[TXQ_ETH].stop_thres = nports *
 	    flits_to_desc(sgl_len(MAX_SKB_FRAGS + 1) + 3);
@@ -2687,25 +3032,35 @@ int t3_sge_alloc_qset(struct adapter *adapter, unsigned int id, int nports,
 #else
 	q->fl[0].buf_size = SGE_RX_SM_BUF_SIZE + sizeof(struct cpl_rx_data);
 #endif
-	q->fl[0].use_pages = FL0_PG_CHUNK_SIZE > 0;
+#if FL1_PG_CHUNK_SIZE > 0
+	q->fl[1].buf_size = FL1_PG_CHUNK_SIZE;
+#else
 	q->fl[1].buf_size = is_offload(adapter) ?
 		(16 * 1024) - SKB_DATA_ALIGN(sizeof(struct skb_shared_info)) :
 		MAX_FRAME_SIZE + 2 + sizeof(struct cpl_rx_pkt);
+#endif
+
+	q->fl[0].use_pages = FL0_PG_CHUNK_SIZE > 0;
+	q->fl[1].use_pages = FL1_PG_CHUNK_SIZE > 0;
+	q->fl[0].order = FL0_PG_ORDER;
+	q->fl[1].order = FL1_PG_ORDER;
+	q->fl[0].alloc_size = FL0_PG_ALLOC_SIZE;
+	q->fl[1].alloc_size = FL1_PG_ALLOC_SIZE;
 
 	spin_lock_irq(&adapter->sge.reg_lock);
 
 	/* FL threshold comparison uses < */
 	ret = t3_sge_init_rspcntxt(adapter, q->rspq.cntxt_id, irq_vec_idx,
 				   q->rspq.phys_addr, q->rspq.size,
-				   q->fl[0].buf_size, 1, 0);
+				   q->fl[0].buf_size - SGE_PG_RSVD, 1, 0);
 	if (ret)
 		goto err_unlock;
 
 	for (i = 0; i < SGE_RXQ_PER_SET; ++i) {
 		ret = t3_sge_init_flcntxt(adapter, q->fl[i].cntxt_id, 0,
 					  q->fl[i].phys_addr, q->fl[i].size,
-					  q->fl[i].buf_size, p->cong_thres, 1,
-					  0);
+					  q->fl[i].buf_size - SGE_PG_RSVD,
+					  p->cong_thres, 1, 0);
 		if (ret)
 			goto err_unlock;
 	}
@@ -2740,23 +3095,77 @@ int t3_sge_alloc_qset(struct adapter *adapter, unsigned int id, int nports,
 
 	q->adap = adapter;
 	q->netdev = dev;
+	q->tx_q = netdevq;
 	t3_update_qset_coalesce(q, p);
 
-	refill_fl(adapter, &q->fl[0], q->fl[0].size, GFP_KERNEL);
-	refill_fl(adapter, &q->fl[1], q->fl[1].size, GFP_KERNEL);
+	avail = refill_fl(adapter, &q->fl[0], q->fl[0].size,
+			  GFP_KERNEL | __GFP_COMP);
+	if (!avail) {
+		CH_ALERT(adapter, "free list queue 0 initialization failed\n");
+		goto err;
+	}
+	if (avail < q->fl[0].size)
+		CH_WARN(adapter, "free list queue 0 enabled with %d credits\n",
+			avail);
+
+	avail = refill_fl(adapter, &q->fl[1], q->fl[1].size,
+			  GFP_KERNEL | __GFP_COMP);
+	if (avail < q->fl[1].size)
+		CH_WARN(adapter, "free list queue 1 enabled with %d credits\n",
+			avail);
 	refill_rspq(adapter, &q->rspq, q->rspq.size - 1);
 
 	t3_write_reg(adapter, A_SG_GTS, V_RSPQ(q->rspq.cntxt_id) |
 		     V_NEWTIMER(q->rspq.holdoff_tmr));
 
-	mod_timer(&q->tx_reclaim_timer, jiffies + TX_RECLAIM_PERIOD);
 	return 0;
 
-      err_unlock:
+err_unlock:
 	spin_unlock_irq(&adapter->sge.reg_lock);
-      err:
+err:
 	t3_free_qset(adapter, q);
 	return ret;
+}
+
+/**
+ *      t3_start_sge_timers - start SGE timer call backs
+ *      @adap: the adapter
+ *
+ *      Starts each SGE queue set's timer call back
+ */
+void t3_start_sge_timers(struct adapter *adap)
+{
+	int i;
+
+	for (i = 0; i < SGE_QSETS; ++i) {
+		struct sge_qset *q = &adap->sge.qs[i];
+
+	if (q->tx_reclaim_timer.function)
+		mod_timer(&q->tx_reclaim_timer, jiffies + TX_RECLAIM_PERIOD);
+
+	if (q->rx_reclaim_timer.function)
+		mod_timer(&q->rx_reclaim_timer, jiffies + RX_RECLAIM_PERIOD);
+	}
+}
+
+/**
+ *	t3_stop_sge_timers - stop SGE timer call backs
+ *	@adap: the adapter
+ *
+ *	Stops each SGE queue set's timer call back
+ */
+void t3_stop_sge_timers(struct adapter *adap)
+{
+	int i;
+
+	for (i = 0; i < SGE_QSETS; ++i) {
+		struct sge_qset *q = &adap->sge.qs[i];
+
+		if (q->tx_reclaim_timer.function)
+			del_timer_sync(&q->tx_reclaim_timer);
+		if (q->rx_reclaim_timer.function)
+			del_timer_sync(&q->rx_reclaim_timer);
+	}
 }
 
 /**
@@ -2876,7 +3285,7 @@ void t3_sge_prep(struct adapter *adap, struct sge_params *p)
 		q->coalesce_usecs = 5;
 		q->rspq_size = 1024;
 		q->fl_size = 1024;
-		q->jumbo_size = 512;
+ 		q->jumbo_size = 512;
 		q->txq_size[TXQ_ETH] = 1024;
 		q->txq_size[TXQ_OFLD] = 1024;
 		q->txq_size[TXQ_CTRL] = 256;

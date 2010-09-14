@@ -52,11 +52,9 @@ static enum hrtimer_restart timerfd_tmrproc(struct hrtimer *htmr)
 
 static ktime_t timerfd_get_remaining(struct timerfd_ctx *ctx)
 {
-	ktime_t now, remaining;
+	ktime_t remaining;
 
-	now = ctx->tmr.base->get_time();
-	remaining = ktime_sub(ctx->tmr.expires, now);
-
+	remaining = hrtimer_expires_remaining(&ctx->tmr);
 	return remaining.tv64 < 0 ? ktime_set(0, 0): remaining;
 }
 
@@ -74,7 +72,7 @@ static void timerfd_setup(struct timerfd_ctx *ctx, int flags,
 	ctx->ticks = 0;
 	ctx->tintv = timespec_to_ktime(ktmr->it_interval);
 	hrtimer_init(&ctx->tmr, ctx->clockid, htmode);
-	ctx->tmr.expires = texp;
+	hrtimer_set_expires(&ctx->tmr, texp);
 	ctx->tmr.function = timerfd_tmrproc;
 	if (texp.tv64 != 0)
 		hrtimer_start(&ctx->tmr, texp, htmode);
@@ -179,15 +177,18 @@ static struct file *timerfd_fget(int fd)
 	return file;
 }
 
-asmlinkage long sys_timerfd_create(int clockid, int flags)
+SYSCALL_DEFINE2(timerfd_create, int, clockid, int, flags)
 {
 	int ufd;
 	struct timerfd_ctx *ctx;
 
-	if (flags)
-		return -EINVAL;
-	if (clockid != CLOCK_MONOTONIC &&
-	    clockid != CLOCK_REALTIME)
+	/* Check the TFD_* constants for consistency.  */
+	BUILD_BUG_ON(TFD_CLOEXEC != O_CLOEXEC);
+	BUILD_BUG_ON(TFD_NONBLOCK != O_NONBLOCK);
+
+	if ((flags & ~TFD_CREATE_FLAGS) ||
+	    (clockid != CLOCK_MONOTONIC &&
+	     clockid != CLOCK_REALTIME))
 		return -EINVAL;
 
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
@@ -198,16 +199,17 @@ asmlinkage long sys_timerfd_create(int clockid, int flags)
 	ctx->clockid = clockid;
 	hrtimer_init(&ctx->tmr, clockid, HRTIMER_MODE_ABS);
 
-	ufd = anon_inode_getfd("[timerfd]", &timerfd_fops, ctx);
+	ufd = anon_inode_getfd("[timerfd]", &timerfd_fops, ctx,
+			       flags & TFD_SHARED_FCNTL_FLAGS);
 	if (ufd < 0)
 		kfree(ctx);
 
 	return ufd;
 }
 
-asmlinkage long sys_timerfd_settime(int ufd, int flags,
-				    const struct itimerspec __user *utmr,
-				    struct itimerspec __user *otmr)
+SYSCALL_DEFINE4(timerfd_settime, int, ufd, int, flags,
+		const struct itimerspec __user *, utmr,
+		struct itimerspec __user *, otmr)
 {
 	struct file *file;
 	struct timerfd_ctx *ctx;
@@ -216,7 +218,8 @@ asmlinkage long sys_timerfd_settime(int ufd, int flags,
 	if (copy_from_user(&ktmr, utmr, sizeof(ktmr)))
 		return -EFAULT;
 
-	if (!timespec_valid(&ktmr.it_value) ||
+	if ((flags & ~TFD_SETTIME_FLAGS) ||
+	    !timespec_valid(&ktmr.it_value) ||
 	    !timespec_valid(&ktmr.it_interval))
 		return -EINVAL;
 
@@ -262,7 +265,7 @@ asmlinkage long sys_timerfd_settime(int ufd, int flags,
 	return 0;
 }
 
-asmlinkage long sys_timerfd_gettime(int ufd, struct itimerspec __user *otmr)
+SYSCALL_DEFINE2(timerfd_gettime, int, ufd, struct itimerspec __user *, otmr)
 {
 	struct file *file;
 	struct timerfd_ctx *ctx;

@@ -46,6 +46,9 @@ static char *in, *inbuf;
 /* The operations for our console. */
 static struct hv_ops virtio_cons;
 
+/* The hvc device */
+static struct hvc_struct *hvc;
+
 /*D:310 The put_chars() callback is pretty straightforward.
  *
  * We turn the characters into a scatter-gather list, add it to the output
@@ -62,7 +65,7 @@ static int put_chars(u32 vtermno, const char *buf, int count)
 
 	/* add_buf wants a token to identify this buffer: we hand it any
 	 * non-NULL pointer, since there's only ever one buffer. */
-	if (out_vq->vq_ops->add_buf(out_vq, sg, 1, 0, (void *)1) == 0) {
+	if (out_vq->vq_ops->add_buf(out_vq, sg, 1, 0, (void *)1) >= 0) {
 		/* Tell Host to go! */
 		out_vq->vq_ops->kick(out_vq);
 		/* Chill out until it's done with the buffer. */
@@ -82,7 +85,7 @@ static void add_inbuf(void)
 	sg_init_one(sg, inbuf, PAGE_SIZE);
 
 	/* We should always be able to add one buffer to an empty queue. */
-	if (in_vq->vq_ops->add_buf(in_vq, sg, 0, 1, inbuf) != 0)
+	if (in_vq->vq_ops->add_buf(in_vq, sg, 0, 1, inbuf) < 0)
 		BUG();
 	in_vq->vq_ops->kick(in_vq);
 }
@@ -134,6 +137,48 @@ int __init virtio_cons_early_init(int (*put_chars)(u32, const char *, int))
 	return hvc_instantiate(0, 0, &virtio_cons);
 }
 
+/*
+ * virtio console configuration. This supports:
+ * - console resize
+ */
+static void virtcons_apply_config(struct virtio_device *dev)
+{
+	struct winsize ws;
+
+	if (virtio_has_feature(dev, VIRTIO_CONSOLE_F_SIZE)) {
+		dev->config->get(dev,
+				 offsetof(struct virtio_console_config, cols),
+				 &ws.ws_col, sizeof(u16));
+		dev->config->get(dev,
+				 offsetof(struct virtio_console_config, rows),
+				 &ws.ws_row, sizeof(u16));
+		hvc_resize(hvc, ws);
+	}
+}
+
+/*
+ * we support only one console, the hvc struct is a global var
+ * We set the configuration at this point, since we now have a tty
+ */
+static int notifier_add_vio(struct hvc_struct *hp, int data)
+{
+	hp->irq_requested = 1;
+	virtcons_apply_config(vdev);
+
+	return 0;
+}
+
+static void notifier_del_vio(struct hvc_struct *hp, int data)
+{
+	hp->irq_requested = 0;
+}
+
+static void hvc_handle_input(struct virtqueue *vq)
+{
+	if (hvc_poll(hvc))
+		hvc_kick();
+}
+
 /*D:370 Once we're further in boot, we get probed like any other virtio device.
  * At this stage we set up the output virtqueue.
  *
@@ -143,8 +188,10 @@ int __init virtio_cons_early_init(int (*put_chars)(u32, const char *, int))
  * Finally we put our input buffer in the input queue, ready to receive. */
 static int __devinit virtcons_probe(struct virtio_device *dev)
 {
+	vq_callback_t *callbacks[] = { hvc_handle_input, NULL};
+	const char *names[] = { "input", "output" };
+	struct virtqueue *vqs[2];
 	int err;
-	struct hvc_struct *hvc;
 
 	vdev = dev;
 
@@ -155,47 +202,44 @@ static int __devinit virtcons_probe(struct virtio_device *dev)
 		goto fail;
 	}
 
-	/* Find the input queue. */
+	/* Find the queues. */
 	/* FIXME: This is why we want to wean off hvc: we do nothing
 	 * when input comes in. */
-	in_vq = vdev->config->find_vq(vdev, 0, NULL);
-	if (IS_ERR(in_vq)) {
-		err = PTR_ERR(in_vq);
+	err = vdev->config->find_vqs(vdev, 2, vqs, callbacks, names);
+	if (err)
 		goto free;
-	}
 
-	out_vq = vdev->config->find_vq(vdev, 1, NULL);
-	if (IS_ERR(out_vq)) {
-		err = PTR_ERR(out_vq);
-		goto free_in_vq;
-	}
+	in_vq = vqs[0];
+	out_vq = vqs[1];
 
 	/* Start using the new console output. */
 	virtio_cons.get_chars = get_chars;
 	virtio_cons.put_chars = put_chars;
+	virtio_cons.notifier_add = notifier_add_vio;
+	virtio_cons.notifier_del = notifier_del_vio;
+	virtio_cons.notifier_hangup = notifier_del_vio;
 
 	/* The first argument of hvc_alloc() is the virtual console number, so
-	 * we use zero.  The second argument is the interrupt number; we
-	 * currently leave this as zero: it would be better not to use the
-	 * hvc mechanism and fix this (FIXME!).
+	 * we use zero.  The second argument is the parameter for the
+	 * notification mechanism (like irq number). We currently leave this
+	 * as zero, virtqueues have implicit notifications.
 	 *
 	 * The third argument is a "struct hv_ops" containing the put_chars()
-	 * and get_chars() pointers.  The final argument is the output buffer
-	 * size: we can do any size, so we put PAGE_SIZE here. */
+	 * get_chars(), notifier_add() and notifier_del() pointers.
+	 * The final argument is the output buffer size: we can do any size,
+	 * so we put PAGE_SIZE here. */
 	hvc = hvc_alloc(0, 0, &virtio_cons, PAGE_SIZE);
 	if (IS_ERR(hvc)) {
 		err = PTR_ERR(hvc);
-		goto free_out_vq;
+		goto free_vqs;
 	}
 
 	/* Register the input buffer the first time. */
 	add_inbuf();
 	return 0;
 
-free_out_vq:
-	vdev->config->del_vq(out_vq);
-free_in_vq:
-	vdev->config->del_vq(in_vq);
+free_vqs:
+	vdev->config->del_vqs(vdev);
 free:
 	kfree(inbuf);
 fail:
@@ -207,11 +251,18 @@ static struct virtio_device_id id_table[] = {
 	{ 0 },
 };
 
+static unsigned int features[] = {
+	VIRTIO_CONSOLE_F_SIZE,
+};
+
 static struct virtio_driver virtio_console = {
+	.feature_table = features,
+	.feature_table_size = ARRAY_SIZE(features),
 	.driver.name =	KBUILD_MODNAME,
 	.driver.owner =	THIS_MODULE,
 	.id_table =	id_table,
 	.probe =	virtcons_probe,
+	.config_changed = virtcons_apply_config,
 };
 
 static int __init init(void)

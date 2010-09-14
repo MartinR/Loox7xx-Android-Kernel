@@ -134,8 +134,8 @@ void inet_frag_destroy(struct inet_frag_queue *q, struct inet_frags *f,
 	struct sk_buff *fp;
 	struct netns_frags *nf;
 
-	BUG_TRAP(q->last_in & INET_FRAG_COMPLETE);
-	BUG_TRAP(del_timer(&q->timer) == 0);
+	WARN_ON(!(q->last_in & INET_FRAG_COMPLETE));
+	WARN_ON(del_timer(&q->timer) != 0);
 
 	/* Release all fragment data. */
 	fp = q->fragments;
@@ -267,6 +267,7 @@ static struct inet_frag_queue *inet_frag_create(struct netns_frags *nf,
 
 struct inet_frag_queue *inet_frag_find(struct netns_frags *nf,
 		struct inet_frags *f, void *key, unsigned int hash)
+	__releases(&f->lock)
 {
 	struct inet_frag_queue *q;
 	struct hlist_node *n;

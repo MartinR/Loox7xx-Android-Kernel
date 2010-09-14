@@ -1,7 +1,7 @@
 /*
  * helper functions for SG DMA video4linux capture buffers
  *
- * The functions expect the hardware being able to scatter gatter
+ * The functions expect the hardware being able to scatter gather
  * (i.e. the buffers are not linear in physical memory, but fragmented
  * into PAGE_SIZE chunks).  They also assume the driver does not need
  * to touch the video data.
@@ -49,7 +49,7 @@ struct scatterlist* videobuf_pages_to_sg(struct page **pages, int nr_pages,
  *	does memory allocation too using vmalloc_32().
  *
  * videobuf_dma_*()
- *	see Documentation/DMA-mapping.txt, these functions to
+ *	see Documentation/PCI/PCI-DMA-mapping.txt, these functions to
  *	basically the same.  The map function does also build a
  *	scatterlist for the buffer (and unmap frees it ...)
  *

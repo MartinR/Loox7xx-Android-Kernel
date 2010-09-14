@@ -21,18 +21,12 @@
 #include <linux/types.h>
 
 /*
- * Some types are conditional depending on the target system.
  * XFS_BIG_BLKNOS needs block layer disk addresses to be 64 bits.
- * XFS_BIG_INUMS needs the VFS inode number to be 64 bits, as well
- * as requiring XFS_BIG_BLKNOS to be set.
+ * XFS_BIG_INUMS requires XFS_BIG_BLKNOS to be set.
  */
-#if defined(CONFIG_LBD) || (BITS_PER_LONG == 64)
+#if defined(CONFIG_LBDAF) || (BITS_PER_LONG == 64)
 # define XFS_BIG_BLKNOS	1
-# if BITS_PER_LONG == 64
-#  define XFS_BIG_INUMS	1
-# else
-#  define XFS_BIG_INUMS	0
-# endif
+# define XFS_BIG_INUMS	1
 #else
 # define XFS_BIG_BLKNOS	0
 # define XFS_BIG_INUMS	0
@@ -44,19 +38,19 @@
 #include <kmem.h>
 #include <mrlock.h>
 #include <sv.h>
-#include <mutex.h>
-#include <sema.h>
 #include <time.h>
 
 #include <support/ktrace.h>
 #include <support/debug.h>
 #include <support/uuid.h>
 
+#include <linux/semaphore.h>
 #include <linux/mm.h>
 #include <linux/kernel.h>
 #include <linux/blkdev.h>
 #include <linux/slab.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/file.h>
 #include <linux/swap.h>
 #include <linux/errno.h>
@@ -76,6 +70,8 @@
 #include <linux/log2.h>
 #include <linux/spinlock.h>
 #include <linux/random.h>
+#include <linux/ctype.h>
+#include <linux/writeback.h>
 
 #include <asm/page.h>
 #include <asm/div64.h>
@@ -84,7 +80,6 @@
 #include <asm/byteorder.h>
 #include <asm/unaligned.h>
 
-#include <xfs_vfs.h>
 #include <xfs_cred.h>
 #include <xfs_vnode.h>
 #include <xfs_stats.h>
@@ -106,7 +101,6 @@
 #undef  HAVE_PERCPU_SB	/* per cpu superblock counters are a 2.6 feature */
 #endif
 
-#define restricted_chown	xfs_params.restrict_chown.val
 #define irix_sgid_inherit	xfs_params.sgid_inherit.val
 #define irix_symlink_mode	xfs_params.symlink_mode.val
 #define xfs_panic_mask		xfs_params.panic_mask.val
@@ -125,8 +119,6 @@
 
 #define current_cpu()		(raw_smp_processor_id())
 #define current_pid()		(current->pid)
-#define current_fsuid(cred)	(current->fsuid)
-#define current_fsgid(cred)	(current->fsgid)
 #define current_test_flags(f)	(current->flags & (f))
 #define current_set_flags_nested(sp, f)		\
 		(*(sp) = current->flags, current->flags |= (f))
@@ -155,17 +147,6 @@
 #define SYNCHRONIZE()	barrier()
 #define __return_address __builtin_return_address(0)
 
-/*
- * IRIX (BSD) quotactl makes use of separate commands for user/group,
- * whereas on Linux the syscall encodes this information into the cmd
- * field (see the QCMD macro in quota.h).  These macros help keep the
- * code portable - they are not visible from the syscall interface.
- */
-#define Q_XSETGQLIM	XQM_CMD(8)	/* set groups disk limits */
-#define Q_XGETGQUOTA	XQM_CMD(9)	/* get groups disk limits */
-#define Q_XSETPQLIM	XQM_CMD(10)	/* set projects disk limits */
-#define Q_XGETPQUOTA	XQM_CMD(11)	/* get projects disk limits */
-
 #define dfltprid	0
 #define MAXPATHLEN	1024
 
@@ -179,7 +160,7 @@
 #define xfs_sort(a,n,s,fn)	sort(a,n,s,fn,NULL)
 #define xfs_stack_trace()	dump_stack()
 #define xfs_itruncate_data(ip, off)	\
-	(-vmtruncate(vn_to_inode(XFS_ITOV(ip)), (off)))
+	(-vmtruncate(VFS_I(ip), (off)))
 
 
 /* Move the kernel do_div definition off to one side */
@@ -298,5 +279,12 @@ static inline __uint64_t howmany_64(__uint64_t x, __uint32_t y)
 	do_div(x, y);
 	return x;
 }
+
+/* ARM old ABI has some weird alignment/padding */
+#if defined(__arm__) && !defined(__ARM_EABI__)
+#define __arch_pack __attribute__((packed))
+#else
+#define __arch_pack
+#endif
 
 #endif /* __XFS_LINUX__ */

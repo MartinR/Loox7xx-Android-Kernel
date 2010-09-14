@@ -4,6 +4,7 @@
  *  Derived from ivtv-cards.c
  *
  *  Copyright (C) 2007  Hans Verkuil <hverkuil@xs4all.nl>
+ *  Copyright (C) 2008  Andy Walls <awalls@radix.net>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -21,12 +22,17 @@
  */
 
 /* hardware flags */
-#define CX18_HW_TUNER     (1 << 0)
-#define CX18_HW_TVEEPROM  (1 << 1)
-#define CX18_HW_CS5345    (1 << 2)
-#define CX18_HW_GPIO      (1 << 3)
-#define CX18_HW_CX23418   (1 << 4)
-#define CX18_HW_DVB   	  (1 << 5)
+#define CX18_HW_TUNER			(1 << 0)
+#define CX18_HW_TVEEPROM		(1 << 1)
+#define CX18_HW_CS5345			(1 << 2)
+#define CX18_HW_DVB			(1 << 3)
+#define CX18_HW_418_AV			(1 << 4)
+#define CX18_HW_GPIO_MUX		(1 << 5)
+#define CX18_HW_GPIO_RESET_CTRL		(1 << 6)
+#define CX18_HW_Z8F0811_IR_TX_HAUP	(1 << 7)
+#define CX18_HW_Z8F0811_IR_RX_HAUP	(1 << 8)
+#define CX18_HW_Z8F0811_IR_HAUP	(CX18_HW_Z8F0811_IR_RX_HAUP | \
+				 CX18_HW_Z8F0811_IR_TX_HAUP)
 
 /* video inputs */
 #define	CX18_CARD_INPUT_VID_TUNER	1
@@ -47,8 +53,8 @@
 
 /* V4L2 capability aliases */
 #define CX18_CAP_ENCODER (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_TUNER | \
-			  V4L2_CAP_AUDIO | V4L2_CAP_READWRITE)
-/* | V4L2_CAP_VBI_CAPTURE | V4L2_CAP_SLICED_VBI_CAPTURE) not yet */
+			  V4L2_CAP_AUDIO | V4L2_CAP_READWRITE | \
+			  V4L2_CAP_VBI_CAPTURE | V4L2_CAP_SLICED_VBI_CAPTURE)
 
 struct cx18_card_video_input {
 	u8  video_type; 	/* video input type */
@@ -83,6 +89,14 @@ struct cx18_gpio_i2c_slave_reset {
 	u32 active_hi_mask; /* GPIO outputs that reset i2c chips when high */
 	int msecs_asserted; /* time period reset must remain asserted */
 	int msecs_recovery; /* time after deassert for chips to be ready */
+	u32 ir_reset_mask;  /* GPIO to reset the Zilog Z8F0811 IR contoller */
+};
+
+struct cx18_gpio_audio_input { 	/* select tuner/line in input */
+	u32 mask; 		/* leave to 0 if not supported */
+	u32 tuner;
+	u32 linein;
+	u32 radio;
 };
 
 struct cx18_card_tuner {
@@ -112,7 +126,7 @@ struct cx18_card {
 	char *comment;
 	u32 v4l2_capabilities;
 	u32 hw_audio_ctrl;	/* hardware used for the V4L2 controls (only
-				   1 dev allowed) */
+				   1 dev allowed currently) */
 	u32 hw_muxer;		/* hardware used to multiplex audio input */
 	u32 hw_all;		/* all hardware used by the board */
 	struct cx18_card_video_input video_inputs[CX18_CARD_MAX_VIDEO_INPUTS];
@@ -123,6 +137,7 @@ struct cx18_card {
 	u8 xceive_pin; 		/* XCeive tuner GPIO reset pin */
 	struct cx18_gpio_init 		 gpio_init;
 	struct cx18_gpio_i2c_slave_reset gpio_i2c_slave_reset;
+	struct cx18_gpio_audio_input    gpio_audio_input;
 
 	struct cx18_card_tuner tuners[CX18_CARD_MAX_TUNERS];
 	struct cx18_card_tuner_i2c *i2c;

@@ -78,6 +78,12 @@ config MACH_IXDP465
 	  IXDP465 Development Platform (Also known as BMP).
 	  For more information on this platform, see <file:Documentation/arm/IXP4xx>.
 
+config MACH_GORAMO_MLR
+	bool "GORAMO Multi Link Router"
+	help
+	  Say 'Y' here if you want your kernel to support GORAMO
+	  MultiLink router.
+
 config MACH_KIXRP435
 	bool "KIXRP435"
 	help
@@ -125,6 +131,15 @@ config	ARCH_IXDP4XX
 	depends on ARCH_IXDP425 || MACH_IXDP465 || MACH_KIXRP435
 	default y
 
+config MACH_FSG
+	bool
+	prompt "Freecom FSG-3"
+	select PCI
+	help
+	  Say 'Y' here if you want your kernel to support Freecom's
+	  FSG-3 device. For more information on this platform,
+	  see http://www.nslu2-linux.org/wiki/FSG3/HomePage
+
 #
 # Certain registers and IRQs are only enabled if supporting IXP465 CPUs
 #
@@ -157,11 +172,6 @@ config MACH_GTWX5715
 		20 Pin ARM/Xscale JTAG interface on J2
 
 comment "IXP4xx Options"
-
-config DMABOUNCE
-	bool
-	default y
-	depends on PCI
 
 config IXP4XX_INDIRECT_PCI
 	bool "Use indirect PCI memory access"

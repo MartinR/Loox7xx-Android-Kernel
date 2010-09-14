@@ -49,7 +49,9 @@
 #define IVTV_CARD_AVER_PVR150PLUS    22 /* AVerMedia PVR-150 Plus */
 #define IVTV_CARD_AVER_EZMAKER       23 /* AVerMedia EZMaker PCI Deluxe */
 #define IVTV_CARD_AVER_M104          24 /* AverMedia M104 miniPCI card */
-#define IVTV_CARD_LAST 		     24
+#define IVTV_CARD_BUFFALO_MV5L       25 /* Buffalo PC-MV5L/PCI card */
+#define IVTV_CARD_AVER_ULTRA1500MCE  26 /* AVerMedia UltraTV 1500 MCE */
+#define IVTV_CARD_LAST 		     26
 
 /* Variants of existing cards but with the same PCI IDs. The driver
    detects these based on other device information.
@@ -153,7 +155,7 @@
 #define IVTV_CAP_ENCODER (V4L2_CAP_VIDEO_CAPTURE | V4L2_CAP_TUNER | \
 			  V4L2_CAP_AUDIO | V4L2_CAP_READWRITE | V4L2_CAP_VBI_CAPTURE | \
 			  V4L2_CAP_SLICED_VBI_CAPTURE)
-#define IVTV_CAP_DECODER (V4L2_CAP_VBI_OUTPUT | V4L2_CAP_VIDEO_OUTPUT | \
+#define IVTV_CAP_DECODER (V4L2_CAP_VIDEO_OUTPUT | \
 			  V4L2_CAP_SLICED_VBI_OUTPUT | V4L2_CAP_VIDEO_OUTPUT_OVERLAY)
 
 struct ivtv_card_video_input {

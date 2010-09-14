@@ -1,7 +1,7 @@
 /*
- *  ec.c - ACPI Embedded Controller Driver (v2.0)
+ *  ec.c - ACPI Embedded Controller Driver (v2.1)
  *
- *  Copyright (C) 2006, 2007 Alexey Starikovskiy <alexey.y.starikovskiy@intel.com>
+ *  Copyright (C) 2006-2008 Alexey Starikovskiy <astarikovskiy@suse.de>
  *  Copyright (C) 2006 Denis Sadykov <denis.m.sadykov@intel.com>
  *  Copyright (C) 2004 Luming Yu <luming.yu@intel.com>
  *  Copyright (C) 2001, 2002 Andy Grover <andrew.grover@intel.com>
@@ -26,7 +26,7 @@
  * ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
  */
 
-/* Uncomment next line to get verbose print outs*/
+/* Uncomment next line to get verbose printout */
 /* #define DEBUG */
 
 #include <linux/kernel.h>
@@ -38,16 +38,16 @@
 #include <linux/seq_file.h>
 #include <linux/interrupt.h>
 #include <linux/list.h>
+#include <linux/spinlock.h>
 #include <asm/io.h>
 #include <acpi/acpi_bus.h>
 #include <acpi/acpi_drivers.h>
-#include <acpi/actypes.h>
+#include <linux/dmi.h>
 
 #define ACPI_EC_CLASS			"embedded_controller"
 #define ACPI_EC_DEVICE_NAME		"Embedded Controller"
 #define ACPI_EC_FILE_INFO		"info"
 
-#undef PREFIX
 #define PREFIX				"ACPI: EC: "
 
 /* EC status register */
@@ -65,22 +65,19 @@ enum ec_command {
 	ACPI_EC_COMMAND_QUERY = 0x84,
 };
 
-/* EC events */
-enum ec_event {
-	ACPI_EC_EVENT_OBF_1 = 1,	/* Output buffer full */
-	ACPI_EC_EVENT_IBF_0,		/* Input buffer empty */
-};
-
 #define ACPI_EC_DELAY		500	/* Wait 500ms max. during EC ops */
 #define ACPI_EC_UDELAY_GLK	1000	/* Wait 1ms max. to get global lock */
-#define ACPI_EC_UDELAY		100	/* Wait 100us before polling EC again */
+#define ACPI_EC_CDELAY		10	/* Wait 10us before polling EC */
+#define ACPI_EC_MSI_UDELAY	550	/* Wait 550us for MSI EC */
+
+#define ACPI_EC_STORM_THRESHOLD 8	/* number of false interrupts
+					   per one transaction */
 
 enum {
-	EC_FLAGS_WAIT_GPE = 0,		/* Don't check status until GPE arrives */
 	EC_FLAGS_QUERY_PENDING,		/* Query is pending */
-	EC_FLAGS_GPE_MODE,		/* Expect GPE to be sent for status change */
-	EC_FLAGS_NO_GPE,		/* Don't use GPE mode */
-	EC_FLAGS_RESCHEDULE_POLL	/* Re-schedule poll */
+	EC_FLAGS_GPE_STORM,		/* GPE storm detected */
+	EC_FLAGS_HANDLERS_INSTALLED	/* Handlers for GPE and
+					 * OpReg are installed */
 };
 
 /* If we find an EC via the ECDT, we need to keep a ptr to its context */
@@ -95,6 +92,18 @@ struct acpi_ec_query_handler {
 	u8 query_bit;
 };
 
+struct transaction {
+	const u8 *wdata;
+	u8 *rdata;
+	unsigned short irq_count;
+	u8 command;
+	u8 wi;
+	u8 ri;
+	u8 wlen;
+	u8 rlen;
+	bool done;
+};
+
 static struct acpi_ec {
 	acpi_handle handle;
 	unsigned long gpe;
@@ -105,10 +114,13 @@ static struct acpi_ec {
 	struct mutex lock;
 	wait_queue_head_t wait;
 	struct list_head list;
-	struct delayed_work work;
-	atomic_t irq_count;
-	u8 handlers_installed;
+	struct transaction *curr;
+	spinlock_t curr_lock;
 } *boot_ec, *first_ec;
+
+static int EC_FLAGS_MSI; /* Out-of-spec MSI controller */
+static int EC_FLAGS_VALIDATE_ECDT; /* ASUStec ECDTs need to be validated */
+static int EC_FLAGS_SKIP_DSDT_SCAN; /* Not all BIOS survive early DSDT scan */
 
 /* --------------------------------------------------------------------------
                              Transaction Management
@@ -125,7 +137,7 @@ static inline u8 acpi_ec_read_data(struct acpi_ec *ec)
 {
 	u8 x = inb(ec->data_addr);
 	pr_debug(PREFIX "---> data = 0x%2.2x\n", x);
-	return inb(ec->data_addr);
+	return x;
 }
 
 static inline void acpi_ec_write_cmd(struct acpi_ec *ec, u8 command)
@@ -140,181 +152,213 @@ static inline void acpi_ec_write_data(struct acpi_ec *ec, u8 data)
 	outb(data, ec->data_addr);
 }
 
-static inline int acpi_ec_check_status(struct acpi_ec *ec, enum ec_event event)
+static int ec_transaction_done(struct acpi_ec *ec)
 {
-	if (test_bit(EC_FLAGS_WAIT_GPE, &ec->flags))
-		return 0;
-	if (event == ACPI_EC_EVENT_OBF_1) {
-		if (acpi_ec_read_status(ec) & ACPI_EC_FLAG_OBF)
-			return 1;
-	} else if (event == ACPI_EC_EVENT_IBF_0) {
-		if (!(acpi_ec_read_status(ec) & ACPI_EC_FLAG_IBF))
-			return 1;
-	}
+	unsigned long flags;
+	int ret = 0;
+	spin_lock_irqsave(&ec->curr_lock, flags);
+	if (!ec->curr || ec->curr->done)
+		ret = 1;
+	spin_unlock_irqrestore(&ec->curr_lock, flags);
+	return ret;
+}
 
+static void start_transaction(struct acpi_ec *ec)
+{
+	ec->curr->irq_count = ec->curr->wi = ec->curr->ri = 0;
+	ec->curr->done = false;
+	acpi_ec_write_cmd(ec, ec->curr->command);
+}
+
+static void advance_transaction(struct acpi_ec *ec, u8 status)
+{
+	unsigned long flags;
+	spin_lock_irqsave(&ec->curr_lock, flags);
+	if (!ec->curr)
+		goto unlock;
+	if (ec->curr->wlen > ec->curr->wi) {
+		if ((status & ACPI_EC_FLAG_IBF) == 0)
+			acpi_ec_write_data(ec,
+				ec->curr->wdata[ec->curr->wi++]);
+		else
+			goto err;
+	} else if (ec->curr->rlen > ec->curr->ri) {
+		if ((status & ACPI_EC_FLAG_OBF) == 1) {
+			ec->curr->rdata[ec->curr->ri++] = acpi_ec_read_data(ec);
+			if (ec->curr->rlen == ec->curr->ri)
+				ec->curr->done = true;
+		} else
+			goto err;
+	} else if (ec->curr->wlen == ec->curr->wi &&
+		   (status & ACPI_EC_FLAG_IBF) == 0)
+		ec->curr->done = true;
+	goto unlock;
+err:
+	/* false interrupt, state didn't change */
+	if (in_interrupt())
+		++ec->curr->irq_count;
+unlock:
+	spin_unlock_irqrestore(&ec->curr_lock, flags);
+}
+
+static void acpi_ec_gpe_query(void *ec_cxt);
+
+static int ec_check_sci(struct acpi_ec *ec, u8 state)
+{
+	if (state & ACPI_EC_FLAG_SCI) {
+		if (!test_and_set_bit(EC_FLAGS_QUERY_PENDING, &ec->flags))
+			return acpi_os_execute(OSL_EC_BURST_HANDLER,
+				acpi_ec_gpe_query, ec);
+	}
 	return 0;
 }
 
-static void ec_schedule_ec_poll(struct acpi_ec *ec)
+static int ec_poll(struct acpi_ec *ec)
 {
-	if (test_bit(EC_FLAGS_RESCHEDULE_POLL, &ec->flags))
-		schedule_delayed_work(&ec->work,
-				      msecs_to_jiffies(ACPI_EC_DELAY));
-}
-
-static void ec_switch_to_poll_mode(struct acpi_ec *ec)
-{
-	set_bit(EC_FLAGS_NO_GPE, &ec->flags);
-	clear_bit(EC_FLAGS_GPE_MODE, &ec->flags);
-	acpi_disable_gpe(NULL, ec->gpe, ACPI_NOT_ISR);
-	set_bit(EC_FLAGS_RESCHEDULE_POLL, &ec->flags);
-}
-
-static int acpi_ec_wait(struct acpi_ec *ec, enum ec_event event, int force_poll)
-{
-	atomic_set(&ec->irq_count, 0);
-	if (likely(test_bit(EC_FLAGS_GPE_MODE, &ec->flags)) &&
-	    likely(!force_poll)) {
-		if (wait_event_timeout(ec->wait, acpi_ec_check_status(ec, event),
-				       msecs_to_jiffies(ACPI_EC_DELAY)))
-			return 0;
-		clear_bit(EC_FLAGS_WAIT_GPE, &ec->flags);
-		if (acpi_ec_check_status(ec, event)) {
-			/* missing GPEs, switch back to poll mode */
-			if (printk_ratelimit())
-				pr_info(PREFIX "missing confirmations, "
-						"switch off interrupt mode.\n");
-			ec_switch_to_poll_mode(ec);
-			ec_schedule_ec_poll(ec);
-			return 0;
-		}
-	} else {
-		unsigned long delay = jiffies + msecs_to_jiffies(ACPI_EC_DELAY);
-		clear_bit(EC_FLAGS_WAIT_GPE, &ec->flags);
-		while (time_before(jiffies, delay)) {
-			if (acpi_ec_check_status(ec, event))
-				return 0;
-			msleep(1);
-		}
+	unsigned long flags;
+	int repeat = 2; /* number of command restarts */
+	while (repeat--) {
+		unsigned long delay = jiffies +
+			msecs_to_jiffies(ACPI_EC_DELAY);
+		do {
+			/* don't sleep with disabled interrupts */
+			if (EC_FLAGS_MSI || irqs_disabled()) {
+				udelay(ACPI_EC_MSI_UDELAY);
+				if (ec_transaction_done(ec))
+					return 0;
+			} else {
+				if (wait_event_timeout(ec->wait,
+						ec_transaction_done(ec),
+						msecs_to_jiffies(1)))
+					return 0;
+			}
+			advance_transaction(ec, acpi_ec_read_status(ec));
+		} while (time_before(jiffies, delay));
+		if (acpi_ec_read_status(ec) & ACPI_EC_FLAG_IBF)
+			break;
+		pr_debug(PREFIX "controller reset, restart transaction\n");
+		spin_lock_irqsave(&ec->curr_lock, flags);
+		start_transaction(ec);
+		spin_unlock_irqrestore(&ec->curr_lock, flags);
 	}
-	pr_err(PREFIX "acpi_ec_wait timeout, status = 0x%2.2x, event = %s\n",
-		acpi_ec_read_status(ec),
-		(event == ACPI_EC_EVENT_OBF_1) ? "\"b0=1\"" : "\"b1=0\"");
 	return -ETIME;
 }
 
-static int acpi_ec_transaction_unlocked(struct acpi_ec *ec, u8 command,
-					const u8 * wdata, unsigned wdata_len,
-					u8 * rdata, unsigned rdata_len,
-					int force_poll)
+static int acpi_ec_transaction_unlocked(struct acpi_ec *ec,
+					struct transaction *t)
 {
-	int result = 0;
-	set_bit(EC_FLAGS_WAIT_GPE, &ec->flags);
+	unsigned long tmp;
+	int ret = 0;
 	pr_debug(PREFIX "transaction start\n");
-	acpi_ec_write_cmd(ec, command);
-	for (; wdata_len > 0; --wdata_len) {
-		result = acpi_ec_wait(ec, ACPI_EC_EVENT_IBF_0, force_poll);
-		if (result) {
-			pr_err(PREFIX
-			       "write_cmd timeout, command = %d\n", command);
-			goto end;
-		}
-		set_bit(EC_FLAGS_WAIT_GPE, &ec->flags);
-		acpi_ec_write_data(ec, *(wdata++));
+	/* disable GPE during transaction if storm is detected */
+	if (test_bit(EC_FLAGS_GPE_STORM, &ec->flags)) {
+		acpi_disable_gpe(NULL, ec->gpe);
 	}
-
-	if (!rdata_len) {
-		result = acpi_ec_wait(ec, ACPI_EC_EVENT_IBF_0, force_poll);
-		if (result) {
-			pr_err(PREFIX
-			       "finish-write timeout, command = %d\n", command);
-			goto end;
-		}
-	} else if (command == ACPI_EC_COMMAND_QUERY)
+	if (EC_FLAGS_MSI)
+		udelay(ACPI_EC_MSI_UDELAY);
+	/* start transaction */
+	spin_lock_irqsave(&ec->curr_lock, tmp);
+	/* following two actions should be kept atomic */
+	ec->curr = t;
+	start_transaction(ec);
+	if (ec->curr->command == ACPI_EC_COMMAND_QUERY)
 		clear_bit(EC_FLAGS_QUERY_PENDING, &ec->flags);
-
-	for (; rdata_len > 0; --rdata_len) {
-		result = acpi_ec_wait(ec, ACPI_EC_EVENT_OBF_1, force_poll);
-		if (result) {
-			pr_err(PREFIX "read timeout, command = %d\n", command);
-			goto end;
-		}
-		/* Don't expect GPE after last read */
-		if (rdata_len > 1)
-			set_bit(EC_FLAGS_WAIT_GPE, &ec->flags);
-		*(rdata++) = acpi_ec_read_data(ec);
-	}
-      end:
+	spin_unlock_irqrestore(&ec->curr_lock, tmp);
+	ret = ec_poll(ec);
 	pr_debug(PREFIX "transaction end\n");
-	return result;
+	spin_lock_irqsave(&ec->curr_lock, tmp);
+	ec->curr = NULL;
+	spin_unlock_irqrestore(&ec->curr_lock, tmp);
+	if (test_bit(EC_FLAGS_GPE_STORM, &ec->flags)) {
+		/* check if we received SCI during transaction */
+		ec_check_sci(ec, acpi_ec_read_status(ec));
+		/* it is safe to enable GPE outside of transaction */
+		acpi_enable_gpe(NULL, ec->gpe);
+	} else if (t->irq_count > ACPI_EC_STORM_THRESHOLD) {
+		pr_info(PREFIX "GPE storm detected, "
+			"transactions will use polling mode\n");
+		set_bit(EC_FLAGS_GPE_STORM, &ec->flags);
+	}
+	return ret;
 }
 
-static int acpi_ec_transaction(struct acpi_ec *ec, u8 command,
-			       const u8 * wdata, unsigned wdata_len,
-			       u8 * rdata, unsigned rdata_len,
-			       int force_poll)
+static int ec_check_ibf0(struct acpi_ec *ec)
+{
+	u8 status = acpi_ec_read_status(ec);
+	return (status & ACPI_EC_FLAG_IBF) == 0;
+}
+
+static int ec_wait_ibf0(struct acpi_ec *ec)
+{
+	unsigned long delay = jiffies + msecs_to_jiffies(ACPI_EC_DELAY);
+	/* interrupt wait manually if GPE mode is not active */
+	while (time_before(jiffies, delay))
+		if (wait_event_timeout(ec->wait, ec_check_ibf0(ec),
+					msecs_to_jiffies(1)))
+			return 0;
+	return -ETIME;
+}
+
+static int acpi_ec_transaction(struct acpi_ec *ec, struct transaction *t)
 {
 	int status;
 	u32 glk;
-
-	if (!ec || (wdata_len && !wdata) || (rdata_len && !rdata))
+	if (!ec || (!t) || (t->wlen && !t->wdata) || (t->rlen && !t->rdata))
 		return -EINVAL;
-
-	if (rdata)
-		memset(rdata, 0, rdata_len);
-
+	if (t->rdata)
+		memset(t->rdata, 0, t->rlen);
 	mutex_lock(&ec->lock);
 	if (ec->global_lock) {
 		status = acpi_acquire_global_lock(ACPI_EC_UDELAY_GLK, &glk);
 		if (ACPI_FAILURE(status)) {
-			mutex_unlock(&ec->lock);
-			return -ENODEV;
+			status = -ENODEV;
+			goto unlock;
 		}
 	}
-
-	status = acpi_ec_wait(ec, ACPI_EC_EVENT_IBF_0, 0);
-	if (status) {
+	if (ec_wait_ibf0(ec)) {
 		pr_err(PREFIX "input buffer is not empty, "
 				"aborting transaction\n");
+		status = -ETIME;
 		goto end;
 	}
-
-	status = acpi_ec_transaction_unlocked(ec, command,
-					      wdata, wdata_len,
-					      rdata, rdata_len,
-					      force_poll);
-
-      end:
-
+	status = acpi_ec_transaction_unlocked(ec, t);
+end:
 	if (ec->global_lock)
 		acpi_release_global_lock(glk);
+unlock:
 	mutex_unlock(&ec->lock);
-
 	return status;
 }
 
-/*
- * Note: samsung nv5000 doesn't work with ec burst mode.
- * http://bugzilla.kernel.org/show_bug.cgi?id=4980
- */
-int acpi_ec_burst_enable(struct acpi_ec *ec)
+static int acpi_ec_burst_enable(struct acpi_ec *ec)
 {
 	u8 d;
-	return acpi_ec_transaction(ec, ACPI_EC_BURST_ENABLE, NULL, 0, &d, 1, 0);
+	struct transaction t = {.command = ACPI_EC_BURST_ENABLE,
+				.wdata = NULL, .rdata = &d,
+				.wlen = 0, .rlen = 1};
+
+	return acpi_ec_transaction(ec, &t);
 }
 
-int acpi_ec_burst_disable(struct acpi_ec *ec)
+static int acpi_ec_burst_disable(struct acpi_ec *ec)
 {
-	return acpi_ec_transaction(ec, ACPI_EC_BURST_DISABLE, NULL, 0, NULL, 0, 0);
+	struct transaction t = {.command = ACPI_EC_BURST_DISABLE,
+				.wdata = NULL, .rdata = NULL,
+				.wlen = 0, .rlen = 0};
+
+	return (acpi_ec_read_status(ec) & ACPI_EC_FLAG_BURST) ?
+				acpi_ec_transaction(ec, &t) : 0;
 }
 
 static int acpi_ec_read(struct acpi_ec *ec, u8 address, u8 * data)
 {
 	int result;
 	u8 d;
+	struct transaction t = {.command = ACPI_EC_COMMAND_READ,
+				.wdata = &address, .rdata = &d,
+				.wlen = 1, .rlen = 1};
 
-	result = acpi_ec_transaction(ec, ACPI_EC_COMMAND_READ,
-				     &address, 1, &d, 1, 0);
+	result = acpi_ec_transaction(ec, &t);
 	*data = d;
 	return result;
 }
@@ -322,8 +366,11 @@ static int acpi_ec_read(struct acpi_ec *ec, u8 address, u8 * data)
 static int acpi_ec_write(struct acpi_ec *ec, u8 address, u8 data)
 {
 	u8 wdata[2] = { address, data };
-	return acpi_ec_transaction(ec, ACPI_EC_COMMAND_WRITE,
-				   wdata, 2, NULL, 0, 0);
+	struct transaction t = {.command = ACPI_EC_COMMAND_WRITE,
+				.wdata = wdata, .rdata = NULL,
+				.wlen = 2, .rlen = 0};
+
+	return acpi_ec_transaction(ec, &t);
 }
 
 /*
@@ -385,12 +432,13 @@ int ec_transaction(u8 command,
 		   u8 * rdata, unsigned rdata_len,
 		   int force_poll)
 {
+	struct transaction t = {.command = command,
+				.wdata = wdata, .rdata = rdata,
+				.wlen = wdata_len, .rlen = rdata_len};
 	if (!first_ec)
 		return -ENODEV;
 
-	return acpi_ec_transaction(first_ec, command, wdata,
-				   wdata_len, rdata, rdata_len,
-				   force_poll);
+	return acpi_ec_transaction(first_ec, &t);
 }
 
 EXPORT_SYMBOL(ec_transaction);
@@ -399,7 +447,9 @@ static int acpi_ec_query(struct acpi_ec *ec, u8 * data)
 {
 	int result;
 	u8 d;
-
+	struct transaction t = {.command = ACPI_EC_COMMAND_QUERY,
+				.wdata = NULL, .rdata = &d,
+				.wlen = 0, .rlen = 1};
 	if (!ec || !data)
 		return -EINVAL;
 
@@ -409,7 +459,7 @@ static int acpi_ec_query(struct acpi_ec *ec, u8 * data)
 	 * bit to be cleared (and thus clearing the interrupt source).
 	 */
 
-	result = acpi_ec_transaction(ec, ACPI_EC_COMMAND_QUERY, NULL, 0, &d, 1, 0);
+	result = acpi_ec_transaction(ec, &t);
 	if (result)
 		return result;
 
@@ -486,46 +536,17 @@ static void acpi_ec_gpe_query(void *ec_cxt)
 
 static u32 acpi_ec_gpe_handler(void *data)
 {
-	acpi_status status = AE_OK;
 	struct acpi_ec *ec = data;
-	u8 state = acpi_ec_read_status(ec);
+	u8 status;
 
 	pr_debug(PREFIX "~~~> interrupt\n");
-	atomic_inc(&ec->irq_count);
-	if (atomic_read(&ec->irq_count) > 5) {
-		pr_err(PREFIX "GPE storm detected, disabling EC GPE\n");
-		ec_switch_to_poll_mode(ec);
-		goto end;
-	}
-	clear_bit(EC_FLAGS_WAIT_GPE, &ec->flags);
-	if (test_bit(EC_FLAGS_GPE_MODE, &ec->flags))
+	status = acpi_ec_read_status(ec);
+
+	advance_transaction(ec, status);
+	if (ec_transaction_done(ec) && (status & ACPI_EC_FLAG_IBF) == 0)
 		wake_up(&ec->wait);
-
-	if (state & ACPI_EC_FLAG_SCI) {
-		if (!test_and_set_bit(EC_FLAGS_QUERY_PENDING, &ec->flags))
-			status = acpi_os_execute(OSL_EC_BURST_HANDLER,
-				acpi_ec_gpe_query, ec);
-	} else if (!test_bit(EC_FLAGS_GPE_MODE, &ec->flags) &&
-		   !test_bit(EC_FLAGS_NO_GPE, &ec->flags) &&
-		   in_interrupt()) {
-		/* this is non-query, must be confirmation */
-		if (printk_ratelimit())
-			pr_info(PREFIX "non-query interrupt received,"
-				" switching to interrupt mode\n");
-		set_bit(EC_FLAGS_GPE_MODE, &ec->flags);
-		clear_bit(EC_FLAGS_RESCHEDULE_POLL, &ec->flags);
-	}
-end:
-	ec_schedule_ec_poll(ec);
-	return ACPI_SUCCESS(status) ?
-	    ACPI_INTERRUPT_HANDLED : ACPI_INTERRUPT_NOT_HANDLED;
-}
-
-static void do_ec_poll(struct work_struct *work)
-{
-	struct acpi_ec *ec = container_of(work, struct acpi_ec, work.work);
-	atomic_set(&ec->irq_count, 0);
-	(void)acpi_ec_gpe_handler(ec);
+	ec_check_sci(ec, status);
+	return ACPI_INTERRUPT_HANDLED;
 }
 
 /* --------------------------------------------------------------------------
@@ -550,7 +571,8 @@ acpi_ec_space_handler(u32 function, acpi_physical_address address,
 	if (bits != 8 && acpi_strict)
 		return AE_BAD_PARAMETER;
 
-	acpi_ec_burst_enable(ec);
+	if (EC_FLAGS_MSI)
+		acpi_ec_burst_enable(ec);
 
 	if (function == ACPI_READ) {
 		result = acpi_ec_read(ec, address, &temp);
@@ -571,7 +593,8 @@ acpi_ec_space_handler(u32 function, acpi_physical_address address,
 		}
 	}
 
-	acpi_ec_burst_disable(ec);
+	if (EC_FLAGS_MSI)
+		acpi_ec_burst_disable(ec);
 
 	switch (result) {
 	case -EINVAL:
@@ -615,7 +638,7 @@ static int acpi_ec_info_open_fs(struct inode *inode, struct file *file)
 	return single_open(file, acpi_ec_read_info, PDE(inode)->data);
 }
 
-static struct file_operations acpi_ec_info_ops = {
+static const struct file_operations acpi_ec_info_ops = {
 	.open = acpi_ec_info_open_fs,
 	.read = seq_read,
 	.llseek = seq_lseek,
@@ -669,8 +692,7 @@ static struct acpi_ec *make_acpi_ec(void)
 	mutex_init(&ec->lock);
 	init_waitqueue_head(&ec->wait);
 	INIT_LIST_HEAD(&ec->list);
-	INIT_DELAYED_WORK_DEFERRABLE(&ec->work, do_ec_poll);
-	atomic_set(&ec->irq_count, 0);
+	spin_lock_init(&ec->curr_lock);
 	return ec;
 }
 
@@ -678,10 +700,15 @@ static acpi_status
 acpi_ec_register_query_methods(acpi_handle handle, u32 level,
 			       void *context, void **return_value)
 {
-	struct acpi_namespace_node *node = handle;
+	char node_name[5];
+	struct acpi_buffer buffer = { sizeof(node_name), node_name };
 	struct acpi_ec *ec = context;
 	int value = 0;
-	if (sscanf(node->name.ascii, "_Q%x", &value) == 1) {
+	acpi_status status;
+
+	status = acpi_get_name(handle, ACPI_SINGLE_NAME, &buffer);
+
+	if (ACPI_SUCCESS(status) && sscanf(node_name, "_Q%x", &value) == 1) {
 		acpi_ec_add_query_handler(ec, value, handle, NULL, NULL);
 	}
 	return AE_OK;
@@ -691,8 +718,13 @@ static acpi_status
 ec_parse_device(acpi_handle handle, u32 Level, void *context, void **retval)
 {
 	acpi_status status;
+	unsigned long long tmp = 0;
 
 	struct acpi_ec *ec = context;
+
+	/* clear addr values, ec_parse_io_ports depend on it */
+	ec->command_addr = ec->data_addr = 0;
+
 	status = acpi_walk_resources(handle, METHOD_NAME__CRS,
 				     ec_parse_io_ports, ec);
 	if (ACPI_FAILURE(status))
@@ -700,39 +732,70 @@ ec_parse_device(acpi_handle handle, u32 Level, void *context, void **retval)
 
 	/* Get GPE bit assignment (EC events). */
 	/* TODO: Add support for _GPE returning a package */
-	status = acpi_evaluate_integer(handle, "_GPE", NULL, &ec->gpe);
+	status = acpi_evaluate_integer(handle, "_GPE", NULL, &tmp);
 	if (ACPI_FAILURE(status))
 		return status;
+	ec->gpe = tmp;
 	/* Use the global lock for all EC transactions? */
-	acpi_evaluate_integer(handle, "_GLK", NULL, &ec->global_lock);
+	tmp = 0;
+	acpi_evaluate_integer(handle, "_GLK", NULL, &tmp);
+	ec->global_lock = tmp;
 	ec->handle = handle;
 	return AE_CTRL_TERMINATE;
 }
 
-static void ec_poll_stop(struct acpi_ec *ec)
+static int ec_install_handlers(struct acpi_ec *ec)
 {
-	clear_bit(EC_FLAGS_RESCHEDULE_POLL, &ec->flags);
-	cancel_delayed_work(&ec->work);
+	acpi_status status;
+	if (test_bit(EC_FLAGS_HANDLERS_INSTALLED, &ec->flags))
+		return 0;
+	status = acpi_install_gpe_handler(NULL, ec->gpe,
+				  ACPI_GPE_EDGE_TRIGGERED,
+				  &acpi_ec_gpe_handler, ec);
+	if (ACPI_FAILURE(status))
+		return -ENODEV;
+	acpi_set_gpe_type(NULL, ec->gpe, ACPI_GPE_TYPE_RUNTIME);
+	acpi_enable_gpe(NULL, ec->gpe);
+	status = acpi_install_address_space_handler(ec->handle,
+						    ACPI_ADR_SPACE_EC,
+						    &acpi_ec_space_handler,
+						    NULL, ec);
+	if (ACPI_FAILURE(status)) {
+		if (status == AE_NOT_FOUND) {
+			/*
+			 * Maybe OS fails in evaluating the _REG object.
+			 * The AE_NOT_FOUND error will be ignored and OS
+			 * continue to initialize EC.
+			 */
+			printk(KERN_ERR "Fail in evaluating the _REG object"
+				" of EC device. Broken bios is suspected.\n");
+		} else {
+			acpi_remove_gpe_handler(NULL, ec->gpe,
+				&acpi_ec_gpe_handler);
+			return -ENODEV;
+		}
+	}
+
+	set_bit(EC_FLAGS_HANDLERS_INSTALLED, &ec->flags);
+	return 0;
 }
 
 static void ec_remove_handlers(struct acpi_ec *ec)
 {
-	ec_poll_stop(ec);
 	if (ACPI_FAILURE(acpi_remove_address_space_handler(ec->handle,
 				ACPI_ADR_SPACE_EC, &acpi_ec_space_handler)))
 		pr_err(PREFIX "failed to remove space handler\n");
 	if (ACPI_FAILURE(acpi_remove_gpe_handler(NULL, ec->gpe,
 				&acpi_ec_gpe_handler)))
 		pr_err(PREFIX "failed to remove gpe handler\n");
-	ec->handlers_installed = 0;
+	clear_bit(EC_FLAGS_HANDLERS_INSTALLED, &ec->flags);
 }
 
 static int acpi_ec_add(struct acpi_device *device)
 {
 	struct acpi_ec *ec = NULL;
+	int ret;
 
-	if (!device)
-		return -EINVAL;
 	strcpy(acpi_device_name(device), ACPI_EC_DEVICE_NAME);
 	strcpy(acpi_device_class(device), ACPI_EC_CLASS);
 
@@ -746,11 +809,11 @@ static int acpi_ec_add(struct acpi_device *device)
 		ec = make_acpi_ec();
 		if (!ec)
 			return -ENOMEM;
-		if (ec_parse_device(device->handle, 0, ec, NULL) !=
-		    AE_CTRL_TERMINATE) {
+	}
+	if (ec_parse_device(device->handle, 0, ec, NULL) !=
+		AE_CTRL_TERMINATE) {
 			kfree(ec);
 			return -EINVAL;
-		}
 	}
 
 	ec->handle = device->handle;
@@ -761,13 +824,16 @@ static int acpi_ec_add(struct acpi_device *device)
 
 	if (!first_ec)
 		first_ec = ec;
-	acpi_driver_data(device) = ec;
+	device->driver_data = ec;
 	acpi_ec_add_fs(device);
 	pr_info(PREFIX "GPE = 0x%lx, I/O: command/status = 0x%lx, data = 0x%lx\n",
 			  ec->gpe, ec->command_addr, ec->data_addr);
-	pr_info(PREFIX "driver started in %s mode\n",
-		(test_bit(EC_FLAGS_GPE_MODE, &ec->flags))?"interrupt":"poll");
-	return 0;
+
+	ret = ec_install_handlers(ec);
+
+	/* EC is fully operational, allow queries */
+	clear_bit(EC_FLAGS_QUERY_PENDING, &ec->flags);
+	return ret;
 }
 
 static int acpi_ec_remove(struct acpi_device *device, int type)
@@ -779,6 +845,7 @@ static int acpi_ec_remove(struct acpi_device *device, int type)
 		return -EINVAL;
 
 	ec = acpi_driver_data(device);
+	ec_remove_handlers(ec);
 	mutex_lock(&ec->lock);
 	list_for_each_entry_safe(handler, tmp, &ec->list, node) {
 		list_del(&handler->node);
@@ -786,7 +853,7 @@ static int acpi_ec_remove(struct acpi_device *device, int type)
 	}
 	mutex_unlock(&ec->lock);
 	acpi_ec_remove_fs(device);
-	acpi_driver_data(device) = NULL;
+	device->driver_data = NULL;
 	if (ec == first_ec)
 		first_ec = NULL;
 	kfree(ec);
@@ -816,70 +883,9 @@ ec_parse_io_ports(struct acpi_resource *resource, void *context)
 	return AE_OK;
 }
 
-static int ec_install_handlers(struct acpi_ec *ec)
-{
-	acpi_status status;
-	if (ec->handlers_installed)
-		return 0;
-	status = acpi_install_gpe_handler(NULL, ec->gpe,
-					  ACPI_GPE_EDGE_TRIGGERED,
-					  &acpi_ec_gpe_handler, ec);
-	if (ACPI_FAILURE(status))
-		return -ENODEV;
-
-	acpi_set_gpe_type(NULL, ec->gpe, ACPI_GPE_TYPE_RUNTIME);
-	acpi_enable_gpe(NULL, ec->gpe, ACPI_NOT_ISR);
-
-	status = acpi_install_address_space_handler(ec->handle,
-						    ACPI_ADR_SPACE_EC,
-						    &acpi_ec_space_handler,
-						    NULL, ec);
-	if (ACPI_FAILURE(status)) {
-		acpi_remove_gpe_handler(NULL, ec->gpe, &acpi_ec_gpe_handler);
-		return -ENODEV;
-	}
-
-	ec->handlers_installed = 1;
-	return 0;
-}
-
-static int acpi_ec_start(struct acpi_device *device)
-{
-	struct acpi_ec *ec;
-	int ret = 0;
-
-	if (!device)
-		return -EINVAL;
-
-	ec = acpi_driver_data(device);
-
-	if (!ec)
-		return -EINVAL;
-
-	ret = ec_install_handlers(ec);
-
-	/* EC is fully operational, allow queries */
-	clear_bit(EC_FLAGS_QUERY_PENDING, &ec->flags);
-	ec_schedule_ec_poll(ec);
-	return ret;
-}
-
-static int acpi_ec_stop(struct acpi_device *device, int type)
-{
-	struct acpi_ec *ec;
-	if (!device)
-		return -EINVAL;
-	ec = acpi_driver_data(device);
-	if (!ec)
-		return -EINVAL;
-	ec_remove_handlers(ec);
-
-	return 0;
-}
-
 int __init acpi_boot_ec_enable(void)
 {
-	if (!boot_ec || boot_ec->handlers_installed)
+	if (!boot_ec || test_bit(EC_FLAGS_HANDLERS_INSTALLED, &boot_ec->flags))
 		return 0;
 	if (!ec_install_handlers(boot_ec)) {
 		first_ec = boot_ec;
@@ -893,10 +899,48 @@ static const struct acpi_device_id ec_device_ids[] = {
 	{"", 0},
 };
 
+/* Some BIOS do not survive early DSDT scan, skip it */
+static int ec_skip_dsdt_scan(const struct dmi_system_id *id)
+{
+	EC_FLAGS_SKIP_DSDT_SCAN = 1;
+	return 0;
+}
+
+/* ASUStek often supplies us with broken ECDT, validate it */
+static int ec_validate_ecdt(const struct dmi_system_id *id)
+{
+	EC_FLAGS_VALIDATE_ECDT = 1;
+	return 0;
+}
+
+/* MSI EC needs special treatment, enable it */
+static int ec_flag_msi(const struct dmi_system_id *id)
+{
+	EC_FLAGS_MSI = 1;
+	EC_FLAGS_VALIDATE_ECDT = 1;
+	return 0;
+}
+
+static struct dmi_system_id __initdata ec_dmi_table[] = {
+	{
+	ec_skip_dsdt_scan, "Compal JFL92", {
+	DMI_MATCH(DMI_BIOS_VENDOR, "COMPAL"),
+	DMI_MATCH(DMI_BOARD_NAME, "JFL92") }, NULL},
+	{
+	ec_flag_msi, "MSI hardware", {
+	DMI_MATCH(DMI_BIOS_VENDOR, "Micro-Star"),
+	DMI_MATCH(DMI_CHASSIS_VENDOR, "MICRO-Star") }, NULL},
+	{
+	ec_validate_ecdt, "ASUS hardware", {
+	DMI_MATCH(DMI_BIOS_VENDOR, "ASUS") }, NULL},
+	{},
+};
+
+
 int __init acpi_ec_ecdt_probe(void)
 {
-	int ret;
 	acpi_status status;
+	struct acpi_ec *saved_ec = NULL;
 	struct acpi_table_ecdt *ecdt_ptr;
 
 	boot_ec = make_acpi_ec();
@@ -905,6 +949,7 @@ int __init acpi_ec_ecdt_probe(void)
 	/*
 	 * Generate a boot ec context
 	 */
+	dmi_check_system(ec_dmi_table);
 	status = acpi_get_table(ACPI_SIG_ECDT, 1,
 				(struct acpi_table_header **)&ecdt_ptr);
 	if (ACPI_SUCCESS(status)) {
@@ -914,30 +959,56 @@ int __init acpi_ec_ecdt_probe(void)
 		boot_ec->gpe = ecdt_ptr->gpe;
 		boot_ec->handle = ACPI_ROOT_OBJECT;
 		acpi_get_handle(ACPI_ROOT_OBJECT, ecdt_ptr->id, &boot_ec->handle);
-	} else {
-		/* This workaround is needed only on some broken machines,
-		 * which require early EC, but fail to provide ECDT */
-		acpi_handle x;
-		printk(KERN_DEBUG PREFIX "Look up EC in DSDT\n");
-		status = acpi_get_devices(ec_device_ids[0].id, ec_parse_device,
-						boot_ec, NULL);
-		/* Check that acpi_get_devices actually find something */
-		if (ACPI_FAILURE(status) || !boot_ec->handle)
-			goto error;
-		/* We really need to limit this workaround, the only ASUS,
-		 * which needs it, has fake EC._INI method, so use it as flag.
-		 * Keep boot_ec struct as it will be needed soon.
-		 */
-		if (ACPI_FAILURE(acpi_get_handle(boot_ec->handle, "_INI", &x)))
-			return -ENODEV;
+		/* Don't trust ECDT, which comes from ASUSTek */
+		if (!EC_FLAGS_VALIDATE_ECDT)
+			goto install;
+		saved_ec = kmalloc(sizeof(struct acpi_ec), GFP_KERNEL);
+		if (!saved_ec)
+			return -ENOMEM;
+		memcpy(saved_ec, boot_ec, sizeof(struct acpi_ec));
+	/* fall through */
 	}
 
-	ret = ec_install_handlers(boot_ec);
-	if (!ret) {
+	if (EC_FLAGS_SKIP_DSDT_SCAN)
+		return -ENODEV;
+
+	/* This workaround is needed only on some broken machines,
+	 * which require early EC, but fail to provide ECDT */
+	printk(KERN_DEBUG PREFIX "Look up EC in DSDT\n");
+	status = acpi_get_devices(ec_device_ids[0].id, ec_parse_device,
+					boot_ec, NULL);
+	/* Check that acpi_get_devices actually find something */
+	if (ACPI_FAILURE(status) || !boot_ec->handle)
+		goto error;
+	if (saved_ec) {
+		/* try to find good ECDT from ASUSTek */
+		if (saved_ec->command_addr != boot_ec->command_addr ||
+		    saved_ec->data_addr != boot_ec->data_addr ||
+		    saved_ec->gpe != boot_ec->gpe ||
+		    saved_ec->handle != boot_ec->handle)
+			pr_info(PREFIX "ASUSTek keeps feeding us with broken "
+			"ECDT tables, which are very hard to workaround. "
+			"Trying to use DSDT EC info instead. Please send "
+			"output of acpidump to linux-acpi@vger.kernel.org\n");
+		kfree(saved_ec);
+		saved_ec = NULL;
+	} else {
+		/* We really need to limit this workaround, the only ASUS,
+		* which needs it, has fake EC._INI method, so use it as flag.
+		* Keep boot_ec struct as it will be needed soon.
+		*/
+		acpi_handle dummy;
+		if (!dmi_name_in_vendors("ASUS") ||
+		    ACPI_FAILURE(acpi_get_handle(boot_ec->handle, "_INI",
+							&dummy)))
+			return -ENODEV;
+	}
+install:
+	if (!ec_install_handlers(boot_ec)) {
 		first_ec = boot_ec;
 		return 0;
 	}
-      error:
+error:
 	kfree(boot_ec);
 	boot_ec = NULL;
 	return -ENODEV;
@@ -947,9 +1018,7 @@ static int acpi_ec_suspend(struct acpi_device *device, pm_message_t state)
 {
 	struct acpi_ec *ec = acpi_driver_data(device);
 	/* Stop using GPE */
-	set_bit(EC_FLAGS_NO_GPE, &ec->flags);
-	clear_bit(EC_FLAGS_GPE_MODE, &ec->flags);
-	acpi_disable_gpe(NULL, ec->gpe, ACPI_NOT_ISR);
+	acpi_disable_gpe(NULL, ec->gpe);
 	return 0;
 }
 
@@ -957,8 +1026,7 @@ static int acpi_ec_resume(struct acpi_device *device)
 {
 	struct acpi_ec *ec = acpi_driver_data(device);
 	/* Enable use of GPE back */
-	clear_bit(EC_FLAGS_NO_GPE, &ec->flags);
-	acpi_enable_gpe(NULL, ec->gpe, ACPI_NOT_ISR);
+	acpi_enable_gpe(NULL, ec->gpe);
 	return 0;
 }
 
@@ -969,19 +1037,14 @@ static struct acpi_driver acpi_ec_driver = {
 	.ops = {
 		.add = acpi_ec_add,
 		.remove = acpi_ec_remove,
-		.start = acpi_ec_start,
-		.stop = acpi_ec_stop,
 		.suspend = acpi_ec_suspend,
 		.resume = acpi_ec_resume,
 		},
 };
 
-static int __init acpi_ec_init(void)
+int __init acpi_ec_init(void)
 {
 	int result = 0;
-
-	if (acpi_disabled)
-		return 0;
 
 	acpi_ec_dir = proc_mkdir(ACPI_EC_CLASS, acpi_root_dir);
 	if (!acpi_ec_dir)
@@ -996,8 +1059,6 @@ static int __init acpi_ec_init(void)
 
 	return result;
 }
-
-subsys_initcall(acpi_ec_init);
 
 /* EC driver currently not unloadable */
 #if 0

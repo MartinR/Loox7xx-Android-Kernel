@@ -1,19 +1,24 @@
+#include <linux/pm.h>
+
 /* Functions local to drivers/usb/core/ */
 
 extern int usb_create_sysfs_dev_files(struct usb_device *dev);
 extern void usb_remove_sysfs_dev_files(struct usb_device *dev);
 extern int usb_create_sysfs_intf_files(struct usb_interface *intf);
 extern void usb_remove_sysfs_intf_files(struct usb_interface *intf);
-extern int usb_create_ep_files(struct device *parent,
+extern int usb_create_ep_devs(struct device *parent,
 				struct usb_host_endpoint *endpoint,
 				struct usb_device *udev);
-extern void usb_remove_ep_files(struct usb_host_endpoint *endpoint);
+extern void usb_remove_ep_devs(struct usb_host_endpoint *endpoint);
 
 extern void usb_enable_endpoint(struct usb_device *dev,
-		struct usb_host_endpoint *ep);
-extern void usb_disable_endpoint(struct usb_device *dev, unsigned int epaddr);
+		struct usb_host_endpoint *ep, bool reset_toggle);
+extern void usb_enable_interface(struct usb_device *dev,
+		struct usb_interface *intf, bool reset_toggles);
+extern void usb_disable_endpoint(struct usb_device *dev, unsigned int epaddr,
+		bool reset_hardware);
 extern void usb_disable_interface(struct usb_device *dev,
-		struct usb_interface *intf);
+		struct usb_interface *intf, bool reset_hardware);
 extern void usb_release_interface_cache(struct kref *ref);
 extern void usb_disable_device(struct usb_device *dev, int skip_ep0);
 extern int usb_deauthorize_device(struct usb_device *);
@@ -29,22 +34,34 @@ extern int usb_choose_configuration(struct usb_device *udev);
 extern void usb_kick_khubd(struct usb_device *dev);
 extern int usb_match_device(struct usb_device *dev,
 			    const struct usb_device_id *id);
+extern void usb_forced_unbind_intf(struct usb_interface *intf);
+extern void usb_rebind_intf(struct usb_interface *intf);
+
+extern int usb_hub_claim_port(struct usb_device *hdev, unsigned port,
+		void *owner);
+extern int usb_hub_release_port(struct usb_device *hdev, unsigned port,
+		void *owner);
+extern void usb_hub_release_all_ports(struct usb_device *hdev, void *owner);
+extern bool usb_device_is_owned(struct usb_device *udev);
 
 extern int  usb_hub_init(void);
 extern void usb_hub_cleanup(void);
 extern int usb_major_init(void);
 extern void usb_major_cleanup(void);
-extern int usb_host_init(void);
-extern void usb_host_cleanup(void);
 
 #ifdef	CONFIG_PM
 
+extern int usb_suspend(struct device *dev, pm_message_t msg);
+extern int usb_resume(struct device *dev, pm_message_t msg);
+
 extern void usb_autosuspend_work(struct work_struct *work);
-extern int usb_port_suspend(struct usb_device *dev);
-extern int usb_port_resume(struct usb_device *dev);
+extern void usb_autoresume_work(struct work_struct *work);
+extern int usb_port_suspend(struct usb_device *dev, pm_message_t msg);
+extern int usb_port_resume(struct usb_device *dev, pm_message_t msg);
 extern int usb_external_suspend_device(struct usb_device *udev,
 		pm_message_t msg);
-extern int usb_external_resume_device(struct usb_device *udev);
+extern int usb_external_resume_device(struct usb_device *udev,
+		pm_message_t msg);
 
 static inline void usb_pm_lock(struct usb_device *udev)
 {
@@ -58,12 +75,12 @@ static inline void usb_pm_unlock(struct usb_device *udev)
 
 #else
 
-static inline int usb_port_suspend(struct usb_device *udev)
+static inline int usb_port_suspend(struct usb_device *udev, pm_message_t msg)
 {
 	return 0;
 }
 
-static inline int usb_port_resume(struct usb_device *udev)
+static inline int usb_port_resume(struct usb_device *udev, pm_message_t msg)
 {
 	return 0;
 }
@@ -94,11 +111,22 @@ extern struct workqueue_struct *ksuspend_usb_wq;
 extern struct bus_type usb_bus_type;
 extern struct device_type usb_device_type;
 extern struct device_type usb_if_device_type;
+extern struct device_type usb_ep_device_type;
 extern struct usb_device_driver usb_generic_driver;
 
 static inline int is_usb_device(const struct device *dev)
 {
 	return dev->type == &usb_device_type;
+}
+
+static inline int is_usb_interface(const struct device *dev)
+{
+	return dev->type == &usb_if_device_type;
+}
+
+static inline int is_usb_endpoint(const struct device *dev)
+{
+	return dev->type == &usb_ep_device_type;
 }
 
 /* Do the same for device drivers and interface drivers. */
@@ -131,8 +159,8 @@ static inline int is_active(const struct usb_interface *f)
 extern const char *usbcore_name;
 
 /* sysfs stuff */
-extern struct attribute_group *usb_device_groups[];
-extern struct attribute_group *usb_interface_groups[];
+extern const struct attribute_group *usb_device_groups[];
+extern const struct attribute_group *usb_interface_groups[];
 
 /* usbfs stuff */
 extern struct mutex usbfs_mutex;
@@ -143,22 +171,6 @@ extern void usbfs_conn_disc_event(void);
 
 extern int usb_devio_init(void);
 extern void usb_devio_cleanup(void);
-
-struct dev_state {
-	struct list_head list;      /* state list */
-	struct usb_device *dev;
-	struct file *file;
-	spinlock_t lock;            /* protects the async urb lists */
-	struct list_head async_pending;
-	struct list_head async_completed;
-	wait_queue_head_t wait;     /* wake up if a request completed */
-	unsigned int discsignr;
-	struct pid *disc_pid;
-	uid_t disc_uid, disc_euid;
-	void __user *disccontext;
-	unsigned long ifclaimed;
-	u32 secid;
-};
 
 /* internal notify stuff */
 extern void usb_notify_add_device(struct usb_device *udev);

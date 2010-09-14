@@ -66,6 +66,9 @@ static irqreturn_t input_handler(int rq, void *dev_id)
 		case XENKBD_TYPE_MOTION:
 			input_report_rel(dev, REL_X, event->motion.rel_x);
 			input_report_rel(dev, REL_Y, event->motion.rel_y);
+			if (event->motion.rel_z)
+				input_report_rel(dev, REL_WHEEL,
+						 -event->motion.rel_z);
 			break;
 		case XENKBD_TYPE_KEY:
 			dev = NULL;
@@ -84,6 +87,9 @@ static irqreturn_t input_handler(int rq, void *dev_id)
 		case XENKBD_TYPE_POS:
 			input_report_abs(dev, ABS_X, event->pos.abs_x);
 			input_report_abs(dev, ABS_Y, event->pos.abs_y);
+			if (event->pos.rel_z)
+				input_report_rel(dev, REL_WHEEL,
+						 -event->pos.rel_z);
 			break;
 		}
 		if (dev)
@@ -108,7 +114,7 @@ static int __devinit xenkbd_probe(struct xenbus_device *dev,
 		xenbus_dev_fatal(dev, -ENOMEM, "allocating info structure");
 		return -ENOMEM;
 	}
-	dev->dev.driver_data = info;
+	dev_set_drvdata(&dev->dev, info);
 	info->xbdev = dev;
 	info->irq = -1;
 	snprintf(info->phys, sizeof(info->phys), "xenbus/%s", dev->nodename);
@@ -152,7 +158,7 @@ static int __devinit xenkbd_probe(struct xenbus_device *dev,
 	ptr->evbit[0] = BIT(EV_KEY) | BIT(EV_REL) | BIT(EV_ABS);
 	for (i = BTN_LEFT; i <= BTN_TASK; i++)
 		set_bit(i, ptr->keybit);
-	ptr->relbit[0] = BIT(REL_X) | BIT(REL_Y);
+	ptr->relbit[0] = BIT(REL_X) | BIT(REL_Y) | BIT(REL_WHEEL);
 	input_set_abs_params(ptr, ABS_X, 0, XENFB_WIDTH, 0, 0);
 	input_set_abs_params(ptr, ABS_Y, 0, XENFB_HEIGHT, 0, 0);
 
@@ -180,7 +186,7 @@ static int __devinit xenkbd_probe(struct xenbus_device *dev,
 
 static int xenkbd_resume(struct xenbus_device *dev)
 {
-	struct xenkbd_info *info = dev->dev.driver_data;
+	struct xenkbd_info *info = dev_get_drvdata(&dev->dev);
 
 	xenkbd_disconnect_backend(info);
 	memset(info->page, 0, PAGE_SIZE);
@@ -189,7 +195,7 @@ static int xenkbd_resume(struct xenbus_device *dev)
 
 static int xenkbd_remove(struct xenbus_device *dev)
 {
-	struct xenkbd_info *info = dev->dev.driver_data;
+	struct xenkbd_info *info = dev_get_drvdata(&dev->dev);
 
 	xenkbd_disconnect_backend(info);
 	if (info->kbd)
@@ -260,7 +266,7 @@ static void xenkbd_disconnect_backend(struct xenkbd_info *info)
 static void xenkbd_backend_changed(struct xenbus_device *dev,
 				   enum xenbus_state backend_state)
 {
-	struct xenkbd_info *info = dev->dev.driver_data;
+	struct xenkbd_info *info = dev_get_drvdata(&dev->dev);
 	int ret, val;
 
 	switch (backend_state) {
@@ -294,6 +300,16 @@ InitWait:
 		 */
 		if (dev->state != XenbusStateConnected)
 			goto InitWait; /* no InitWait seen yet, fudge it */
+
+		/* Set input abs params to match backend screen res */
+		if (xenbus_scanf(XBT_NIL, info->xbdev->otherend,
+				 "width", "%d", &val) > 0)
+			input_set_abs_params(info->ptr, ABS_X, 0, val, 0, 0);
+
+		if (xenbus_scanf(XBT_NIL, info->xbdev->otherend,
+				 "height", "%d", &val) > 0)
+			input_set_abs_params(info->ptr, ABS_Y, 0, val, 0, 0);
+
 		break;
 
 	case XenbusStateClosing:
@@ -307,7 +323,7 @@ static struct xenbus_device_id xenkbd_ids[] = {
 	{ "" }
 };
 
-static struct xenbus_driver xenkbd = {
+static struct xenbus_driver xenkbd_driver = {
 	.name = "vkbd",
 	.owner = THIS_MODULE,
 	.ids = xenkbd_ids,
@@ -319,22 +335,24 @@ static struct xenbus_driver xenkbd = {
 
 static int __init xenkbd_init(void)
 {
-	if (!is_running_on_xen())
+	if (!xen_domain())
 		return -ENODEV;
 
 	/* Nothing to do if running in dom0. */
-	if (is_initial_xendomain())
+	if (xen_initial_domain())
 		return -ENODEV;
 
-	return xenbus_register_frontend(&xenkbd);
+	return xenbus_register_frontend(&xenkbd_driver);
 }
 
 static void __exit xenkbd_cleanup(void)
 {
-	xenbus_unregister_driver(&xenkbd);
+	xenbus_unregister_driver(&xenkbd_driver);
 }
 
 module_init(xenkbd_init);
 module_exit(xenkbd_cleanup);
 
+MODULE_DESCRIPTION("Xen virtual keyboard/pointer device frontend");
 MODULE_LICENSE("GPL");
+MODULE_ALIAS("xen:vkbd");

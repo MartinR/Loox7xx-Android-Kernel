@@ -49,11 +49,6 @@
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
 
-#ifndef CONFIG_BT_HCI_SOCK_DEBUG
-#undef  BT_DBG
-#define BT_DBG(D...)
-#endif
-
 /* ----- HCI socket interface ----- */
 
 static inline int hci_test_bit(int nr, void *addr)
@@ -193,19 +188,11 @@ static inline int hci_sock_bound_ioctl(struct sock *sk, unsigned int cmd, unsign
 
 		return 0;
 
-	case HCISETSECMGR:
-		if (!capable(CAP_NET_ADMIN))
-			return -EACCES;
-
-		if (arg)
-			set_bit(HCI_SECMGR, &hdev->flags);
-		else
-			clear_bit(HCI_SECMGR, &hdev->flags);
-
-		return 0;
-
 	case HCIGETCONNINFO:
-		return hci_get_conn_info(hdev, (void __user *)arg);
+		return hci_get_conn_info(hdev, (void __user *) arg);
+
+	case HCIGETAUTHINFO:
+		return hci_get_auth_info(hdev, (void __user *) arg);
 
 	default:
 		if (hdev->ioctl)
@@ -217,7 +204,7 @@ static inline int hci_sock_bound_ioctl(struct sock *sk, unsigned int cmd, unsign
 static int hci_sock_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 {
 	struct sock *sk = sock->sk;
-	void __user *argp = (void __user *)arg;
+	void __user *argp = (void __user *) arg;
 	int err;
 
 	BT_DBG("cmd %x arg %lx", cmd, arg);
@@ -479,7 +466,7 @@ drop:
 	goto done;
 }
 
-static int hci_sock_setsockopt(struct socket *sock, int level, int optname, char __user *optval, int len)
+static int hci_sock_setsockopt(struct socket *sock, int level, int optname, char __user *optval, unsigned int len)
 {
 	struct hci_ufilter uf = { .opcode = 0 };
 	struct sock *sk = sock->sk;

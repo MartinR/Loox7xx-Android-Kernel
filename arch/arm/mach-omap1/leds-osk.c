@@ -5,11 +5,11 @@
  */
 #include <linux/init.h>
 
-#include <asm/hardware.h>
+#include <mach/hardware.h>
 #include <asm/leds.h>
 #include <asm/system.h>
 
-#include <asm/arch/gpio.h>
+#include <mach/gpio.h>
 
 #include "leds.h"
 
@@ -44,8 +44,8 @@ static void mistral_setled(void)
 		green = 1;
 	/* else both sides are disabled */
 
-	omap_set_gpio_dataout(GPIO_LED_GREEN, green);
-	omap_set_gpio_dataout(GPIO_LED_RED, red);
+	gpio_set_value(GPIO_LED_GREEN, green);
+	gpio_set_value(GPIO_LED_RED, red);
 }
 
 #endif

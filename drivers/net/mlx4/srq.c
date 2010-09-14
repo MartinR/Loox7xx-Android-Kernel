@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2006, 2007 Cisco Systems, Inc. All rights reserved.
+ * Copyright (c) 2007, 2008 Mellanox Technologies. All rights reserved.
  *
  * This software is available to you under a choice of one of two
  * licenses.  You may choose to be licensed under the terms of the GNU
@@ -29,8 +30,6 @@
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  */
-
-#include <linux/init.h>
 
 #include <linux/mlx4/cmd.h>
 
@@ -244,7 +243,7 @@ int mlx4_init_srq_table(struct mlx4_dev *dev)
 	INIT_RADIX_TREE(&srq_table->tree, GFP_ATOMIC);
 
 	err = mlx4_bitmap_init(&srq_table->bitmap, dev->caps.num_srqs,
-			       dev->caps.num_srqs - 1, dev->caps.reserved_srqs);
+			       dev->caps.num_srqs - 1, dev->caps.reserved_srqs, 0);
 	if (err)
 		return err;
 

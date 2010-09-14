@@ -1,6 +1,7 @@
 #ifndef _IPV6_H
 #define _IPV6_H
 
+#include <linux/types.h>
 #include <linux/in6.h>
 #include <asm/byteorder.h>
 
@@ -123,6 +124,7 @@ struct ipv6hdr {
 	struct	in6_addr	daddr;
 };
 
+#ifdef __KERNEL__
 /*
  * This structure contains configuration options per IPv6 link.
  */
@@ -163,8 +165,17 @@ struct ipv6_devconf {
 #ifdef CONFIG_IPV6_MROUTE
 	__s32		mc_forwarding;
 #endif
+	__s32		disable_ipv6;
+	__s32		accept_dad;
 	void		*sysctl;
 };
+
+struct ipv6_params {
+	__s32 disable_ipv6;
+	__s32 autoconf;
+};
+extern struct ipv6_params ipv6_defaults;
+#endif
 
 /* index values for the variables in ipv6_devconf */
 enum {
@@ -194,6 +205,8 @@ enum {
 	DEVCONF_OPTIMISTIC_DAD,
 	DEVCONF_ACCEPT_SOURCE_ROUTE,
 	DEVCONF_MC_FORWARDING,
+	DEVCONF_DISABLE_IPV6,
+	DEVCONF_ACCEPT_DAD,
 	DEVCONF_MAX
 };
 
@@ -272,6 +285,7 @@ struct ipv6_pinfo {
 	struct in6_addr 	saddr;
 	struct in6_addr 	rcv_saddr;
 	struct in6_addr		daddr;
+	struct in6_pktinfo	sticky_pktinfo;
 	struct in6_addr		*daddr_cache;
 #ifdef CONFIG_IPV6_SUBTREES
 	struct in6_addr		*saddr_cache;

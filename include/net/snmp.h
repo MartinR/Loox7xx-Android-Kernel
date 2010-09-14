@@ -14,8 +14,6 @@
  *		as published by the Free Software Foundation; either version
  *		2 of the License, or (at your option) any later version.
  *
- *		$Id: snmp.h,v 1.19 2001/06/14 13:40:46 davem Exp $
- *
  */
  
 #ifndef _SNMP_H
@@ -155,6 +153,11 @@ struct linux_xfrm_mib {
 		per_cpu_ptr(mib[!in_softirq()], get_cpu())->mibs[field]--; \
 		put_cpu(); \
 	} while (0)
+#define SNMP_ADD_STATS(mib, field, addend) 	\
+	do { \
+		per_cpu_ptr(mib[!in_softirq()], get_cpu())->mibs[field] += addend; \
+		put_cpu(); \
+	} while (0)
 #define SNMP_ADD_STATS_BH(mib, field, addend) 	\
 	(per_cpu_ptr(mib[0], raw_smp_processor_id())->mibs[field] += addend)
 #define SNMP_ADD_STATS_USER(mib, field, addend) 	\
@@ -162,5 +165,17 @@ struct linux_xfrm_mib {
 		per_cpu_ptr(mib[1], get_cpu())->mibs[field] += addend; \
 		put_cpu(); \
 	} while (0)
-
+#define SNMP_UPD_PO_STATS(mib, basefield, addend)	\
+	do { \
+		__typeof__(mib[0]) ptr = per_cpu_ptr(mib[!in_softirq()], get_cpu());\
+		ptr->mibs[basefield##PKTS]++; \
+		ptr->mibs[basefield##OCTETS] += addend;\
+		put_cpu(); \
+	} while (0)
+#define SNMP_UPD_PO_STATS_BH(mib, basefield, addend)	\
+	do { \
+		__typeof__(mib[0]) ptr = per_cpu_ptr(mib[!in_softirq()], raw_smp_processor_id());\
+		ptr->mibs[basefield##PKTS]++; \
+		ptr->mibs[basefield##OCTETS] += addend;\
+	} while (0)
 #endif

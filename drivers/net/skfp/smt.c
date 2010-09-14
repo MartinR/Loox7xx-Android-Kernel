@@ -19,6 +19,7 @@
 #include "h/smc.h"
 #include "h/smt_p.h"
 #include <linux/bitrev.h>
+#include <linux/kernel.h>
 
 #define KERNEL
 #include "h/smtstate.h"
@@ -52,16 +53,6 @@ static const char *const smt_class_name[] = {
 static const struct fddi_addr SMT_Unknown = {
 	{ 0,0,0x1f,0,0,0 }
 } ;
-
-/*
- * external variables
- */
-extern const struct fddi_addr fddi_broadcast ;
-
-/*
- * external functions
- */
-int pcm_status_twisted(struct s_smc *smc);
 
 /*
  * function prototypes
@@ -1730,20 +1721,18 @@ void fddi_send_antc(struct s_smc *smc, struct fddi_addr *dest)
 #endif
 
 #ifdef	DEBUG
-#define hextoasc(x)	"0123456789abcdef"[x]
-
 char *addr_to_string(struct fddi_addr *addr)
 {
 	int	i ;
 	static char	string[6*3] = "****" ;
 
 	for (i = 0 ; i < 6 ; i++) {
-		string[i*3] = hextoasc((addr->a[i]>>4)&0xf) ;
-		string[i*3+1] = hextoasc((addr->a[i])&0xf) ;
-		string[i*3+2] = ':' ;
+		string[i * 3] = hex_asc_hi(addr->a[i]);
+		string[i * 3 + 1] = hex_asc_lo(addr->a[i]);
+		string[i * 3 + 2] = ':';
 	}
-	string[5*3+2] = 0 ;
-	return(string) ;
+	string[5 * 3 + 2] = 0;
+	return(string);
 }
 #endif
 

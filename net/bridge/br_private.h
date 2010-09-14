@@ -4,8 +4,6 @@
  *	Authors:
  *	Lennert Buytenhek		<buytenh@gnu.org>
  *
- *	$Id: br_private.h,v 1.7 2001/12/24 00:59:55 davem Exp $
- *
  *	This program is free software; you can redistribute it and/or
  *	modify it under the terms of the GNU General Public License
  *	as published by the Free Software Foundation; either version
@@ -17,6 +15,7 @@
 
 #include <linux/netdevice.h>
 #include <linux/if_bridge.h>
+#include <net/route.h>
 
 #define BR_HASH_BITS 8
 #define BR_HASH_SIZE (1 << BR_HASH_BITS)
@@ -52,7 +51,6 @@ struct net_bridge_fdb_entry
 	struct net_bridge_port		*dst;
 
 	struct rcu_head			rcu;
-	atomic_t			use_count;
 	unsigned long			ageing_timer;
 	mac_addr			addr;
 	unsigned char			is_local;
@@ -83,6 +81,9 @@ struct net_bridge_port
 	struct timer_list		message_age_timer;
 	struct kobject			kobj;
 	struct rcu_head			rcu;
+
+	unsigned long 			flags;
+#define BR_HAIRPIN_MODE		0x00000001
 };
 
 struct net_bridge
@@ -90,11 +91,15 @@ struct net_bridge
 	spinlock_t			lock;
 	struct list_head		port_list;
 	struct net_device		*dev;
-	struct net_device_stats		statistics;
 	spinlock_t			hash_lock;
 	struct hlist_head		hash[BR_HASH_SIZE];
 	struct list_head		age_list;
 	unsigned long			feature_mask;
+#ifdef CONFIG_BRIDGE_NETFILTER
+	struct rtable 			fake_rtable;
+#endif
+	unsigned long			flags;
+#define BR_SET_MAC_ADDR		0x00000001
 
 	/* STP */
 	bridge_id			designated_root;
@@ -138,7 +143,8 @@ static inline int br_is_root_bridge(const struct net_bridge *br)
 
 /* br_device.c */
 extern void br_dev_setup(struct net_device *dev);
-extern int br_dev_xmit(struct sk_buff *skb, struct net_device *dev);
+extern netdev_tx_t br_dev_xmit(struct sk_buff *skb,
+			       struct net_device *dev);
 
 /* br_fdb.c */
 extern int br_fdb_init(void);
@@ -151,9 +157,7 @@ extern void br_fdb_delete_by_port(struct net_bridge *br,
 				  const struct net_bridge_port *p, int do_all);
 extern struct net_bridge_fdb_entry *__br_fdb_get(struct net_bridge *br,
 						 const unsigned char *addr);
-extern struct net_bridge_fdb_entry *br_fdb_get(struct net_bridge *br,
-					       unsigned char *addr);
-extern void br_fdb_put(struct net_bridge_fdb_entry *ent);
+extern int br_fdb_test_addr(struct net_device *dev, unsigned char *addr);
 extern int br_fdb_fillbuf(struct net_bridge *br, void *buf,
 			  unsigned long count, unsigned long off);
 extern int br_fdb_insert(struct net_bridge *br,
@@ -175,9 +179,9 @@ extern void br_flood_forward(struct net_bridge *br, struct sk_buff *skb);
 
 /* br_if.c */
 extern void br_port_carrier_check(struct net_bridge_port *p);
-extern int br_add_bridge(const char *name);
-extern int br_del_bridge(const char *name);
-extern void br_cleanup_bridges(void);
+extern int br_add_bridge(struct net *net, const char *name);
+extern int br_del_bridge(struct net *net, const char *name);
+extern void br_net_exit(struct net *net);
 extern int br_add_if(struct net_bridge *br,
 	      struct net_device *dev);
 extern int br_del_if(struct net_bridge *br,
@@ -198,9 +202,11 @@ extern int br_ioctl_deviceless_stub(struct net *net, unsigned int cmd, void __us
 #ifdef CONFIG_BRIDGE_NETFILTER
 extern int br_netfilter_init(void);
 extern void br_netfilter_fini(void);
+extern void br_netfilter_rtable_init(struct net_bridge *);
 #else
 #define br_netfilter_init()	(0)
 #define br_netfilter_fini()	do { } while(0)
+#define br_netfilter_rtable_init(x)
 #endif
 
 /* br_stp.c */
@@ -227,8 +233,9 @@ extern void br_stp_set_path_cost(struct net_bridge_port *p,
 extern ssize_t br_show_bridge_id(char *buf, const struct bridge_id *id);
 
 /* br_stp_bpdu.c */
-extern int br_stp_rcv(struct sk_buff *skb, struct net_device *dev,
-		      struct packet_type *pt, struct net_device *orig_dev);
+struct stp_proto;
+extern void br_stp_rcv(const struct stp_proto *proto, struct sk_buff *skb,
+		       struct net_device *dev);
 
 /* br_stp_timer.c */
 extern void br_stp_timer_init(struct net_bridge *br);
@@ -236,10 +243,9 @@ extern void br_stp_port_timer_init(struct net_bridge_port *p);
 extern unsigned long br_timer_value(const struct timer_list *timer);
 
 /* br.c */
-extern struct net_bridge_fdb_entry *(*br_fdb_get_hook)(struct net_bridge *br,
-						       unsigned char *addr);
-extern void (*br_fdb_put_hook)(struct net_bridge_fdb_entry *ent);
-
+#if defined(CONFIG_ATM_LANE) || defined(CONFIG_ATM_LANE_MODULE)
+extern int (*br_fdb_test_addr_hook)(struct net_device *dev, unsigned char *addr);
+#endif
 
 /* br_netlink.c */
 extern int br_netlink_init(void);

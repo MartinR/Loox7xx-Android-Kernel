@@ -9,20 +9,19 @@
  * as published by the Free Software Foundation.
  */
 
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/slab.h>
-#include <linux/poll.h>
 #include <linux/errno.h>
-#include <linux/if_arp.h>
-#include <linux/init.h>
-#include <linux/skbuff.h>
-#include <linux/pkt_sched.h>
-#include <linux/inetdevice.h>
-#include <linux/lapb.h>
-#include <linux/rtnetlink.h>
 #include <linux/hdlc.h>
-
+#include <linux/if_arp.h>
+#include <linux/inetdevice.h>
+#include <linux/init.h>
+#include <linux/kernel.h>
+#include <linux/lapb.h>
+#include <linux/module.h>
+#include <linux/pkt_sched.h>
+#include <linux/poll.h>
+#include <linux/rtnetlink.h>
+#include <linux/skbuff.h>
+#include <linux/slab.h>
 #include <net/x25device.h>
 
 static int x25_ioctl(struct net_device *dev, struct ifreq *ifr);
@@ -88,7 +87,7 @@ static void x25_data_transmit(struct net_device *dev, struct sk_buff *skb)
 
 
 
-static int x25_xmit(struct sk_buff *skb, struct net_device *dev)
+static netdev_tx_t x25_xmit(struct sk_buff *skb, struct net_device *dev)
 {
 	int result;
 
@@ -99,7 +98,7 @@ static int x25_xmit(struct sk_buff *skb, struct net_device *dev)
 		skb_pull(skb, 1);
 		if ((result = lapb_data_request(dev, skb)) != LAPB_OK)
 			dev_kfree_skb(skb);
-		return 0;
+		return NETDEV_TX_OK;
 
 	case 1:
 		if ((result = lapb_connect_request(dev))!= LAPB_OK) {
@@ -130,7 +129,7 @@ static int x25_xmit(struct sk_buff *skb, struct net_device *dev)
 	}
 
 	dev_kfree_skb(skb);
-	return 0;
+	return NETDEV_TX_OK;
 }
 
 
@@ -164,17 +163,17 @@ static void x25_close(struct net_device *dev)
 
 static int x25_rx(struct sk_buff *skb)
 {
-	struct hdlc_device *hdlc = dev_to_hdlc(skb->dev);
+	struct net_device *dev = skb->dev;
 
 	if ((skb = skb_share_check(skb, GFP_ATOMIC)) == NULL) {
-		hdlc->stats.rx_dropped++;
+		dev->stats.rx_dropped++;
 		return NET_RX_DROP;
 	}
 
-	if (lapb_data_received(skb->dev, skb) == LAPB_OK)
+	if (lapb_data_received(dev, skb) == LAPB_OK)
 		return NET_RX_SUCCESS;
 
-	hdlc->stats.rx_errors++;
+	dev->stats.rx_errors++;
 	dev_kfree_skb_any(skb);
 	return NET_RX_DROP;
 }
@@ -185,6 +184,7 @@ static struct hdlc_proto proto = {
 	.close		= x25_close,
 	.ioctl		= x25_ioctl,
 	.netif_rx	= x25_rx,
+	.xmit		= x25_xmit,
 	.module		= THIS_MODULE,
 };
 
@@ -214,7 +214,6 @@ static int x25_ioctl(struct net_device *dev, struct ifreq *ifr)
 
 		if ((result = attach_hdlc_protocol(dev, &proto, 0)))
 			return result;
-		dev->hard_start_xmit = x25_xmit;
 		dev->type = ARPHRD_X25;
 		netif_dormant_off(dev);
 		return 0;

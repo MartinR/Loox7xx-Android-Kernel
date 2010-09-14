@@ -40,16 +40,15 @@
 #include <linux/usb/gadget.h>
 
 #include <asm/byteorder.h>
-#include <asm/hardware.h>
+#include <mach/hardware.h>
 #include <asm/io.h>
 #include <asm/irq.h>
 #include <asm/system.h>
-#include <asm/mach-types.h>
 #include <asm/gpio.h>
 
-#include <asm/arch/board.h>
-#include <asm/arch/cpu.h>
-#include <asm/arch/at91sam9261_matrix.h>
+#include <mach/board.h>
+#include <mach/cpu.h>
+#include <mach/at91sam9261_matrix.h>
 
 #include "at91_udc.h"
 
@@ -486,7 +485,7 @@ static int at91_ep_enable(struct usb_ep *_ep,
 		return -ESHUTDOWN;
 	}
 
-	tmp = desc->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK;
+	tmp = usb_endpoint_type(desc);
 	switch (tmp) {
 	case USB_ENDPOINT_XFER_CONTROL:
 		DBG("only one control endpoint\n");
@@ -518,7 +517,7 @@ ok:
 	local_irq_save(flags);
 
 	/* initialize endpoint to match this descriptor */
-	ep->is_in = (desc->bEndpointAddress & USB_DIR_IN) != 0;
+	ep->is_in = usb_endpoint_dir_in(desc);
 	ep->is_iso = (tmp == USB_ENDPOINT_XFER_ISOC);
 	ep->stopped = 0;
 	if (ep->is_in)
@@ -888,7 +887,7 @@ static void pullup(struct at91_udc *udc, int is_on)
 		at91_udp_write(udc, AT91_UDP_TXVC, 0);
 		if (cpu_is_at91rm9200())
 			gpio_set_value(udc->board.pullup_pin, active);
-		else if (cpu_is_at91sam9260() || cpu_is_at91sam9263()) {
+		else if (cpu_is_at91sam9260() || cpu_is_at91sam9263() || cpu_is_at91sam9g20()) {
 			u32	txvc = at91_udp_read(udc, AT91_UDP_TXVC);
 
 			txvc |= AT91_UDP_TXVC_PUON;
@@ -906,7 +905,7 @@ static void pullup(struct at91_udc *udc, int is_on)
 		at91_udp_write(udc, AT91_UDP_TXVC, AT91_UDP_TXVC_TXVDIS);
 		if (cpu_is_at91rm9200())
 			gpio_set_value(udc->board.pullup_pin, !active);
-		else if (cpu_is_at91sam9260() || cpu_is_at91sam9263()) {
+		else if (cpu_is_at91sam9260() || cpu_is_at91sam9263() || cpu_is_at91sam9g20()) {
 			u32	txvc = at91_udp_read(udc, AT91_UDP_TXVC);
 
 			txvc &= ~AT91_UDP_TXVC_PUON;
@@ -1475,7 +1474,7 @@ static struct at91_udc controller = {
 		.ep0	= &controller.ep[0].ep,
 		.name	= driver_name,
 		.dev	= {
-			.bus_id = "gadget",
+			.init_name = "gadget",
 			.release = nop_release,
 		}
 	},
@@ -1575,7 +1574,7 @@ int usb_gadget_register_driver (struct usb_gadget_driver *driver)
 
 	udc->driver = driver;
 	udc->gadget.dev.driver = &driver->driver;
-	udc->gadget.dev.driver_data = &driver->driver;
+	dev_set_drvdata(&udc->gadget.dev, &driver->driver);
 	udc->enabled = 1;
 	udc->selfpowered = 1;
 
@@ -1584,7 +1583,7 @@ int usb_gadget_register_driver (struct usb_gadget_driver *driver)
 		DBG("driver->bind() returned %d\n", retval);
 		udc->driver = NULL;
 		udc->gadget.dev.driver = NULL;
-		udc->gadget.dev.driver_data = NULL;
+		dev_set_drvdata(&udc->gadget.dev, NULL);
 		udc->enabled = 0;
 		udc->selfpowered = 0;
 		return retval;
@@ -1614,7 +1613,7 @@ int usb_gadget_unregister_driver (struct usb_gadget_driver *driver)
 
 	driver->unbind(&udc->gadget);
 	udc->gadget.dev.driver = NULL;
-	udc->gadget.dev.driver_data = NULL;
+	dev_set_drvdata(&udc->gadget.dev, NULL);
 	udc->driver = NULL;
 
 	DBG("unbound from %s\n", driver->driver.name);
@@ -1687,6 +1686,19 @@ static int __init at91udc_probe(struct platform_device *pdev)
 				udc->board.pullup_active_low);
 	}
 
+	/* newer chips have more FIFO memory than rm9200 */
+	if (cpu_is_at91sam9260()) {
+		udc->ep[0].maxpacket = 64;
+		udc->ep[3].maxpacket = 64;
+		udc->ep[4].maxpacket = 512;
+		udc->ep[5].maxpacket = 512;
+	} else if (cpu_is_at91sam9261()) {
+		udc->ep[3].maxpacket = 64;
+	} else if (cpu_is_at91sam9263()) {
+		udc->ep[0].maxpacket = 64;
+		udc->ep[3].maxpacket = 64;
+	}
+
 	udc->udp_baseaddr = ioremap(res->start, res->end - res->start + 1);
 	if (!udc->udp_baseaddr) {
 		retval = -ENOMEM;
@@ -1742,7 +1754,6 @@ static int __init at91udc_probe(struct platform_device *pdev)
 				IRQF_DISABLED, driver_name, udc)) {
 			DBG("request vbus irq %d failed\n",
 					udc->board.vbus_pin);
-			free_irq(udc->udp_irq, udc);
 			retval = -EBUSY;
 			goto fail3;
 		}

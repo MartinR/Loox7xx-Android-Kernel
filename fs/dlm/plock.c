@@ -116,7 +116,7 @@ int dlm_posix_lock(dlm_lockspace_t *lockspace, u64 number, struct file *file,
 	if (xop->callback == NULL)
 		wait_event(recv_wq, (op->done != 0));
 	else {
-		rv = -EINPROGRESS;
+		rv = FILE_LOCK_DEFERRED;
 		goto out;
 	}
 
@@ -168,7 +168,7 @@ static int dlm_plock_callback(struct plock_op *op)
 	notify = xop->callback;
 
 	if (op->info.rv) {
-		notify(flc, NULL, op->info.rv);
+		notify(fl, NULL, op->info.rv);
 		goto out;
 	}
 
@@ -187,7 +187,7 @@ static int dlm_plock_callback(struct plock_op *op)
 			  (unsigned long long)op->info.number, file, fl);
 	}
 
-	rv = notify(flc, NULL, 0);
+	rv = notify(fl, NULL, 0);
 	if (rv) {
 		/* XXX: We need to cancel the fs lock here: */
 		log_print("dlm_plock_callback: lock granted after lock request "
@@ -304,7 +304,9 @@ int dlm_posix_get(dlm_lockspace_t *lockspace, u64 number, struct file *file,
 	if (rv == -ENOENT)
 		rv = 0;
 	else if (rv > 0) {
+		locks_init_lock(fl);
 		fl->fl_type = (op->info.ex) ? F_WRLCK : F_RDLCK;
+		fl->fl_flags = FL_POSIX;
 		fl->fl_pid = op->info.pid;
 		fl->fl_start = op->info.start;
 		fl->fl_end = op->info.end;
@@ -351,7 +353,7 @@ static ssize_t dev_write(struct file *file, const char __user *u, size_t count,
 {
 	struct dlm_plock_info info;
 	struct plock_op *op;
-	int found = 0;
+	int found = 0, do_callback = 0;
 
 	if (count != sizeof(info))
 		return -EINVAL;
@@ -364,21 +366,24 @@ static ssize_t dev_write(struct file *file, const char __user *u, size_t count,
 
 	spin_lock(&ops_lock);
 	list_for_each_entry(op, &recv_list, list) {
-		if (op->info.fsid == info.fsid && op->info.number == info.number &&
+		if (op->info.fsid == info.fsid &&
+		    op->info.number == info.number &&
 		    op->info.owner == info.owner) {
+			struct plock_xop *xop = (struct plock_xop *)op;
 			list_del_init(&op->list);
-			found = 1;
-			op->done = 1;
 			memcpy(&op->info, &info, sizeof(info));
+			if (xop->callback)
+				do_callback = 1;
+			else
+				op->done = 1;
+			found = 1;
 			break;
 		}
 	}
 	spin_unlock(&ops_lock);
 
 	if (found) {
-		struct plock_xop *xop;
-		xop = (struct plock_xop *)op;
-		if (xop->callback)
+		if (do_callback)
 			dlm_plock_callback(op);
 		else
 			wake_up(&recv_wq);

@@ -1,7 +1,6 @@
 /*
  * pata-cs5530.c 	- CS5530 PATA for new ATA layer
  *			  (C) 2005 Red Hat Inc
- *			  Alan Cox <alan@redhat.com>
  *
  * based upon cs5530.c by Mark Lord.
  *
@@ -149,10 +148,10 @@ static unsigned int cs5530_qc_issue(struct ata_queued_cmd *qc)
 	struct ata_device *prev = ap->private_data;
 
 	/* See if the DMA settings could be wrong */
-	if (adev->dma_mode != 0 && adev != prev && prev != NULL) {
+	if (ata_dma_enabled(adev) && adev != prev && prev != NULL) {
 		/* Maybe, but do the channels match MWDMA/UDMA ? */
-		if ((adev->dma_mode >= XFER_UDMA_0 && prev->dma_mode < XFER_UDMA_0) ||
-		    (adev->dma_mode < XFER_UDMA_0 && prev->dma_mode >= XFER_UDMA_0))
+		if ((ata_using_udma(adev) && !ata_using_udma(prev)) ||
+		    (ata_using_udma(prev) && !ata_using_udma(adev)))
 		    	/* Switch the mode bits */
 		    	cs5530_set_dmamode(ap, adev);
 	}
@@ -299,15 +298,15 @@ static int cs5530_init_one(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	static const struct ata_port_info info = {
 		.flags = ATA_FLAG_SLAVE_POSS,
-		.pio_mask = 0x1f,
-		.mwdma_mask = 0x07,
-		.udma_mask = 0x07,
+		.pio_mask = ATA_PIO4,
+		.mwdma_mask = ATA_MWDMA2,
+		.udma_mask = ATA_UDMA2,
 		.port_ops = &cs5530_port_ops
 	};
 	/* The docking connector doesn't do UDMA, and it seems not MWDMA */
 	static const struct ata_port_info info_palmax_secondary = {
 		.flags = ATA_FLAG_SLAVE_POSS,
-		.pio_mask = 0x1f,
+		.pio_mask = ATA_PIO4,
 		.port_ops = &cs5530_port_ops
 	};
 	const struct ata_port_info *ppi[] = { &info, NULL };

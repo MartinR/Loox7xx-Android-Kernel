@@ -64,7 +64,7 @@ struct cfq_io_context {
  * and kmalloc'ed. These could be shared between processes.
  */
 struct io_context {
-	atomic_t refcount;
+	atomic_long_t refcount;
 	atomic_t nr_tasks;
 
 	/* all the fields below are protected by this lock */
@@ -91,12 +91,30 @@ static inline struct io_context *ioc_task_link(struct io_context *ioc)
 	 * if ref count is zero, don't allow sharing (ioc is going away, it's
 	 * a race).
 	 */
-	if (ioc && atomic_inc_not_zero(&ioc->refcount)) {
+	if (ioc && atomic_long_inc_not_zero(&ioc->refcount)) {
 		atomic_inc(&ioc->nr_tasks);
 		return ioc;
 	}
 
 	return NULL;
 }
+
+#ifdef CONFIG_BLOCK
+int put_io_context(struct io_context *ioc);
+void exit_io_context(void);
+struct io_context *get_io_context(gfp_t gfp_flags, int node);
+struct io_context *alloc_io_context(gfp_t gfp_flags, int node);
+void copy_io_context(struct io_context **pdst, struct io_context **psrc);
+#else
+static inline void exit_io_context(void)
+{
+}
+
+struct io_context;
+static inline int put_io_context(struct io_context *ioc)
+{
+	return 1;
+}
+#endif
 
 #endif

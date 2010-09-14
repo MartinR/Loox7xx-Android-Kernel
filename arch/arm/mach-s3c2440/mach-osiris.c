@@ -1,6 +1,6 @@
 /* linux/arch/arm/mach-s3c2440/mach-osiris.c
  *
- * Copyright (c) 2005 Simtec Electronics
+ * Copyright (c) 2005,2008 Simtec Electronics
  *	http://armlinux.simtec.co.uk/
  *	Ben Dooks <ben@simtec.co.uk>
  *
@@ -15,37 +15,41 @@
 #include <linux/list.h>
 #include <linux/timer.h>
 #include <linux/init.h>
+#include <linux/gpio.h>
 #include <linux/device.h>
 #include <linux/sysdev.h>
 #include <linux/serial_core.h>
 #include <linux/clk.h>
+#include <linux/i2c.h>
+#include <linux/io.h>
 
 #include <asm/mach/arch.h>
 #include <asm/mach/map.h>
 #include <asm/mach/irq.h>
 
-#include <asm/arch/osiris-map.h>
-#include <asm/arch/osiris-cpld.h>
+#include <mach/osiris-map.h>
+#include <mach/osiris-cpld.h>
 
-#include <asm/hardware.h>
-#include <asm/io.h>
+#include <mach/hardware.h>
 #include <asm/irq.h>
 #include <asm/mach-types.h>
 
-#include <asm/plat-s3c/regs-serial.h>
-#include <asm/arch/regs-gpio.h>
-#include <asm/arch/regs-mem.h>
-#include <asm/arch/regs-lcd.h>
-#include <asm/plat-s3c/nand.h>
+#include <plat/cpu-freq.h>
+#include <plat/regs-serial.h>
+#include <mach/regs-gpio.h>
+#include <mach/regs-mem.h>
+#include <mach/regs-lcd.h>
+#include <plat/nand.h>
+#include <plat/iic.h>
 
 #include <linux/mtd/mtd.h>
 #include <linux/mtd/nand.h>
 #include <linux/mtd/nand_ecc.h>
 #include <linux/mtd/partitions.h>
 
-#include <asm/plat-s3c24xx/clock.h>
-#include <asm/plat-s3c24xx/devs.h>
-#include <asm/plat-s3c24xx/cpu.h>
+#include <plat/clock.h>
+#include <plat/devs.h>
+#include <plat/cpu.h>
 
 /* onboard perihperal map */
 
@@ -289,8 +293,8 @@ static int osiris_pm_suspend(struct sys_device *sd, pm_message_t state)
 	__raw_writeb(tmp, OSIRIS_VA_CTRL0);
 
 	/* ensure that an nRESET is not generated on resume. */
-	s3c2410_gpio_setpin(S3C2410_GPA21, 1);
-	s3c2410_gpio_cfgpin(S3C2410_GPA21, S3C2410_GPA21_OUT);
+	s3c2410_gpio_setpin(S3C2410_GPA(21), 1);
+	s3c2410_gpio_cfgpin(S3C2410_GPA(21), S3C2410_GPIO_OUTPUT);
 
 	return 0;
 }
@@ -302,7 +306,7 @@ static int osiris_pm_resume(struct sys_device *sd)
 
 	__raw_writeb(pm_osiris_ctrl0, OSIRIS_VA_CTRL0);
 
-	s3c2410_gpio_cfgpin(S3C2410_GPA21, S3C2410_GPA21_nRSTOUT);
+	s3c2410_gpio_cfgpin(S3C2410_GPA(21), S3C2410_GPA21_nRSTOUT);
 
 	return 0;
 }
@@ -322,21 +326,36 @@ static struct sys_device osiris_pm_sysdev = {
 	.cls		= &osiris_pm_sysclass,
 };
 
+/* I2C devices fitted. */
+
+static struct i2c_board_info osiris_i2c_devs[] __initdata = {
+	{
+		I2C_BOARD_INFO("tps65011", 0x48),
+		.irq	= IRQ_EINT20,
+	},
+};
+
 /* Standard Osiris devices */
 
 static struct platform_device *osiris_devices[] __initdata = {
-	&s3c_device_i2c,
+	&s3c_device_i2c0,
 	&s3c_device_wdt,
 	&s3c_device_nand,
 	&osiris_pcmcia,
 };
 
-static struct clk *osiris_clocks[] = {
+static struct clk *osiris_clocks[] __initdata = {
 	&s3c24xx_dclk0,
 	&s3c24xx_dclk1,
 	&s3c24xx_clkout0,
 	&s3c24xx_clkout1,
 	&s3c24xx_uclk,
+};
+
+static struct s3c_cpufreq_board __initdata osiris_cpufreq = {
+	.refresh	= 7800, /* refresh period is 7.8usec */
+	.auto_io	= 1,
+	.need_io	= 1,
 };
 
 static void __init osiris_map_io(void)
@@ -373,7 +392,7 @@ static void __init osiris_map_io(void)
 		osiris_nand_sets[0].nr_partitions = ARRAY_SIZE(osiris_default_nand_part_large);
 	} else {
 		/* write-protect line to the NAND */
-		s3c2410_gpio_setpin(S3C2410_GPA0, 1);
+		s3c2410_gpio_setpin(S3C2410_GPA(0), 1);
 	}
 
 	/* fix bus configuration (nBE settings wrong on ABLE pre v2.20) */
@@ -388,6 +407,13 @@ static void __init osiris_init(void)
 	sysdev_class_register(&osiris_pm_sysclass);
 	sysdev_register(&osiris_pm_sysdev);
 
+	s3c_i2c0_set_platdata(NULL);
+
+	s3c_cpufreq_setboard(&osiris_cpufreq);
+
+	i2c_register_board_info(0, osiris_i2c_devs,
+				ARRAY_SIZE(osiris_i2c_devs));
+
 	platform_add_devices(osiris_devices, ARRAY_SIZE(osiris_devices));
 };
 
@@ -397,7 +423,6 @@ MACHINE_START(OSIRIS, "Simtec-OSIRIS")
 	.io_pg_offst	= (((u32)S3C24XX_VA_UART) >> 18) & 0xfffc,
 	.boot_params	= S3C2410_SDRAM_PA + 0x100,
 	.map_io		= osiris_map_io,
-	.init_machine	= osiris_init,
 	.init_irq	= s3c24xx_init_irq,
 	.init_machine	= osiris_init,
 	.timer		= &s3c24xx_timer,

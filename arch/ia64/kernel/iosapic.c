@@ -69,7 +69,7 @@
  *     systems, we use one-to-one mapping between IA-64 vector and IRQ.  A
  *     platform can implement platform_irq_to_vector(irq) and
  *     platform_local_vector_to_irq(vector) APIs to differentiate the mapping.
- *     Please see also include/asm-ia64/hw_irq.h for those APIs.
+ *     Please see also arch/ia64/include/asm/hw_irq.h for those APIs.
  *
  * To sum up, there are three levels of mappings involved:
  *
@@ -329,29 +329,29 @@ unmask_irq (unsigned int irq)
 }
 
 
-static void
-iosapic_set_affinity (unsigned int irq, cpumask_t mask)
+static int
+iosapic_set_affinity(unsigned int irq, const struct cpumask *mask)
 {
 #ifdef CONFIG_SMP
 	u32 high32, low32;
-	int dest, rte_index;
+	int cpu, dest, rte_index;
 	int redir = (irq & IA64_IRQ_REDIRECTED) ? 1 : 0;
 	struct iosapic_rte_info *rte;
 	struct iosapic *iosapic;
 
 	irq &= (~IA64_IRQ_REDIRECTED);
 
-	cpus_and(mask, mask, cpu_online_map);
-	if (cpus_empty(mask))
-		return;
+	cpu = cpumask_first_and(cpu_online_mask, mask);
+	if (cpu >= nr_cpu_ids)
+		return -1;
 
-	if (irq_prepare_move(irq, first_cpu(mask)))
-		return;
+	if (irq_prepare_move(irq, cpu))
+		return -1;
 
-	dest = cpu_physical_id(first_cpu(mask));
+	dest = cpu_physical_id(cpu);
 
 	if (!iosapic_intr_info[irq].count)
-		return;			/* not an IOSAPIC interrupt */
+		return -1;			/* not an IOSAPIC interrupt */
 
 	set_irq_affinity_info(irq, dest, redir);
 
@@ -376,7 +376,9 @@ iosapic_set_affinity (unsigned int irq, cpumask_t mask)
 		iosapic_write(iosapic, IOSAPIC_RTE_HIGH(rte_index), high32);
 		iosapic_write(iosapic, IOSAPIC_RTE_LOW(rte_index), low32);
 	}
+
 #endif
+	return 0;
 }
 
 /*
@@ -449,7 +451,7 @@ iosapic_startup_edge_irq (unsigned int irq)
 static void
 iosapic_ack_edge_irq (unsigned int irq)
 {
-	irq_desc_t *idesc = irq_desc + irq;
+	struct irq_desc *idesc = irq_desc + irq;
 
 	irq_complete_move(irq);
 	move_native_irq(irq);
@@ -507,7 +509,7 @@ static int iosapic_find_sharable_irq(unsigned long trigger, unsigned long pol)
 	if (trigger == IOSAPIC_EDGE)
 		return -EINVAL;
 
-	for (i = 0; i <= NR_IRQS; i++) {
+	for (i = 0; i < NR_IRQS; i++) {
 		info = &iosapic_intr_info[i];
 		if (info->trigger == trigger && info->polarity == pol &&
 		    (info->dmode == IOSAPIC_FIXED ||
@@ -585,12 +587,21 @@ static inline int irq_is_shared (int irq)
 	return (iosapic_intr_info[irq].count > 1);
 }
 
+struct irq_chip*
+ia64_native_iosapic_get_irq_chip(unsigned long trigger)
+{
+	if (trigger == IOSAPIC_EDGE)
+		return &irq_type_iosapic_edge;
+	else
+		return &irq_type_iosapic_level;
+}
+
 static int
 register_intr (unsigned int gsi, int irq, unsigned char delivery,
 	       unsigned long polarity, unsigned long trigger)
 {
-	irq_desc_t *idesc;
-	struct hw_interrupt_type *irq_type;
+	struct irq_desc *idesc;
+	struct irq_chip *irq_type;
 	int index;
 	struct iosapic_rte_info *rte;
 
@@ -635,14 +646,11 @@ register_intr (unsigned int gsi, int irq, unsigned char delivery,
 	iosapic_intr_info[irq].dmode    = delivery;
 	iosapic_intr_info[irq].trigger  = trigger;
 
-	if (trigger == IOSAPIC_EDGE)
-		irq_type = &irq_type_iosapic_edge;
-	else
-		irq_type = &irq_type_iosapic_level;
+	irq_type = iosapic_get_irq_chip(trigger);
 
 	idesc = irq_desc + irq;
-	if (idesc->chip != irq_type) {
-		if (idesc->chip != &no_irq_type)
+	if (irq_type != NULL && idesc->chip != irq_type) {
+		if (idesc->chip != &no_irq_chip)
 			printk(KERN_WARNING
 			       "%s: changing vector %d from %s to %s\n",
 			       __func__, irq_to_vector(irq),
@@ -689,21 +697,19 @@ get_target_cpu (unsigned int gsi, int irq)
 #ifdef CONFIG_NUMA
 	{
 		int num_cpus, cpu_index, iosapic_index, numa_cpu, i = 0;
-		cpumask_t cpu_mask;
+		const struct cpumask *cpu_mask;
 
 		iosapic_index = find_iosapic(gsi);
 		if (iosapic_index < 0 ||
 		    iosapic_lists[iosapic_index].node == MAX_NUMNODES)
 			goto skip_numa_setup;
 
-		cpu_mask = node_to_cpumask(iosapic_lists[iosapic_index].node);
-		cpus_and(cpu_mask, cpu_mask, domain);
-		for_each_cpu_mask(numa_cpu, cpu_mask) {
-			if (!cpu_online(numa_cpu))
-				cpu_clear(numa_cpu, cpu_mask);
+		cpu_mask = cpumask_of_node(iosapic_lists[iosapic_index].node);
+		num_cpus = 0;
+		for_each_cpu_and(numa_cpu, cpu_mask, &domain) {
+			if (cpu_online(numa_cpu))
+				num_cpus++;
 		}
-
-		num_cpus = cpus_weight(cpu_mask);
 
 		if (!num_cpus)
 			goto skip_numa_setup;
@@ -711,10 +717,11 @@ get_target_cpu (unsigned int gsi, int irq)
 		/* Use irq assignment to distribute across cpus in node */
 		cpu_index = irq % num_cpus;
 
-		for (numa_cpu = first_cpu(cpu_mask) ; i < cpu_index ; i++)
-			numa_cpu = next_cpu(numa_cpu, cpu_mask);
+		for_each_cpu_and(numa_cpu, cpu_mask, &domain)
+			if (cpu_online(numa_cpu) && i++ >= cpu_index)
+				break;
 
-		if (numa_cpu != NR_CPUS)
+		if (numa_cpu < nr_cpu_ids)
 			return cpu_physical_id(numa_cpu);
 	}
 skip_numa_setup:
@@ -725,7 +732,7 @@ skip_numa_setup:
 	 * case of NUMA.)
 	 */
 	do {
-		if (++cpu >= NR_CPUS)
+		if (++cpu >= nr_cpu_ids)
 			cpu = 0;
 	} while (!cpu_online(cpu) || !cpu_isset(cpu, domain));
 
@@ -821,7 +828,7 @@ iosapic_unregister_intr (unsigned int gsi)
 {
 	unsigned long flags;
 	int irq, index;
-	irq_desc_t *idesc;
+	struct irq_desc *idesc;
 	u32 low32;
 	unsigned long trigger, polarity;
 	unsigned int dest;
@@ -875,7 +882,7 @@ iosapic_unregister_intr (unsigned int gsi)
 	if (iosapic_intr_info[irq].count == 0) {
 #ifdef CONFIG_SMP
 		/* Clear affinity */
-		cpus_setall(idesc->affinity);
+		cpumask_setall(idesc->affinity);
 #endif
 		/* Clear the interrupt information */
 		iosapic_intr_info[irq].dest = 0;
@@ -974,6 +981,22 @@ iosapic_override_isa_irq (unsigned int isa_irq, unsigned int gsi,
 }
 
 void __init
+ia64_native_iosapic_pcat_compat_init(void)
+{
+	if (pcat_compat) {
+		/*
+		 * Disable the compatibility mode interrupts (8259 style),
+		 * needs IN/OUT support enabled.
+		 */
+		printk(KERN_INFO
+		       "%s: Disabling PC-AT compatible 8259 interrupts\n",
+		       __func__);
+		outb(0xff, 0xA1);
+		outb(0xff, 0x21);
+	}
+}
+
+void __init
 iosapic_system_init (int system_pcat_compat)
 {
 	int irq;
@@ -987,17 +1010,8 @@ iosapic_system_init (int system_pcat_compat)
 	}
 
 	pcat_compat = system_pcat_compat;
-	if (pcat_compat) {
-		/*
-		 * Disable the compatibility mode interrupts (8259 style),
-		 * needs IN/OUT support enabled.
-		 */
-		printk(KERN_INFO
-		       "%s: Disabling PC-AT compatible 8259 interrupts\n",
-		       __func__);
-		outb(0xff, 0xA1);
-		outb(0xff, 0x21);
-	}
+	if (pcat_compat)
+		iosapic_pcat_compat_init();
 }
 
 static inline int
@@ -1058,6 +1072,10 @@ iosapic_init (unsigned long phys_addr, unsigned int gsi_base)
 	}
 
 	addr = ioremap(phys_addr, 0);
+	if (addr == NULL) {
+		spin_unlock_irqrestore(&iosapic_lock, flags);
+		return -ENOMEM;
+	}
 	ver = iosapic_version(addr);
 	if ((err = iosapic_check_gsi_range(gsi_base, ver))) {
 		iounmap(addr);

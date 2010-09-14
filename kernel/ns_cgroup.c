@@ -7,12 +7,12 @@
 #include <linux/module.h>
 #include <linux/cgroup.h>
 #include <linux/fs.h>
+#include <linux/proc_fs.h>
 #include <linux/slab.h>
 #include <linux/nsproxy.h>
 
 struct ns_cgroup {
 	struct cgroup_subsys_state css;
-	spinlock_t lock;
 };
 
 struct cgroup_subsys ns_subsys;
@@ -24,14 +24,17 @@ static inline struct ns_cgroup *cgroup_to_ns(
 			    struct ns_cgroup, css);
 }
 
-int ns_cgroup_clone(struct task_struct *task)
+int ns_cgroup_clone(struct task_struct *task, struct pid *pid)
 {
-	return cgroup_clone(task, &ns_subsys);
+	char name[PROC_NUMBUF];
+
+	snprintf(name, PROC_NUMBUF, "%d", pid_vnr(pid));
+	return cgroup_clone(task, &ns_subsys, name);
 }
 
 /*
  * Rules:
- *   1. you can only enter a cgroup which is a child of your current
+ *   1. you can only enter a cgroup which is a descendant of your current
  *     cgroup
  *   2. you can only place another process into a cgroup if
  *     a. you have CAP_SYS_ADMIN
@@ -39,25 +42,31 @@ int ns_cgroup_clone(struct task_struct *task)
  *       (hence either you are in the same cgroup as task, or in an
  *        ancestor cgroup thereof)
  */
-static int ns_can_attach(struct cgroup_subsys *ss,
-		struct cgroup *new_cgroup, struct task_struct *task)
+static int ns_can_attach(struct cgroup_subsys *ss, struct cgroup *new_cgroup,
+			 struct task_struct *task, bool threadgroup)
 {
-	struct cgroup *orig;
-
 	if (current != task) {
 		if (!capable(CAP_SYS_ADMIN))
 			return -EPERM;
 
-		if (!cgroup_is_descendant(new_cgroup))
+		if (!cgroup_is_descendant(new_cgroup, current))
 			return -EPERM;
 	}
 
-	if (atomic_read(&new_cgroup->count) != 0)
+	if (!cgroup_is_descendant(new_cgroup, task))
 		return -EPERM;
 
-	orig = task_cgroup(task, ns_subsys_id);
-	if (orig && orig != new_cgroup->parent)
-		return -EPERM;
+	if (threadgroup) {
+		struct task_struct *c;
+		rcu_read_lock();
+		list_for_each_entry_rcu(c, &task->thread_group, thread_group) {
+			if (!cgroup_is_descendant(new_cgroup, c)) {
+				rcu_read_unlock();
+				return -EPERM;
+			}
+		}
+		rcu_read_unlock();
+	}
 
 	return 0;
 }
@@ -74,13 +83,12 @@ static struct cgroup_subsys_state *ns_create(struct cgroup_subsys *ss,
 
 	if (!capable(CAP_SYS_ADMIN))
 		return ERR_PTR(-EPERM);
-	if (!cgroup_is_descendant(cgroup))
+	if (!cgroup_is_descendant(cgroup, current))
 		return ERR_PTR(-EPERM);
 
 	ns_cgroup = kzalloc(sizeof(*ns_cgroup), GFP_KERNEL);
 	if (!ns_cgroup)
 		return ERR_PTR(-ENOMEM);
-	spin_lock_init(&ns_cgroup->lock);
 	return &ns_cgroup->css;
 }
 

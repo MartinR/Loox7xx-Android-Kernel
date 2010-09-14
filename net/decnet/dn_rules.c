@@ -115,7 +115,7 @@ static int dn_fib_rule_match(struct fib_rule *rule, struct flowi *fl, int flags)
 }
 
 static int dn_fib_rule_configure(struct fib_rule *rule, struct sk_buff *skb,
-				 struct nlmsghdr *nlh, struct fib_rule_hdr *frh,
+				 struct fib_rule_hdr *frh,
 				 struct nlattr **tb)
 {
 	int err = -EINVAL;
@@ -192,7 +192,7 @@ unsigned dnet_addr_type(__le16 addr)
 }
 
 static int dn_fib_rule_fill(struct fib_rule *rule, struct sk_buff *skb,
-			    struct nlmsghdr *nlh, struct fib_rule_hdr *frh)
+			    struct fib_rule_hdr *frh)
 {
 	struct dn_fib_rule *r = (struct dn_fib_rule *)rule;
 
@@ -229,7 +229,7 @@ static u32 dn_fib_rule_default_pref(struct fib_rules_ops *ops)
 	return 0;
 }
 
-static void dn_fib_rule_flush_cache(void)
+static void dn_fib_rule_flush_cache(struct fib_rules_ops *ops)
 {
 	dn_rt_cache_flush(-1);
 }

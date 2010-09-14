@@ -14,8 +14,8 @@
 #include <linux/clk.h>
 #include <linux/string.h>
 #include <linux/platform_device.h>
+#include <linux/semaphore.h>
 
-#include <asm/semaphore.h>
 #include "clock.h"
 
 static LIST_HEAD(clocks);
@@ -195,7 +195,7 @@ static int clk_debugfs_open(struct inode *inode, struct file *file)
 	return single_open(file, clk_debugfs_show, NULL);
 }
 
-static struct file_operations clk_debugfs_operations = {
+static const struct file_operations clk_debugfs_operations = {
 	.open = clk_debugfs_open,
 	.read = seq_read,
 	.llseek = seq_lseek,

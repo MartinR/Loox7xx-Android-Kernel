@@ -1,6 +1,7 @@
 #ifndef __LINUX_PKT_CLS_H
 #define __LINUX_PKT_CLS_H
 
+#include <linux/types.h>
 #include <linux/pkt_sched.h>
 
 /* I think i could have done better macros ; for now this is stolen from
@@ -374,6 +375,7 @@ enum
 	TCA_FLOW_ACT,
 	TCA_FLOW_POLICE,
 	TCA_FLOW_EMATCHES,
+	TCA_FLOW_PERTURB,
 	__TCA_FLOW_MAX
 };
 
@@ -392,6 +394,20 @@ enum
 };
 
 #define TCA_BASIC_MAX (__TCA_BASIC_MAX - 1)
+
+
+/* Cgroup classifier */
+
+enum
+{
+	TCA_CGROUP_UNSPEC,
+	TCA_CGROUP_ACT,
+	TCA_CGROUP_POLICE,
+	TCA_CGROUP_EMATCHES,
+	__TCA_CGROUP_MAX,
+};
+
+#define TCA_CGROUP_MAX (__TCA_CGROUP_MAX - 1)
 
 /* Extended Matches */
 

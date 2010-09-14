@@ -196,7 +196,7 @@ static void clear_irq_vector(int irq)
 }
 
 int
-assign_irq_vector (int irq)
+ia64_native_assign_irq_vector (int irq)
 {
 	unsigned long flags;
 	int vector, cpu;
@@ -222,7 +222,7 @@ assign_irq_vector (int irq)
 }
 
 void
-free_irq_vector (int vector)
+ia64_native_free_irq_vector (int vector)
 {
 	if (vector < IA64_FIRST_DEVICE_VECTOR ||
 	    vector > IA64_LAST_DEVICE_VECTOR)
@@ -493,14 +493,15 @@ ia64_handle_irq (ia64_vector vector, struct pt_regs *regs)
 	saved_tpr = ia64_getreg(_IA64_REG_CR_TPR);
 	ia64_srlz_d();
 	while (vector != IA64_SPURIOUS_INT_VECTOR) {
+		int irq = local_vector_to_irq(vector);
+		struct irq_desc *desc = irq_to_desc(irq);
+
 		if (unlikely(IS_LOCAL_TLB_FLUSH(vector))) {
 			smp_local_flush_tlb();
-			kstat_this_cpu.irqs[vector]++;
-		} else if (unlikely(IS_RESCHEDULE(vector)))
-			kstat_this_cpu.irqs[vector]++;
-		else {
-			int irq = local_vector_to_irq(vector);
-
+			kstat_incr_irqs_this_cpu(irq, desc);
+		} else if (unlikely(IS_RESCHEDULE(vector))) {
+			kstat_incr_irqs_this_cpu(irq, desc);
+		} else {
 			ia64_setreg(_IA64_REG_CR_TPR, vector);
 			ia64_srlz_d();
 
@@ -543,22 +544,24 @@ void ia64_process_pending_intr(void)
 
 	vector = ia64_get_ivr();
 
-	 irq_enter();
-	 saved_tpr = ia64_getreg(_IA64_REG_CR_TPR);
-	 ia64_srlz_d();
+	irq_enter();
+	saved_tpr = ia64_getreg(_IA64_REG_CR_TPR);
+	ia64_srlz_d();
 
 	 /*
 	  * Perform normal interrupt style processing
 	  */
 	while (vector != IA64_SPURIOUS_INT_VECTOR) {
+		int irq = local_vector_to_irq(vector);
+		struct irq_desc *desc = irq_to_desc(irq);
+
 		if (unlikely(IS_LOCAL_TLB_FLUSH(vector))) {
 			smp_local_flush_tlb();
-			kstat_this_cpu.irqs[vector]++;
-		} else if (unlikely(IS_RESCHEDULE(vector)))
-			kstat_this_cpu.irqs[vector]++;
-		else {
+			kstat_incr_irqs_this_cpu(irq, desc);
+		} else if (unlikely(IS_RESCHEDULE(vector))) {
+			kstat_incr_irqs_this_cpu(irq, desc);
+		} else {
 			struct pt_regs *old_regs = set_irq_regs(NULL);
-			int irq = local_vector_to_irq(vector);
 
 			ia64_setreg(_IA64_REG_CR_TPR, vector);
 			ia64_srlz_d();
@@ -600,7 +603,6 @@ static irqreturn_t dummy_handler (int irq, void *dev_id)
 {
 	BUG();
 }
-extern irqreturn_t handle_IPI (int irq, void *dev_id);
 
 static struct irqaction ipi_irqaction = {
 	.handler =	handle_IPI,
@@ -608,6 +610,9 @@ static struct irqaction ipi_irqaction = {
 	.name =		"IPI"
 };
 
+/*
+ * KVM uses this interrupt to force a cpu out of guest mode
+ */
 static struct irqaction resched_irqaction = {
 	.handler =	dummy_handler,
 	.flags =	IRQF_DISABLED,
@@ -623,9 +628,9 @@ static struct irqaction tlb_irqaction = {
 #endif
 
 void
-register_percpu_irq (ia64_vector vec, struct irqaction *action)
+ia64_native_register_percpu_irq (ia64_vector vec, struct irqaction *action)
 {
-	irq_desc_t *desc;
+	struct irq_desc *desc;
 	unsigned int irq;
 
 	irq = vec;
@@ -638,13 +643,21 @@ register_percpu_irq (ia64_vector vec, struct irqaction *action)
 }
 
 void __init
-init_IRQ (void)
+ia64_native_register_ipi(void)
 {
-	register_percpu_irq(IA64_SPURIOUS_INT_VECTOR, NULL);
 #ifdef CONFIG_SMP
 	register_percpu_irq(IA64_IPI_VECTOR, &ipi_irqaction);
 	register_percpu_irq(IA64_IPI_RESCHEDULE, &resched_irqaction);
 	register_percpu_irq(IA64_IPI_LOCAL_TLB_FLUSH, &tlb_irqaction);
+#endif
+}
+
+void __init
+init_IRQ (void)
+{
+	ia64_register_ipi();
+	register_percpu_irq(IA64_SPURIOUS_INT_VECTOR, NULL);
+#ifdef CONFIG_SMP
 #if defined(CONFIG_IA64_GENERIC) || defined(CONFIG_IA64_DIG)
 	if (vector_domain_type != VECTOR_DOMAIN_NONE) {
 		BUG_ON(IA64_FIRST_DEVICE_VECTOR != IA64_IRQ_MOVE_VECTOR);

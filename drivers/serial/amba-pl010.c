@@ -22,8 +22,6 @@
  * along with this program; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA  02111-1307  USA
  *
- *  $Id: amba.c,v 1.41 2002/07/28 10:03:27 rmk Exp $
- *
  * This is a generic driver for ARM AMBA-type serial ports.  They
  * have a lot of 16550-like features, but are not register compatible.
  * Note that although they do have CTS, DCD and DSR inputs, they do
@@ -119,7 +117,7 @@ static void pl010_enable_ms(struct uart_port *port)
 
 static void pl010_rx_chars(struct uart_amba_port *uap)
 {
-	struct tty_struct *tty = uap->port.info->tty;
+	struct tty_struct *tty = uap->port.state->port.tty;
 	unsigned int status, ch, flag, rsr, max_count = 256;
 
 	status = readb(uap->port.membase + UART01x_FR);
@@ -174,7 +172,7 @@ static void pl010_rx_chars(struct uart_amba_port *uap)
 
 static void pl010_tx_chars(struct uart_amba_port *uap)
 {
-	struct circ_buf *xmit = &uap->port.info->xmit;
+	struct circ_buf *xmit = &uap->port.state->xmit;
 	int count;
 
 	if (uap->port.x_char) {
@@ -227,7 +225,7 @@ static void pl010_modem_status(struct uart_amba_port *uap)
 	if (delta & UART01x_FR_CTS)
 		uart_handle_cts_change(&uap->port, status & UART01x_FR_CTS);
 
-	wake_up_interruptible(&uap->port.info->delta_msr_wait);
+	wake_up_interruptible(&uap->port.state->port.delta_msr_wait);
 }
 
 static irqreturn_t pl010_int(int irq, void *dev_id)
@@ -514,7 +512,7 @@ static int pl010_verify_port(struct uart_port *port, struct serial_struct *ser)
 	int ret = 0;
 	if (ser->type != PORT_UNKNOWN && ser->type != PORT_AMBA)
 		ret = -EINVAL;
-	if (ser->irq < 0 || ser->irq >= NR_IRQS)
+	if (ser->irq < 0 || ser->irq >= nr_irqs)
 		ret = -EINVAL;
 	if (ser->baud_base < 9600)
 		ret = -EINVAL;
@@ -667,7 +665,7 @@ static struct uart_driver amba_reg = {
 	.cons			= AMBA_CONSOLE,
 };
 
-static int pl010_probe(struct amba_device *dev, void *id)
+static int pl010_probe(struct amba_device *dev, struct amba_id *id)
 {
 	struct uart_amba_port *uap;
 	void __iomem *base;
@@ -688,13 +686,13 @@ static int pl010_probe(struct amba_device *dev, void *id)
 		goto out;
 	}
 
-	base = ioremap(dev->res.start, PAGE_SIZE);
+	base = ioremap(dev->res.start, resource_size(&dev->res));
 	if (!base) {
 		ret = -ENOMEM;
 		goto free;
 	}
 
-	uap->clk = clk_get(&dev->dev, "UARTCLK");
+	uap->clk = clk_get(&dev->dev, NULL);
 	if (IS_ERR(uap->clk)) {
 		ret = PTR_ERR(uap->clk);
 		goto unmap;
@@ -791,7 +789,7 @@ static int __init pl010_init(void)
 {
 	int ret;
 
-	printk(KERN_INFO "Serial: AMBA driver $Revision: 1.41 $\n");
+	printk(KERN_INFO "Serial: AMBA driver\n");
 
 	ret = uart_register_driver(&amba_reg);
 	if (ret == 0) {
@@ -812,5 +810,5 @@ module_init(pl010_init);
 module_exit(pl010_exit);
 
 MODULE_AUTHOR("ARM Ltd/Deep Blue Solutions Ltd");
-MODULE_DESCRIPTION("ARM AMBA serial port driver $Revision: 1.41 $");
+MODULE_DESCRIPTION("ARM AMBA serial port driver");
 MODULE_LICENSE("GPL");

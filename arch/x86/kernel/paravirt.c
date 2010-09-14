@@ -28,8 +28,9 @@
 #include <asm/paravirt.h>
 #include <asm/desc.h>
 #include <asm/setup.h>
-#include <asm/arch_hooks.h>
+#include <asm/pgtable.h>
 #include <asm/time.h>
+#include <asm/pgalloc.h>
 #include <asm/irq.h>
 #include <asm/delay.h>
 #include <asm/fixmap.h>
@@ -42,15 +43,21 @@ void _paravirt_nop(void)
 {
 }
 
-static void __init default_banner(void)
+/* identity function, which can be inlined */
+u32 _paravirt_ident_32(u32 x)
+{
+	return x;
+}
+
+u64 _paravirt_ident_64(u64 x)
+{
+	return x;
+}
+
+void __init default_banner(void)
 {
 	printk(KERN_INFO "Booting paravirtualized kernel on %s\n",
 	       pv_info.name);
-}
-
-char *memory_setup(void)
-{
-	return pv_init_ops.memory_setup();
 }
 
 /* Simple instruction patching code. */
@@ -122,6 +129,9 @@ static void *get_call_destination(u8 type)
 		.pv_irq_ops = pv_irq_ops,
 		.pv_apic_ops = pv_apic_ops,
 		.pv_mmu_ops = pv_mmu_ops,
+#ifdef CONFIG_PARAVIRT_SPINLOCKS
+		.pv_lock_ops = pv_lock_ops,
+#endif
 	};
 	return *((void **)&tmpl + type);
 }
@@ -135,11 +145,20 @@ unsigned paravirt_patch_default(u8 type, u16 clobbers, void *insnbuf,
 	if (opfunc == NULL)
 		/* If there's no function, patch it with a ud2a (BUG) */
 		ret = paravirt_patch_insns(insnbuf, len, ud2a, ud2a+sizeof(ud2a));
-	else if (opfunc == paravirt_nop)
+	else if (opfunc == _paravirt_nop)
 		/* If the operation is a nop, then nop the callsite */
 		ret = paravirt_patch_nop();
+
+	/* identity functions just return their single argument */
+	else if (opfunc == _paravirt_ident_32)
+		ret = paravirt_patch_ident_32(insnbuf, len);
+	else if (opfunc == _paravirt_ident_64)
+		ret = paravirt_patch_ident_64(insnbuf, len);
+
 	else if (type == PARAVIRT_PATCH(pv_cpu_ops.iret) ||
-		 type == PARAVIRT_PATCH(pv_cpu_ops.irq_enable_syscall_ret))
+		 type == PARAVIRT_PATCH(pv_cpu_ops.irq_enable_sysexit) ||
+		 type == PARAVIRT_PATCH(pv_cpu_ops.usergs_sysret32) ||
+		 type == PARAVIRT_PATCH(pv_cpu_ops.usergs_sysret64))
 		/* If operation requires a jmp, then jmp */
 		ret = paravirt_patch_jmp(insnbuf, opfunc, addr, len);
 	else
@@ -164,11 +183,6 @@ unsigned paravirt_patch_insns(void *insnbuf, unsigned len,
 	return insn_len;
 }
 
-void init_IRQ(void)
-{
-	pv_irq_ops.init_IRQ();
-}
-
 static void native_flush_tlb(void)
 {
 	__native_flush_tlb();
@@ -190,14 +204,9 @@ static void native_flush_tlb_single(unsigned long addr)
 
 /* These are in entry.S */
 extern void native_iret(void);
-extern void native_irq_enable_syscall_ret(void);
-
-static int __init print_banner(void)
-{
-	pv_init_ops.banner();
-	return 0;
-}
-core_initcall(print_banner);
+extern void native_irq_enable_sysexit(void);
+extern void native_usergs_sysret32(void);
+extern void native_usergs_sysret64(void);
 
 static struct resource reserve_ioports = {
 	.start = 0,
@@ -222,18 +231,16 @@ static DEFINE_PER_CPU(enum paravirt_lazy_mode, paravirt_lazy_mode) = PARAVIRT_LA
 
 static inline void enter_lazy(enum paravirt_lazy_mode mode)
 {
-	BUG_ON(__get_cpu_var(paravirt_lazy_mode) != PARAVIRT_LAZY_NONE);
-	BUG_ON(preemptible());
+	BUG_ON(percpu_read(paravirt_lazy_mode) != PARAVIRT_LAZY_NONE);
 
-	__get_cpu_var(paravirt_lazy_mode) = mode;
+	percpu_write(paravirt_lazy_mode, mode);
 }
 
-void paravirt_leave_lazy(enum paravirt_lazy_mode mode)
+static void leave_lazy(enum paravirt_lazy_mode mode)
 {
-	BUG_ON(__get_cpu_var(paravirt_lazy_mode) != mode);
-	BUG_ON(preemptible());
+	BUG_ON(percpu_read(paravirt_lazy_mode) != mode);
 
-	__get_cpu_var(paravirt_lazy_mode) = PARAVIRT_LAZY_NONE;
+	percpu_write(paravirt_lazy_mode, PARAVIRT_LAZY_NONE);
 }
 
 void paravirt_enter_lazy_mmu(void)
@@ -243,22 +250,48 @@ void paravirt_enter_lazy_mmu(void)
 
 void paravirt_leave_lazy_mmu(void)
 {
-	paravirt_leave_lazy(PARAVIRT_LAZY_MMU);
+	leave_lazy(PARAVIRT_LAZY_MMU);
 }
 
-void paravirt_enter_lazy_cpu(void)
+void paravirt_start_context_switch(struct task_struct *prev)
 {
+	BUG_ON(preemptible());
+
+	if (percpu_read(paravirt_lazy_mode) == PARAVIRT_LAZY_MMU) {
+		arch_leave_lazy_mmu_mode();
+		set_ti_thread_flag(task_thread_info(prev), TIF_LAZY_MMU_UPDATES);
+	}
 	enter_lazy(PARAVIRT_LAZY_CPU);
 }
 
-void paravirt_leave_lazy_cpu(void)
+void paravirt_end_context_switch(struct task_struct *next)
 {
-	paravirt_leave_lazy(PARAVIRT_LAZY_CPU);
+	BUG_ON(preemptible());
+
+	leave_lazy(PARAVIRT_LAZY_CPU);
+
+	if (test_and_clear_ti_thread_flag(task_thread_info(next), TIF_LAZY_MMU_UPDATES))
+		arch_enter_lazy_mmu_mode();
 }
 
 enum paravirt_lazy_mode paravirt_get_lazy_mode(void)
 {
-	return __get_cpu_var(paravirt_lazy_mode);
+	if (in_interrupt())
+		return PARAVIRT_LAZY_NONE;
+
+	return percpu_read(paravirt_lazy_mode);
+}
+
+void arch_flush_lazy_mmu_mode(void)
+{
+	preempt_disable();
+
+	if (paravirt_get_lazy_mode() == PARAVIRT_LAZY_MMU) {
+		arch_leave_lazy_mmu_mode();
+		arch_enter_lazy_mmu_mode();
+	}
+
+	preempt_enable();
 }
 
 struct pv_info pv_info = {
@@ -270,27 +303,22 @@ struct pv_info pv_info = {
 
 struct pv_init_ops pv_init_ops = {
 	.patch = native_patch,
-	.banner = default_banner,
-	.arch_setup = paravirt_nop,
-	.memory_setup = machine_specific_memory_setup,
 };
 
 struct pv_time_ops pv_time_ops = {
-	.time_init = hpet_time_init,
-	.get_wallclock = native_get_wallclock,
-	.set_wallclock = native_set_wallclock,
 	.sched_clock = native_sched_clock,
-	.get_cpu_khz = native_calculate_cpu_khz,
 };
 
 struct pv_irq_ops pv_irq_ops = {
-	.init_IRQ = native_init_IRQ,
-	.save_fl = native_save_fl,
-	.restore_fl = native_restore_fl,
-	.irq_disable = native_irq_disable,
-	.irq_enable = native_irq_enable,
+	.save_fl = __PV_IS_CALLEE_SAVE(native_save_fl),
+	.restore_fl = __PV_IS_CALLEE_SAVE(native_restore_fl),
+	.irq_disable = __PV_IS_CALLEE_SAVE(native_irq_disable),
+	.irq_enable = __PV_IS_CALLEE_SAVE(native_irq_enable),
 	.safe_halt = native_safe_halt,
 	.halt = native_halt,
+#ifdef CONFIG_X86_64
+	.adjust_exception_frame = paravirt_nop,
+#endif
 };
 
 struct pv_cpu_ops pv_cpu_ops = {
@@ -309,7 +337,9 @@ struct pv_cpu_ops pv_cpu_ops = {
 #endif
 	.wbinvd = native_wbinvd,
 	.read_msr = native_read_msr_safe,
+	.rdmsr_regs = native_rdmsr_safe_regs,
 	.write_msr = native_write_msr_safe,
+	.wrmsr_regs = native_wrmsr_safe_regs,
 	.read_tsc = native_read_tsc,
 	.read_pmc = native_read_pmc,
 	.read_tscp = native_read_tscp,
@@ -321,40 +351,52 @@ struct pv_cpu_ops pv_cpu_ops = {
 	.store_idt = native_store_idt,
 	.store_tr = native_store_tr,
 	.load_tls = native_load_tls,
+#ifdef CONFIG_X86_64
+	.load_gs_index = native_load_gs_index,
+#endif
 	.write_ldt_entry = native_write_ldt_entry,
 	.write_gdt_entry = native_write_gdt_entry,
 	.write_idt_entry = native_write_idt_entry,
+
+	.alloc_ldt = paravirt_nop,
+	.free_ldt = paravirt_nop,
+
 	.load_sp0 = native_load_sp0,
 
-	.irq_enable_syscall_ret = native_irq_enable_syscall_ret,
+#if defined(CONFIG_X86_32) || defined(CONFIG_IA32_EMULATION)
+	.irq_enable_sysexit = native_irq_enable_sysexit,
+#endif
+#ifdef CONFIG_X86_64
+#ifdef CONFIG_IA32_EMULATION
+	.usergs_sysret32 = native_usergs_sysret32,
+#endif
+	.usergs_sysret64 = native_usergs_sysret64,
+#endif
 	.iret = native_iret,
 	.swapgs = native_swapgs,
 
 	.set_iopl_mask = native_set_iopl_mask,
 	.io_delay = native_io_delay,
 
-	.lazy_mode = {
-		.enter = paravirt_nop,
-		.leave = paravirt_nop,
-	},
+	.start_context_switch = paravirt_nop,
+	.end_context_switch = paravirt_nop,
 };
 
 struct pv_apic_ops pv_apic_ops = {
 #ifdef CONFIG_X86_LOCAL_APIC
-	.apic_write = native_apic_write,
-	.apic_write_atomic = native_apic_write_atomic,
-	.apic_read = native_apic_read,
-	.setup_boot_clock = setup_boot_APIC_clock,
-	.setup_secondary_clock = setup_secondary_APIC_clock,
 	.startup_ipi_hook = paravirt_nop,
 #endif
 };
 
-struct pv_mmu_ops pv_mmu_ops = {
-#ifndef CONFIG_X86_64
-	.pagetable_setup_start = native_pagetable_setup_start,
-	.pagetable_setup_done = native_pagetable_setup_done,
+#if defined(CONFIG_X86_32) && !defined(CONFIG_X86_PAE)
+/* 32-bit pagetable entries */
+#define PTE_IDENT	__PV_IS_CALLEE_SAVE(_paravirt_ident_32)
+#else
+/* 64-bit pagetable entries */
+#define PTE_IDENT	__PV_IS_CALLEE_SAVE(_paravirt_ident_64)
 #endif
+
+struct pv_mmu_ops pv_mmu_ops = {
 
 	.read_cr2 = native_read_cr2,
 	.write_cr2 = native_write_cr2,
@@ -365,6 +407,9 @@ struct pv_mmu_ops pv_mmu_ops = {
 	.flush_tlb_kernel = native_flush_tlb_global,
 	.flush_tlb_single = native_flush_tlb_single,
 	.flush_tlb_others = native_flush_tlb_others,
+
+	.pgd_alloc = __paravirt_pgd_alloc,
+	.pgd_free = paravirt_nop,
 
 	.alloc_pte = paravirt_nop,
 	.alloc_pmd = paravirt_nop,
@@ -380,6 +425,9 @@ struct pv_mmu_ops pv_mmu_ops = {
 	.pte_update = paravirt_nop,
 	.pte_update_defer = paravirt_nop,
 
+	.ptep_modify_prot_start = __ptep_modify_prot_start,
+	.ptep_modify_prot_commit = __ptep_modify_prot_commit,
+
 #ifdef CONFIG_HIGHPTE
 	.kmap_atomic_pte = kmap_atomic,
 #endif
@@ -387,26 +435,27 @@ struct pv_mmu_ops pv_mmu_ops = {
 #if PAGETABLE_LEVELS >= 3
 #ifdef CONFIG_X86_PAE
 	.set_pte_atomic = native_set_pte_atomic,
-	.set_pte_present = native_set_pte_present,
 	.pte_clear = native_pte_clear,
 	.pmd_clear = native_pmd_clear,
 #endif
 	.set_pud = native_set_pud,
-	.pmd_val = native_pmd_val,
-	.make_pmd = native_make_pmd,
+
+	.pmd_val = PTE_IDENT,
+	.make_pmd = PTE_IDENT,
 
 #if PAGETABLE_LEVELS == 4
-	.pud_val = native_pud_val,
-	.make_pud = native_make_pud,
+	.pud_val = PTE_IDENT,
+	.make_pud = PTE_IDENT,
+
 	.set_pgd = native_set_pgd,
 #endif
 #endif /* PAGETABLE_LEVELS >= 3 */
 
-	.pte_val = native_pte_val,
-	.pgd_val = native_pgd_val,
+	.pte_val = PTE_IDENT,
+	.pgd_val = PTE_IDENT,
 
-	.make_pte = native_make_pte,
-	.make_pgd = native_make_pgd,
+	.make_pte = PTE_IDENT,
+	.make_pgd = PTE_IDENT,
 
 	.dup_mmap = paravirt_nop,
 	.exit_mmap = paravirt_nop,
@@ -416,6 +465,8 @@ struct pv_mmu_ops pv_mmu_ops = {
 		.enter = paravirt_nop,
 		.leave = paravirt_nop,
 	},
+
+	.set_fixmap = native_set_fixmap,
 };
 
 EXPORT_SYMBOL_GPL(pv_time_ops);

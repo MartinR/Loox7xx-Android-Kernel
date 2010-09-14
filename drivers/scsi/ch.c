@@ -22,6 +22,7 @@
 #include <linux/chio.h>			/* here are all the ioctls */
 #include <linux/mutex.h>
 #include <linux/idr.h>
+#include <linux/smp_lock.h>
 
 #include <scsi/scsi.h>
 #include <scsi/scsi_cmnd.h>
@@ -40,6 +41,7 @@ MODULE_DESCRIPTION("device driver for scsi media changer devices");
 MODULE_AUTHOR("Gerd Knorr <kraxel@bytesex.org>");
 MODULE_LICENSE("GPL");
 MODULE_ALIAS_CHARDEV_MAJOR(SCSI_CHANGER_MAJOR);
+MODULE_ALIAS_SCSI_DEVICE(TYPE_MEDIUM_CHANGER);
 
 static int init = 1;
 module_param(init, int, 0444);
@@ -189,7 +191,7 @@ ch_do_scsi(scsi_changer *ch, unsigned char *cmd,
 
         result = scsi_execute_req(ch->device, cmd, direction, buffer,
 				  buflength, &sshdr, timeout * HZ,
-				  MAX_RETRIES);
+				  MAX_RETRIES, NULL);
 
 	dprintk("result: 0x%x\n",result);
 	if (driver_byte(result) & DRIVER_SENSE) {
@@ -351,6 +353,12 @@ ch_readconfig(scsi_changer *ch)
 	/* look up the devices of the data transfer elements */
 	ch->dt = kmalloc(ch->counts[CHET_DT]*sizeof(struct scsi_device),
 			 GFP_KERNEL);
+
+	if (!ch->dt) {
+		kfree(buffer);
+		return -ENOMEM;
+	}
+
 	for (elem = 0; elem < ch->counts[CHET_DT]; elem++) {
 		id  = -1;
 		lun = 0;
@@ -571,16 +579,19 @@ ch_open(struct inode *inode, struct file *file)
 	scsi_changer *ch;
 	int minor = iminor(inode);
 
+	lock_kernel();
 	spin_lock(&ch_index_lock);
 	ch = idr_find(&ch_index_idr, minor);
 
 	if (NULL == ch || scsi_device_get(ch->device)) {
 		spin_unlock(&ch_index_lock);
+		unlock_kernel();
 		return -ENXIO;
 	}
 	spin_unlock(&ch_index_lock);
 
 	file->private_data = ch;
+	unlock_kernel();
 	return 0;
 }
 
@@ -910,9 +921,9 @@ static int ch_probe(struct device *dev)
 	ch->minor = minor;
 	sprintf(ch->name,"ch%d",ch->minor);
 
-	class_dev = device_create_drvdata(ch_sysfs_class, dev,
-					  MKDEV(SCSI_CHANGER_MAJOR, ch->minor),
-					  ch, "s%s", ch->name);
+	class_dev = device_create(ch_sysfs_class, dev,
+				  MKDEV(SCSI_CHANGER_MAJOR, ch->minor), ch,
+				  "s%s", ch->name);
 	if (IS_ERR(class_dev)) {
 		printk(KERN_WARNING "ch%d: device_create failed\n",
 		       ch->minor);
@@ -926,6 +937,7 @@ static int ch_probe(struct device *dev)
 	if (init)
 		ch_init_elem(ch);
 
+	dev_set_drvdata(dev, ch);
 	sdev_printk(KERN_INFO, sd, "Attached scsi changer %s\n", ch->name);
 
 	return 0;

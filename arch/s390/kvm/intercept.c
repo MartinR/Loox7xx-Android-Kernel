@@ -1,7 +1,7 @@
 /*
  * intercept.c - in-kernel handling for sie intercepts
  *
- * Copyright IBM Corp. 2008
+ * Copyright IBM Corp. 2008,2009
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License (version 2 only)
@@ -20,7 +20,7 @@
 #include "kvm-s390.h"
 #include "gaccess.h"
 
-static int handle_lctg(struct kvm_vcpu *vcpu)
+static int handle_lctlg(struct kvm_vcpu *vcpu)
 {
 	int reg1 = (vcpu->arch.sie_block->ipa & 0x00f0) >> 4;
 	int reg3 = vcpu->arch.sie_block->ipa & 0x000f;
@@ -30,7 +30,7 @@ static int handle_lctg(struct kvm_vcpu *vcpu)
 	u64 useraddr;
 	int reg, rc;
 
-	vcpu->stat.instruction_lctg++;
+	vcpu->stat.instruction_lctlg++;
 	if ((vcpu->arch.sie_block->ipb & 0xff) != 0x2f)
 		return -ENOTSUPP;
 
@@ -38,9 +38,12 @@ static int handle_lctg(struct kvm_vcpu *vcpu)
 	if (base2)
 		useraddr += vcpu->arch.guest_gprs[base2];
 
+	if (useraddr & 7)
+		return kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION);
+
 	reg = reg1;
 
-	VCPU_EVENT(vcpu, 5, "lctg r1:%x, r3:%x,b2:%x,d2:%x", reg1, reg3, base2,
+	VCPU_EVENT(vcpu, 5, "lctlg r1:%x, r3:%x,b2:%x,d2:%x", reg1, reg3, base2,
 		   disp2);
 
 	do {
@@ -74,6 +77,9 @@ static int handle_lctl(struct kvm_vcpu *vcpu)
 	if (base2)
 		useraddr += vcpu->arch.guest_gprs[base2];
 
+	if (useraddr & 3)
+		return kvm_s390_inject_program_int(vcpu, PGM_SPECIFICATION);
+
 	VCPU_EVENT(vcpu, 5, "lctl r1:%x, r3:%x,b2:%x,d2:%x", reg1, reg3, base2,
 		   disp2);
 
@@ -97,9 +103,9 @@ static int handle_lctl(struct kvm_vcpu *vcpu)
 static intercept_handler_t instruction_handlers[256] = {
 	[0x83] = kvm_s390_handle_diag,
 	[0xae] = kvm_s390_handle_sigp,
-	[0xb2] = kvm_s390_handle_priv,
+	[0xb2] = kvm_s390_handle_b2,
 	[0xb7] = handle_lctl,
-	[0xeb] = handle_lctg,
+	[0xeb] = handle_lctlg,
 };
 
 static int handle_noop(struct kvm_vcpu *vcpu)
@@ -122,7 +128,7 @@ static int handle_noop(struct kvm_vcpu *vcpu)
 
 static int handle_stop(struct kvm_vcpu *vcpu)
 {
-	int rc;
+	int rc = 0;
 
 	vcpu->stat.exit_stop_request++;
 	atomic_clear_mask(CPUSTAT_RUNNING, &vcpu->arch.sie_block->cpuflags);
@@ -135,12 +141,18 @@ static int handle_stop(struct kvm_vcpu *vcpu)
 			rc = -ENOTSUPP;
 	}
 
+	if (vcpu->arch.local_int.action_bits & ACTION_RELOADVCPU_ON_STOP) {
+		vcpu->arch.local_int.action_bits &= ~ACTION_RELOADVCPU_ON_STOP;
+		rc = SIE_INTERCEPT_RERUNVCPU;
+		vcpu->run->exit_reason = KVM_EXIT_INTR;
+	}
+
 	if (vcpu->arch.local_int.action_bits & ACTION_STOP_ON_STOP) {
 		vcpu->arch.local_int.action_bits &= ~ACTION_STOP_ON_STOP;
 		VCPU_EVENT(vcpu, 3, "%s", "cpu stopped");
 		rc = -ENOTSUPP;
-	} else
-		rc = 0;
+	}
+
 	spin_unlock_bh(&vcpu->arch.local_int.lock);
 	return rc;
 }
@@ -148,17 +160,25 @@ static int handle_stop(struct kvm_vcpu *vcpu)
 static int handle_validity(struct kvm_vcpu *vcpu)
 {
 	int viwhy = vcpu->arch.sie_block->ipb >> 16;
+	int rc;
+
 	vcpu->stat.exit_validity++;
-	if (viwhy == 0x37) {
-		fault_in_pages_writeable((char __user *)
-					 vcpu->kvm->arch.guest_origin +
-					 vcpu->arch.sie_block->prefix,
-					 PAGE_SIZE);
-		return 0;
-	}
-	VCPU_EVENT(vcpu, 2, "unhandled validity intercept code %d",
-		   viwhy);
-	return -ENOTSUPP;
+	if ((viwhy == 0x37) && (vcpu->arch.sie_block->prefix
+		<= kvm_s390_vcpu_get_memsize(vcpu) - 2*PAGE_SIZE)) {
+		rc = fault_in_pages_writeable((char __user *)
+			 vcpu->arch.sie_block->gmsor +
+			 vcpu->arch.sie_block->prefix,
+			 2*PAGE_SIZE);
+		if (rc)
+			/* user will receive sigsegv, exit to user */
+			rc = -ENOTSUPP;
+	} else
+		rc = -ENOTSUPP;
+
+	if (rc)
+		VCPU_EVENT(vcpu, 2, "unhandled validity intercept code %d",
+			   viwhy);
+	return rc;
 }
 
 static int handle_instruction(struct kvm_vcpu *vcpu)

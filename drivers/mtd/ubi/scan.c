@@ -19,9 +19,9 @@
  */
 
 /*
- * UBI scanning unit.
+ * UBI scanning sub-system.
  *
- * This unit is responsible for scanning the flash media, checking UBI
+ * This sub-system is responsible for scanning the flash media, checking UBI
  * headers and providing complete information about the UBI flash image.
  *
  * The scanning information is represented by a &struct ubi_scan_info' object.
@@ -42,7 +42,7 @@
 
 #include <linux/err.h>
 #include <linux/crc32.h>
-#include <asm/div64.h>
+#include <linux/math64.h>
 #include "ubi.h"
 
 #ifdef CONFIG_MTD_UBI_DEBUG_PARANOID
@@ -75,9 +75,10 @@ static int add_to_list(struct ubi_scan_info *si, int pnum, int ec,
 		dbg_bld("add to free: PEB %d, EC %d", pnum, ec);
 	else if (list == &si->erase)
 		dbg_bld("add to erase: PEB %d, EC %d", pnum, ec);
-	else if (list == &si->corr)
+	else if (list == &si->corr) {
 		dbg_bld("add to corrupted: PEB %d, EC %d", pnum, ec);
-	else if (list == &si->alien)
+		si->corr_count += 1;
+	} else if (list == &si->alien)
 		dbg_bld("add to alien: PEB %d, EC %d", pnum, ec);
 	else
 		BUG();
@@ -93,8 +94,7 @@ static int add_to_list(struct ubi_scan_info *si, int pnum, int ec,
 }
 
 /**
- * validate_vid_hdr - check that volume identifier header is correct and
- * consistent.
+ * validate_vid_hdr - check volume identifier header.
  * @vid_hdr: the volume identifier header to check
  * @sv: information about the volume this logical eraseblock belongs to
  * @pnum: physical eraseblock number the VID header came from
@@ -103,7 +103,7 @@ static int add_to_list(struct ubi_scan_info *si, int pnum, int ec,
  * non-zero if an inconsistency was found and zero if not.
  *
  * Note, UBI does sanity check of everything it reads from the flash media.
- * Most of the checks are done in the I/O unit. Here we check that the
+ * Most of the checks are done in the I/O sub-system. Here we check that the
  * information in the VID header is consistent to the information in other VID
  * headers of the same volume.
  */
@@ -247,45 +247,21 @@ static int compare_lebs(struct ubi_device *ubi, const struct ubi_scan_leb *seb,
 	struct ubi_vid_hdr *vh = NULL;
 	unsigned long long sqnum2 = be64_to_cpu(vid_hdr->sqnum);
 
-	if (seb->sqnum == 0 && sqnum2 == 0) {
-		long long abs, v1 = seb->leb_ver, v2 = be32_to_cpu(vid_hdr->leb_ver);
-
+	if (sqnum2 == seb->sqnum) {
 		/*
-		 * UBI constantly increases the logical eraseblock version
-		 * number and it can overflow. Thus, we have to bear in mind
-		 * that versions that are close to %0xFFFFFFFF are less then
-		 * versions that are close to %0.
-		 *
-		 * The UBI WL unit guarantees that the number of pending tasks
-		 * is not greater then %0x7FFFFFFF. So, if the difference
-		 * between any two versions is greater or equivalent to
-		 * %0x7FFFFFFF, there was an overflow and the logical
-		 * eraseblock with lower version is actually newer then the one
-		 * with higher version.
-		 *
-		 * FIXME: but this is anyway obsolete and will be removed at
-		 * some point.
+		 * This must be a really ancient UBI image which has been
+		 * created before sequence numbers support has been added. At
+		 * that times we used 32-bit LEB versions stored in logical
+		 * eraseblocks. That was before UBI got into mainline. We do not
+		 * support these images anymore. Well, those images will work
+		 * still work, but only if no unclean reboots happened.
 		 */
-		dbg_bld("using old crappy leb_ver stuff");
+		ubi_err("unsupported on-flash UBI format\n");
+		return -EINVAL;
+	}
 
-		if (v1 == v2) {
-			ubi_err("PEB %d and PEB %d have the same version %lld",
-				seb->pnum, pnum, v1);
-			return -EINVAL;
-		}
-
-		abs = v1 - v2;
-		if (abs < 0)
-			abs = -abs;
-
-		if (abs < 0x7FFFFFFF)
-			/* Non-overflow situation */
-			second_is_newer = (v2 > v1);
-		else
-			second_is_newer = (v2 < v1);
-	} else
-		/* Obviously the LEB with lower sequence counter is older */
-		second_is_newer = sqnum2 > seb->sqnum;
+	/* Obviously the LEB with lower sequence counter is older */
+	second_is_newer = !!(sqnum2 > seb->sqnum);
 
 	/*
 	 * Now we know which copy is newer. If the copy flag of the PEB with
@@ -293,7 +269,7 @@ static int compare_lebs(struct ubi_device *ubi, const struct ubi_scan_leb *seb,
 	 * check data CRC. For the second PEB we already have the VID header,
 	 * for the first one - we'll need to re-read it from flash.
 	 *
-	 * FIXME: this may be optimized so that we wouldn't read twice.
+	 * Note: this may be optimized so that we wouldn't read twice.
 	 */
 
 	if (second_is_newer) {
@@ -345,7 +321,7 @@ static int compare_lebs(struct ubi_device *ubi, const struct ubi_scan_leb *seb,
 	}
 
 	err = ubi_io_read_data(ubi, buf, pnum, 0, len);
-	if (err && err != UBI_IO_BITFLIPS)
+	if (err && err != UBI_IO_BITFLIPS && err != -EBADMSG)
 		goto out_free_buf;
 
 	data_crc = be32_to_cpu(vid_hdr->data_crc);
@@ -379,8 +355,7 @@ out_free_vidh:
 }
 
 /**
- * ubi_scan_add_used - add information about a physical eraseblock to the
- * scanning information.
+ * ubi_scan_add_used - add physical eraseblock to the scanning information.
  * @ubi: UBI device description object
  * @si: scanning information
  * @pnum: the physical eraseblock number
@@ -400,7 +375,6 @@ int ubi_scan_add_used(struct ubi_device *ubi, struct ubi_scan_info *si,
 		      int bitflips)
 {
 	int err, vol_id, lnum;
-	uint32_t leb_ver;
 	unsigned long long sqnum;
 	struct ubi_scan_volume *sv;
 	struct ubi_scan_leb *seb;
@@ -409,13 +383,12 @@ int ubi_scan_add_used(struct ubi_device *ubi, struct ubi_scan_info *si,
 	vol_id = be32_to_cpu(vid_hdr->vol_id);
 	lnum = be32_to_cpu(vid_hdr->lnum);
 	sqnum = be64_to_cpu(vid_hdr->sqnum);
-	leb_ver = be32_to_cpu(vid_hdr->leb_ver);
 
-	dbg_bld("PEB %d, LEB %d:%d, EC %d, sqnum %llu, ver %u, bitflips %d",
-		pnum, vol_id, lnum, ec, sqnum, leb_ver, bitflips);
+	dbg_bld("PEB %d, LEB %d:%d, EC %d, sqnum %llu, bitflips %d",
+		pnum, vol_id, lnum, ec, sqnum, bitflips);
 
 	sv = add_volume(si, vol_id, pnum, vid_hdr);
-	if (IS_ERR(sv) < 0)
+	if (IS_ERR(sv))
 		return PTR_ERR(sv);
 
 	if (si->max_sqnum < sqnum)
@@ -445,25 +418,20 @@ int ubi_scan_add_used(struct ubi_device *ubi, struct ubi_scan_info *si,
 		 */
 
 		dbg_bld("this LEB already exists: PEB %d, sqnum %llu, "
-			"LEB ver %u, EC %d", seb->pnum, seb->sqnum,
-			seb->leb_ver, seb->ec);
-
-		/*
-		 * Make sure that the logical eraseblocks have different
-		 * versions. Otherwise the image is bad.
-		 */
-		if (seb->leb_ver == leb_ver && leb_ver != 0) {
-			ubi_err("two LEBs with same version %u", leb_ver);
-			ubi_dbg_dump_seb(seb, 0);
-			ubi_dbg_dump_vid_hdr(vid_hdr);
-			return -EINVAL;
-		}
+			"EC %d", seb->pnum, seb->sqnum, seb->ec);
 
 		/*
 		 * Make sure that the logical eraseblocks have different
 		 * sequence numbers. Otherwise the image is bad.
 		 *
-		 * FIXME: remove 'sqnum != 0' check when leb_ver is removed.
+		 * However, if the sequence number is zero, we assume it must
+		 * be an ancient UBI image from the era when UBI did not have
+		 * sequence numbers. We still can attach these images, unless
+		 * there is a need to distinguish between old and new
+		 * eraseblocks, in which case we'll refuse the image in
+		 * 'compare_lebs()'. In other words, we attach old clean
+		 * images, but refuse attaching old images with duplicated
+		 * logical eraseblocks because there was an unclean reboot.
 		 */
 		if (seb->sqnum == sqnum && sqnum != 0) {
 			ubi_err("two LEBs with same sequence number %llu",
@@ -503,7 +471,6 @@ int ubi_scan_add_used(struct ubi_device *ubi, struct ubi_scan_info *si,
 			seb->pnum = pnum;
 			seb->scrub = ((cmp_res & 2) || bitflips);
 			seb->sqnum = sqnum;
-			seb->leb_ver = leb_ver;
 
 			if (sv->highest_lnum == lnum)
 				sv->last_data_size =
@@ -512,7 +479,7 @@ int ubi_scan_add_used(struct ubi_device *ubi, struct ubi_scan_info *si,
 			return 0;
 		} else {
 			/*
-			 * This logical eraseblock is older then the one found
+			 * This logical eraseblock is older than the one found
 			 * previously.
 			 */
 			if (cmp_res & 4)
@@ -540,7 +507,6 @@ int ubi_scan_add_used(struct ubi_device *ubi, struct ubi_scan_info *si,
 	seb->lnum = lnum;
 	seb->sqnum = sqnum;
 	seb->scrub = bitflips;
-	seb->leb_ver = leb_ver;
 
 	if (sv->highest_lnum <= lnum) {
 		sv->highest_lnum = lnum;
@@ -554,8 +520,7 @@ int ubi_scan_add_used(struct ubi_device *ubi, struct ubi_scan_info *si,
 }
 
 /**
- * ubi_scan_find_sv - find information about a particular volume in the
- * scanning information.
+ * ubi_scan_find_sv - find volume in the scanning information.
  * @si: scanning information
  * @vol_id: the requested volume ID
  *
@@ -584,8 +549,7 @@ struct ubi_scan_volume *ubi_scan_find_sv(const struct ubi_scan_info *si,
 }
 
 /**
- * ubi_scan_find_seb - find information about a particular logical
- * eraseblock in the volume scanning information.
+ * ubi_scan_find_seb - find LEB in the volume scanning information.
  * @sv: a pointer to the volume scanning information
  * @lnum: the requested logical eraseblock
  *
@@ -645,9 +609,9 @@ void ubi_scan_rm_volume(struct ubi_scan_info *si, struct ubi_scan_volume *sv)
  *
  * This function erases physical eraseblock 'pnum', and writes the erase
  * counter header to it. This function should only be used on UBI device
- * initialization stages, when the EBA unit had not been yet initialized. This
- * function returns zero in case of success and a negative error code in case
- * of failure.
+ * initialization stages, when the EBA sub-system had not been yet initialized.
+ * This function returns zero in case of success and a negative error code in
+ * case of failure.
  */
 int ubi_scan_erase_peb(struct ubi_device *ubi, const struct ubi_scan_info *si,
 		       int pnum, int ec)
@@ -687,9 +651,10 @@ out_free:
  * @si: scanning information
  *
  * This function returns a free physical eraseblock. It is supposed to be
- * called on the UBI initialization stages when the wear-leveling unit is not
- * initialized yet. This function picks a physical eraseblocks from one of the
- * lists, writes the EC header if it is needed, and removes it from the list.
+ * called on the UBI initialization stages when the wear-leveling sub-system is
+ * not initialized yet. This function picks a physical eraseblocks from one of
+ * the lists, writes the EC header if it is needed, and removes it from the
+ * list.
  *
  * This function returns scanning physical eraseblock information in case of
  * success and an error code in case of failure.
@@ -742,8 +707,7 @@ struct ubi_scan_leb *ubi_scan_get_free_peb(struct ubi_device *ubi,
 }
 
 /**
- * process_eb - read UBI headers, check them and add corresponding data
- * to the scanning information.
+ * process_eb - read, check UBI headers, and add them to scanning information.
  * @ubi: UBI device description object
  * @si: scanning information
  * @pnum: the physical eraseblock number
@@ -751,7 +715,8 @@ struct ubi_scan_leb *ubi_scan_get_free_peb(struct ubi_device *ubi,
  * This function returns a zero if the physical eraseblock was successfully
  * handled and a negative error code in case of failure.
  */
-static int process_eb(struct ubi_device *ubi, struct ubi_scan_info *si, int pnum)
+static int process_eb(struct ubi_device *ubi, struct ubi_scan_info *si,
+		      int pnum)
 {
 	long long uninitialized_var(ec);
 	int err, bitflips = 0, vol_id, ec_corr = 0;
@@ -764,8 +729,9 @@ static int process_eb(struct ubi_device *ubi, struct ubi_scan_info *si, int pnum
 		return err;
 	else if (err) {
 		/*
-		 * FIXME: this is actually duty of the I/O unit to initialize
-		 * this, but MTD does not provide enough information.
+		 * FIXME: this is actually duty of the I/O sub-system to
+		 * initialize this, but MTD does not provide enough
+		 * information.
 		 */
 		si->bad_peb_count += 1;
 		return 0;
@@ -792,6 +758,8 @@ static int process_eb(struct ubi_device *ubi, struct ubi_scan_info *si, int pnum
 	si->is_empty = 0;
 
 	if (!ec_corr) {
+		int image_seq;
+
 		/* Make sure UBI version is OK */
 		if (ech->version != UBI_VERSION) {
 			ubi_err("this UBI version is %d, image version is %d",
@@ -810,6 +778,28 @@ static int process_eb(struct ubi_device *ubi, struct ubi_scan_info *si, int pnum
 			 */
 			ubi_err("erase counter overflow, max is %d",
 				UBI_MAX_ERASECOUNTER);
+			ubi_dbg_dump_ec_hdr(ech);
+			return -EINVAL;
+		}
+
+		/*
+		 * Make sure that all PEBs have the same image sequence number.
+		 * This allows us to detect situations when users flash UBI
+		 * images incorrectly, so that the flash has the new UBI image
+		 * and leftovers from the old one. This feature was added
+		 * relatively recently, and the sequence number was always
+		 * zero, because old UBI implementations always set it to zero.
+		 * For this reasons, we do not panic if some PEBs have zero
+		 * sequence number, while other PEBs have non-zero sequence
+		 * number.
+		 */
+		image_seq = be32_to_cpu(ech->image_seq);
+		if (!ubi->image_seq && image_seq)
+			ubi->image_seq = image_seq;
+		if (ubi->image_seq && image_seq &&
+		    ubi->image_seq != image_seq) {
+			ubi_err("bad image sequence number %d in PEB %d, "
+				"expected %d", image_seq, pnum, ubi->image_seq);
 			ubi_dbg_dump_ec_hdr(ech);
 			return -EINVAL;
 		}
@@ -874,7 +864,9 @@ static int process_eb(struct ubi_device *ubi, struct ubi_scan_info *si, int pnum
 		}
 	}
 
-	/* Both UBI headers seem to be fine */
+	if (ec_corr)
+		ubi_warn("valid VID header but corrupted EC header at PEB %d",
+			 pnum);
 	err = ubi_scan_add_used(ubi, si, pnum, ec, vidh, bitflips);
 	if (err)
 		return err;
@@ -930,7 +922,7 @@ struct ubi_scan_info *ubi_scan(struct ubi_device *ubi)
 	for (pnum = 0; pnum < ubi->peb_count; pnum++) {
 		cond_resched();
 
-		dbg_msg("process PEB %d", pnum);
+		dbg_gen("process PEB %d", pnum);
 		err = process_eb(ubi, si, pnum);
 		if (err < 0)
 			goto out_vidh;
@@ -939,13 +931,24 @@ struct ubi_scan_info *ubi_scan(struct ubi_device *ubi)
 	dbg_msg("scanning is finished");
 
 	/* Calculate mean erase counter */
-	if (si->ec_count) {
-		do_div(si->ec_sum, si->ec_count);
-		si->mean_ec = si->ec_sum;
-	}
+	if (si->ec_count)
+		si->mean_ec = div_u64(si->ec_sum, si->ec_count);
 
 	if (si->is_empty)
 		ubi_msg("empty MTD device detected");
+
+	/*
+	 * Few corrupted PEBs are not a problem and may be just a result of
+	 * unclean reboots. However, many of them may indicate some problems
+	 * with the flash HW or driver. Print a warning in this case.
+	 */
+	if (si->corr_count >= 8 || si->corr_count >= ubi->peb_count / 4) {
+		ubi_warn("%d PEBs are corrupted", si->corr_count);
+		printk(KERN_WARNING "corrupted PEBs are:");
+		list_for_each_entry(seb, &si->corr, u.list)
+			printk(KERN_CONT " %d", seb->pnum);
+		printk(KERN_CONT "\n");
+	}
 
 	/*
 	 * In case of unknown erase counter we use the mean erase counter
@@ -1079,8 +1082,7 @@ void ubi_scan_destroy_si(struct ubi_scan_info *si)
 #ifdef CONFIG_MTD_UBI_DEBUG_PARANOID
 
 /**
- * paranoid_check_si - check if the scanning information is correct and
- * consistent.
+ * paranoid_check_si - check the scanning information.
  * @ubi: UBI device description object
  * @si: scanning information
  *
@@ -1265,11 +1267,6 @@ static int paranoid_check_si(struct ubi_device *ubi, struct ubi_scan_info *si)
 				ubi_err("bad data_pad %d", sv->data_pad);
 				goto bad_vid_hdr;
 			}
-
-			if (seb->leb_ver != be32_to_cpu(vidh->leb_ver)) {
-				ubi_err("bad leb_ver %u", seb->leb_ver);
-				goto bad_vid_hdr;
-			}
 		}
 
 		if (!last_seb)
@@ -1299,8 +1296,7 @@ static int paranoid_check_si(struct ubi_device *ubi, struct ubi_scan_info *si)
 		if (err < 0) {
 			kfree(buf);
 			return err;
-		}
-		else if (err)
+		} else if (err)
 			buf[pnum] = 1;
 	}
 

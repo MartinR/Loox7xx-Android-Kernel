@@ -74,7 +74,7 @@
 #define IOC_IO_ExcpStat_V		0x8000000000000000ul
 #define IOC_IO_ExcpStat_SPF_Mask	0x6000000000000000ul
 #define IOC_IO_ExcpStat_SPF_S		0x6000000000000000ul
-#define IOC_IO_ExcpStat_SPF_P		0x4000000000000000ul
+#define IOC_IO_ExcpStat_SPF_P		0x2000000000000000ul
 #define IOC_IO_ExcpStat_ADDR_Mask	0x00000007fffff000ul
 #define IOC_IO_ExcpStat_RW_Mask		0x0000000000000800ul
 #define IOC_IO_ExcpStat_IOID_Mask	0x00000000000007fful
@@ -99,16 +99,6 @@
 #define IOSTE_PS_64K		0x0000000000000003ul /*   - 64kB */
 #define IOSTE_PS_1M		0x0000000000000005ul /*   - 1MB  */
 #define IOSTE_PS_16M		0x0000000000000007ul /*   - 16MB */
-
-/* Page table entries */
-#define IOPTE_PP_W		0x8000000000000000ul /* protection: write */
-#define IOPTE_PP_R		0x4000000000000000ul /* protection: read */
-#define IOPTE_M			0x2000000000000000ul /* coherency required */
-#define IOPTE_SO_R		0x1000000000000000ul /* ordering: writes */
-#define IOPTE_SO_RW             0x1800000000000000ul /* ordering: r & w */
-#define IOPTE_RPN_Mask		0x07fffffffffff000ul /* RPN */
-#define IOPTE_H			0x0000000000000800ul /* cache hint */
-#define IOPTE_IOID_Mask		0x00000000000007fful /* ioid */
 
 
 /* IOMMU sizing */
@@ -150,8 +140,8 @@ static int cbe_nr_iommus;
 static void invalidate_tce_cache(struct cbe_iommu *iommu, unsigned long *pte,
 		long n_ptes)
 {
-	unsigned long __iomem *reg;
-	unsigned long val;
+	u64 __iomem *reg;
+	u64 val;
 	long n;
 
 	reg = iommu->xlate_regs + IOC_IOPT_CacheInvd;
@@ -172,8 +162,9 @@ static void invalidate_tce_cache(struct cbe_iommu *iommu, unsigned long *pte,
 	}
 }
 
-static void tce_build_cell(struct iommu_table *tbl, long index, long npages,
-		unsigned long uaddr, enum dma_data_direction direction)
+static int tce_build_cell(struct iommu_table *tbl, long index, long npages,
+		unsigned long uaddr, enum dma_data_direction direction,
+		struct dma_attrs *attrs)
 {
 	int i;
 	unsigned long *io_pte, base_pte;
@@ -192,17 +183,21 @@ static void tce_build_cell(struct iommu_table *tbl, long index, long npages,
 	 */
 	const unsigned long prot = 0xc48;
 	base_pte =
-		((prot << (52 + 4 * direction)) & (IOPTE_PP_W | IOPTE_PP_R))
-		| IOPTE_M | IOPTE_SO_RW | (window->ioid & IOPTE_IOID_Mask);
+		((prot << (52 + 4 * direction)) &
+		 (CBE_IOPTE_PP_W | CBE_IOPTE_PP_R)) |
+		CBE_IOPTE_M | CBE_IOPTE_SO_RW |
+		(window->ioid & CBE_IOPTE_IOID_Mask);
 #else
-	base_pte = IOPTE_PP_W | IOPTE_PP_R | IOPTE_M | IOPTE_SO_RW |
-		(window->ioid & IOPTE_IOID_Mask);
+	base_pte = CBE_IOPTE_PP_W | CBE_IOPTE_PP_R | CBE_IOPTE_M |
+		CBE_IOPTE_SO_RW | (window->ioid & CBE_IOPTE_IOID_Mask);
 #endif
+	if (unlikely(dma_get_attr(DMA_ATTR_WEAK_ORDERING, attrs)))
+		base_pte &= ~CBE_IOPTE_SO_RW;
 
 	io_pte = (unsigned long *)tbl->it_base + (index - tbl->it_offset);
 
 	for (i = 0; i < npages; i++, uaddr += IOMMU_PAGE_SIZE)
-		io_pte[i] = base_pte | (__pa(uaddr) & IOPTE_RPN_Mask);
+		io_pte[i] = base_pte | (__pa(uaddr) & CBE_IOPTE_RPN_Mask);
 
 	mb();
 
@@ -210,6 +205,7 @@ static void tce_build_cell(struct iommu_table *tbl, long index, long npages,
 
 	pr_debug("tce_build_cell(index=%lx,n=%lx,dir=%d,base_pte=%lx)\n",
 		 index, npages, direction, base_pte);
+	return 0;
 }
 
 static void tce_free_cell(struct iommu_table *tbl, long index, long npages)
@@ -227,8 +223,9 @@ static void tce_free_cell(struct iommu_table *tbl, long index, long npages)
 #else
 	/* spider bridge does PCI reads after freeing - insert a mapping
 	 * to a scratch page instead of an invalid entry */
-	pte = IOPTE_PP_R | IOPTE_M | IOPTE_SO_RW | __pa(window->iommu->pad_page)
-		| (window->ioid & IOPTE_IOID_Mask);
+	pte = CBE_IOPTE_PP_R | CBE_IOPTE_M | CBE_IOPTE_SO_RW |
+		__pa(window->iommu->pad_page) |
+		(window->ioid & CBE_IOPTE_IOID_Mask);
 #endif
 
 	io_pte = (unsigned long *)tbl->it_base + (index - tbl->it_offset);
@@ -243,17 +240,18 @@ static void tce_free_cell(struct iommu_table *tbl, long index, long npages)
 
 static irqreturn_t ioc_interrupt(int irq, void *data)
 {
-	unsigned long stat;
+	unsigned long stat, spf;
 	struct cbe_iommu *iommu = data;
 
 	stat = in_be64(iommu->xlate_regs + IOC_IO_ExcpStat);
+	spf = stat & IOC_IO_ExcpStat_SPF_Mask;
 
 	/* Might want to rate limit it */
 	printk(KERN_ERR "iommu: DMA exception 0x%016lx\n", stat);
 	printk(KERN_ERR "  V=%d, SPF=[%c%c], RW=%s, IOID=0x%04x\n",
 	       !!(stat & IOC_IO_ExcpStat_V),
-	       (stat & IOC_IO_ExcpStat_SPF_S) ? 'S' : ' ',
-	       (stat & IOC_IO_ExcpStat_SPF_P) ? 'P' : ' ',
+	       (spf == IOC_IO_ExcpStat_SPF_S) ? 'S' : ' ',
+	       (spf == IOC_IO_ExcpStat_SPF_P) ? 'P' : ' ',
 	       (stat & IOC_IO_ExcpStat_RW_Mask) ? "Read" : "Write",
 	       (unsigned int)(stat & IOC_IO_ExcpStat_IOID_Mask));
 	printk(KERN_ERR "  page=0x%016lx\n",
@@ -519,7 +517,7 @@ cell_iommu_setup_window(struct cbe_iommu *iommu, struct device_node *np,
 
 	__set_bit(0, window->table.it_map);
 	tce_build_cell(&window->table, window->table.it_offset, 1,
-		       (unsigned long)iommu->pad_page, DMA_TO_DEVICE);
+		       (unsigned long)iommu->pad_page, DMA_TO_DEVICE, NULL);
 	window->table.it_hint = window->table.it_blocksize;
 
 	return window;
@@ -538,9 +536,11 @@ static struct cbe_iommu *cell_iommu_for_node(int nid)
 static unsigned long cell_dma_direct_offset;
 
 static unsigned long dma_iommu_fixed_base;
-struct dma_mapping_ops dma_iommu_fixed_ops;
 
-static void cell_dma_dev_setup_iommu(struct device *dev)
+/* iommu_fixed_is_weak is set if booted with iommu_fixed=weak */
+static int iommu_fixed_is_weak;
+
+static struct iommu_table *cell_get_iommu_table(struct device *dev)
 {
 	struct iommu_window *window;
 	struct cbe_iommu *iommu;
@@ -550,31 +550,120 @@ static void cell_dma_dev_setup_iommu(struct device *dev)
 	 * node's iommu. We -might- do something smarter later though it may
 	 * never be necessary
 	 */
-	iommu = cell_iommu_for_node(archdata->numa_node);
+	iommu = cell_iommu_for_node(dev_to_node(dev));
 	if (iommu == NULL || list_empty(&iommu->windows)) {
 		printk(KERN_ERR "iommu: missing iommu for %s (node %d)\n",
 		       archdata->of_node ? archdata->of_node->full_name : "?",
-		       archdata->numa_node);
-		return;
+		       dev_to_node(dev));
+		return NULL;
 	}
 	window = list_entry(iommu->windows.next, struct iommu_window, list);
 
-	archdata->dma_data = &window->table;
+	return &window->table;
 }
+
+/* A coherent allocation implies strong ordering */
+
+static void *dma_fixed_alloc_coherent(struct device *dev, size_t size,
+				      dma_addr_t *dma_handle, gfp_t flag)
+{
+	if (iommu_fixed_is_weak)
+		return iommu_alloc_coherent(dev, cell_get_iommu_table(dev),
+					    size, dma_handle,
+					    device_to_mask(dev), flag,
+					    dev_to_node(dev));
+	else
+		return dma_direct_ops.alloc_coherent(dev, size, dma_handle,
+						     flag);
+}
+
+static void dma_fixed_free_coherent(struct device *dev, size_t size,
+				    void *vaddr, dma_addr_t dma_handle)
+{
+	if (iommu_fixed_is_weak)
+		iommu_free_coherent(cell_get_iommu_table(dev), size, vaddr,
+				    dma_handle);
+	else
+		dma_direct_ops.free_coherent(dev, size, vaddr, dma_handle);
+}
+
+static dma_addr_t dma_fixed_map_page(struct device *dev, struct page *page,
+				     unsigned long offset, size_t size,
+				     enum dma_data_direction direction,
+				     struct dma_attrs *attrs)
+{
+	if (iommu_fixed_is_weak == dma_get_attr(DMA_ATTR_WEAK_ORDERING, attrs))
+		return dma_direct_ops.map_page(dev, page, offset, size,
+					       direction, attrs);
+	else
+		return iommu_map_page(dev, cell_get_iommu_table(dev), page,
+				      offset, size, device_to_mask(dev),
+				      direction, attrs);
+}
+
+static void dma_fixed_unmap_page(struct device *dev, dma_addr_t dma_addr,
+				 size_t size, enum dma_data_direction direction,
+				 struct dma_attrs *attrs)
+{
+	if (iommu_fixed_is_weak == dma_get_attr(DMA_ATTR_WEAK_ORDERING, attrs))
+		dma_direct_ops.unmap_page(dev, dma_addr, size, direction,
+					  attrs);
+	else
+		iommu_unmap_page(cell_get_iommu_table(dev), dma_addr, size,
+				 direction, attrs);
+}
+
+static int dma_fixed_map_sg(struct device *dev, struct scatterlist *sg,
+			   int nents, enum dma_data_direction direction,
+			   struct dma_attrs *attrs)
+{
+	if (iommu_fixed_is_weak == dma_get_attr(DMA_ATTR_WEAK_ORDERING, attrs))
+		return dma_direct_ops.map_sg(dev, sg, nents, direction, attrs);
+	else
+		return iommu_map_sg(dev, cell_get_iommu_table(dev), sg, nents,
+				    device_to_mask(dev), direction, attrs);
+}
+
+static void dma_fixed_unmap_sg(struct device *dev, struct scatterlist *sg,
+			       int nents, enum dma_data_direction direction,
+			       struct dma_attrs *attrs)
+{
+	if (iommu_fixed_is_weak == dma_get_attr(DMA_ATTR_WEAK_ORDERING, attrs))
+		dma_direct_ops.unmap_sg(dev, sg, nents, direction, attrs);
+	else
+		iommu_unmap_sg(cell_get_iommu_table(dev), sg, nents, direction,
+			       attrs);
+}
+
+static int dma_fixed_dma_supported(struct device *dev, u64 mask)
+{
+	return mask == DMA_BIT_MASK(64);
+}
+
+static int dma_set_mask_and_switch(struct device *dev, u64 dma_mask);
+
+struct dma_map_ops dma_iommu_fixed_ops = {
+	.alloc_coherent = dma_fixed_alloc_coherent,
+	.free_coherent  = dma_fixed_free_coherent,
+	.map_sg         = dma_fixed_map_sg,
+	.unmap_sg       = dma_fixed_unmap_sg,
+	.dma_supported  = dma_fixed_dma_supported,
+	.set_dma_mask   = dma_set_mask_and_switch,
+	.map_page       = dma_fixed_map_page,
+	.unmap_page     = dma_fixed_unmap_page,
+};
 
 static void cell_dma_dev_setup_fixed(struct device *dev);
 
 static void cell_dma_dev_setup(struct device *dev)
 {
-	struct dev_archdata *archdata = &dev->archdata;
-
 	/* Order is important here, these are not mutually exclusive */
 	if (get_dma_ops(dev) == &dma_iommu_fixed_ops)
 		cell_dma_dev_setup_fixed(dev);
 	else if (get_pci_dma_ops() == &dma_iommu_ops)
-		cell_dma_dev_setup_iommu(dev);
+		set_iommu_table_base(dev, cell_get_iommu_table(dev));
 	else if (get_pci_dma_ops() == &dma_direct_ops)
-		archdata->dma_data = (void *)cell_dma_direct_offset;
+		set_dma_offset(dev, cell_dma_direct_offset);
 	else
 		BUG();
 }
@@ -758,7 +847,7 @@ static int __init cell_iommu_init_disabled(void)
 	 */
 	if (np && size < lmb_end_of_DRAM()) {
 		printk(KERN_WARNING "iommu: force-enabled, dma window"
-		       " (%ldMB) smaller than total memory (%ldMB)\n",
+		       " (%ldMB) smaller than total memory (%lldMB)\n",
 		       size >> 20, lmb_end_of_DRAM() >> 20);
 		return -ENODEV;
 	}
@@ -882,13 +971,12 @@ static int dma_set_mask_and_switch(struct device *dev, u64 dma_mask)
 
 static void cell_dma_dev_setup_fixed(struct device *dev)
 {
-	struct dev_archdata *archdata = &dev->archdata;
 	u64 addr;
 
 	addr = cell_iommu_get_fixed_address(dev) + dma_iommu_fixed_base;
-	archdata->dma_data = (void *)addr;
+	set_dma_offset(dev, addr);
 
-	dev_dbg(dev, "iommu: fixed addr = %lx\n", addr);
+	dev_dbg(dev, "iommu: fixed addr = %llx\n", addr);
 }
 
 static void insert_16M_pte(unsigned long addr, unsigned long *ptab,
@@ -903,7 +991,7 @@ static void insert_16M_pte(unsigned long addr, unsigned long *ptab,
 	pr_debug("iommu: addr %lx ptab %p segment %lx offset %lx\n",
 		  addr, ptab, segment, offset);
 
-	ptab[offset] = base_pte | (__pa(addr) & IOPTE_RPN_Mask);
+	ptab[offset] = base_pte | (__pa(addr) & CBE_IOPTE_RPN_Mask);
 }
 
 static void cell_iommu_setup_fixed_ptab(struct cbe_iommu *iommu,
@@ -918,8 +1006,15 @@ static void cell_iommu_setup_fixed_ptab(struct cbe_iommu *iommu,
 
 	pr_debug("iommu: mapping 0x%lx pages from 0x%lx\n", fsize, fbase);
 
-	base_pte = IOPTE_PP_W | IOPTE_PP_R | IOPTE_M | IOPTE_SO_RW
-		    | (cell_iommu_get_ioid(np) & IOPTE_IOID_Mask);
+	base_pte = CBE_IOPTE_PP_W | CBE_IOPTE_PP_R | CBE_IOPTE_M |
+		(cell_iommu_get_ioid(np) & CBE_IOPTE_IOID_Mask);
+
+	if (iommu_fixed_is_weak)
+		pr_info("IOMMU: Using weak ordering for fixed mapping\n");
+	else {
+		pr_info("IOMMU: Using strong ordering for fixed mapping\n");
+		base_pte |= CBE_IOPTE_SO_RW;
+	}
 
 	for (uaddr = 0; uaddr < fsize; uaddr += (1 << 24)) {
 		/* Don't touch the dynamic region */
@@ -949,10 +1044,7 @@ static int __init cell_iommu_fixed_mapping_init(void)
 	}
 
 	/* We must have dma-ranges properties for fixed mapping to work */
-	for (np = NULL; (np = of_find_all_nodes(np));) {
-		if (of_find_property(np, "dma-ranges", NULL))
-			break;
-	}
+	np = of_find_node_with_property(NULL, "dma-ranges");
 	of_node_put(np);
 
 	if (!np) {
@@ -1036,9 +1128,6 @@ static int __init cell_iommu_fixed_mapping_init(void)
 		cell_iommu_setup_window(iommu, np, dbase, dsize, 0);
 	}
 
-	dma_iommu_fixed_ops = dma_direct_ops;
-	dma_iommu_fixed_ops.set_dma_mask = dma_set_mask_and_switch;
-
 	dma_iommu_ops.set_dma_mask = dma_set_mask_and_switch;
 	set_pci_dma_ops(&dma_iommu_ops);
 
@@ -1049,8 +1138,22 @@ static int iommu_fixed_disabled;
 
 static int __init setup_iommu_fixed(char *str)
 {
+	struct device_node *pciep;
+
 	if (strcmp(str, "off") == 0)
 		iommu_fixed_disabled = 1;
+
+	/* If we can find a pcie-endpoint in the device tree assume that
+	 * we're on a triblade or a CAB so by default the fixed mapping
+	 * should be set to be weakly ordered; but only if the boot
+	 * option WASN'T set for strong ordering
+	 */
+	pciep = of_find_node_by_type(NULL, "pcie-endpoint");
+
+	if (strcmp(str, "weak") == 0 || (pciep && strcmp(str, "strong") != 0))
+		iommu_fixed_is_weak = 1;
+
+	of_node_put(pciep);
 
 	return 1;
 }

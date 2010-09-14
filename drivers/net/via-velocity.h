@@ -96,8 +96,8 @@
  * Bits in the CSM register
  */
 
-#define CSM_IPOK            0x40	//IP Checkusm validatiaon ok
-#define CSM_TUPOK           0x20	//TCP/UDP Checkusm validatiaon ok
+#define CSM_IPOK            0x40	//IP Checksum validation ok
+#define CSM_TUPOK           0x20	//TCP/UDP Checksum validation ok
 #define CSM_FRAG            0x10	//Fragment IP datagram
 #define CSM_IPKT            0x04	//Received an IP packet
 #define CSM_TCPKT           0x02	//Received a TCP packet
@@ -183,7 +183,7 @@ struct rdesc1 {
 };
 
 enum {
-	RX_INTEN = __constant_cpu_to_le16(0x8000)
+	RX_INTEN = cpu_to_le16(0x8000)
 };
 
 struct rx_desc {
@@ -210,7 +210,7 @@ struct tdesc1 {
 } __attribute__ ((__packed__));
 
 enum {
-	TD_QUEUE = __constant_cpu_to_le16(0x8000)
+	TD_QUEUE = cpu_to_le16(0x8000)
 };
 
 struct td_buf {
@@ -236,15 +236,13 @@ struct velocity_rd_info {
 
 struct velocity_td_info {
 	struct sk_buff *skb;
-	u8 *buf;
 	int nskb_dma;
 	dma_addr_t skb_dma[7];
-	dma_addr_t buf_dma;
 };
 
 enum  velocity_owner {
 	OWNED_BY_HOST = 0,
-	OWNED_BY_NIC = __constant_cpu_to_le16(0x8000)
+	OWNED_BY_NIC = cpu_to_le16(0x8000)
 };
 
 
@@ -821,7 +819,7 @@ enum  velocity_owner {
  *	Bits in the EECSR register
  */
 
-#define EECSR_EMBP          0x40	/* eeprom embeded programming */
+#define EECSR_EMBP          0x40	/* eeprom embedded programming */
 #define EECSR_RELOAD        0x20	/* eeprom content reload */
 #define EECSR_DPM           0x10	/* eeprom direct programming */
 #define EECSR_ECS           0x08	/* eeprom CS pin */
@@ -1383,7 +1381,7 @@ enum velocity_msg_level {
 #define ASSERT(x) { \
 	if (!(x)) { \
 		printk(KERN_ERR "assertion %s failed: file %s line %d\n", #x,\
-			__FUNCTION__, __LINE__);\
+			__func__, __LINE__);\
 		BUG(); \
 	}\
 }
@@ -1496,18 +1494,15 @@ struct velocity_opt {
 	u32 flags;
 };
 
+#define AVAIL_TD(p,q)   ((p)->options.numtx-((p)->tx.used[(q)]))
+
+#define GET_RD_BY_IDX(vptr, idx)   (vptr->rd_ring[idx])
+
 struct velocity_info {
 	struct list_head list;
 
 	struct pci_dev *pdev;
 	struct net_device *dev;
-	struct net_device_stats stats;
-
-	dma_addr_t rd_pool_dma;
-	dma_addr_t td_pool_dma[TX_QUEUE_NO];
-
-	dma_addr_t tx_bufs_dma;
-	u8 *tx_bufs;
 
 	struct vlan_group    *vlgrp;
 	u8 ip_addr[4];
@@ -1517,25 +1512,29 @@ struct velocity_info {
 	unsigned long memaddr;
 	unsigned long ioaddr;
 
-	u8 rev_id;
+	struct tx_info {
+		int numq;
 
-#define AVAIL_TD(p,q)   ((p)->options.numtx-((p)->td_used[(q)]))
+		/* FIXME: the locality of the data seems rather poor. */
+		int used[TX_QUEUE_NO];
+		int curr[TX_QUEUE_NO];
+		int tail[TX_QUEUE_NO];
+		struct tx_desc *rings[TX_QUEUE_NO];
+		struct velocity_td_info *infos[TX_QUEUE_NO];
+		dma_addr_t pool_dma[TX_QUEUE_NO];
+	} tx;
 
-	int num_txq;
+	struct rx_info {
+		int buf_sz;
 
-	volatile int td_used[TX_QUEUE_NO];
-	int td_curr[TX_QUEUE_NO];
-	int td_tail[TX_QUEUE_NO];
-	struct tx_desc *td_rings[TX_QUEUE_NO];
-	struct velocity_td_info *td_infos[TX_QUEUE_NO];
+		int dirty;
+		int curr;
+		u32 filled;
+		struct rx_desc *ring;
+		struct velocity_rd_info *info;	/* It's an array */
+		dma_addr_t pool_dma;
+	} rx;
 
-	int rd_curr;
-	int rd_dirty;
-	u32 rd_filled;
-	struct rx_desc *rd_ring;
-	struct velocity_rd_info *rd_info;	/* It's an array */
-
-#define GET_RD_BY_IDX(vptr, idx)   (vptr->rd_ring[idx])
 	u32 mib_counter[MAX_HW_MIB_COUNTER];
 	struct velocity_opt options;
 
@@ -1543,7 +1542,6 @@ struct velocity_info {
 
 	u32 flags;
 
-	int rx_buf_sz;
 	u32 mii_status;
 	u32 phy_id;
 	int multicast_limit;
@@ -1559,8 +1557,8 @@ struct velocity_info {
 	struct velocity_context context;
 
 	u32 ticks;
-	u32 rx_bytes;
 
+	u8 rev_id;
 };
 
 /**

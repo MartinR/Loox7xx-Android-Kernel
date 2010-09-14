@@ -32,6 +32,7 @@
 #include <linux/bitops.h>
 #include <linux/fs.h>
 #include <linux/platform_device.h>
+#include <linux/of_device.h>
 
 #include <asm/irq.h>
 #include <asm/uaccess.h>
@@ -41,10 +42,6 @@
 #include <asm/pgtable.h>
 #include <asm/mpc8xx.h>
 #include <asm/cpm1.h>
-#endif
-
-#ifdef CONFIG_PPC_CPM_NEW_BINDING
-#include <asm/of_device.h>
 #endif
 
 #include "fs_enet.h"
@@ -99,7 +96,6 @@ static int whack_reset(fec_t __iomem *fecp)
 
 static int do_pd_setup(struct fs_enet_private *fep)
 {
-#ifdef CONFIG_PPC_CPM_NEW_BINDING
 	struct of_device *ofdev = to_of_device(fep->dev);
 
 	fep->interrupt = of_irq_to_resource(ofdev->node, 0, NULL);
@@ -111,23 +107,6 @@ static int do_pd_setup(struct fs_enet_private *fep)
 		return -EINVAL;
 
 	return 0;
-#else
-	struct platform_device *pdev = to_platform_device(fep->dev);
-	struct resource	*r;
-
-	/* Fill out IRQ field */
-	fep->interrupt = platform_get_irq_byname(pdev,"interrupt");
-	if (fep->interrupt < 0)
-		return -EINVAL;
-
-	r = platform_get_resource_byname(pdev, IORESOURCE_MEM, "regs");
-	fep->fec.fecp = ioremap(r->start, r->end - r->start + 1);
-
-	if(fep->fec.fecp == NULL)
-		return -EINVAL;
-
-	return 0;
-#endif
 }
 
 #define FEC_NAPI_RX_EVENT_MSK	(FEC_ENET_RXF | FEC_ENET_RXB)
@@ -266,10 +245,6 @@ static void set_multicast_list(struct net_device *dev)
 
 static void restart(struct net_device *dev)
 {
-#ifdef CONFIG_DUET
-	immap_t *immap = fs_enet_immap;
-	u32 cptr;
-#endif
 	struct fs_enet_private *fep = netdev_priv(dev);
 	fec_t __iomem *fecp = fep->fec.fecp;
 	const struct fs_platform_info *fpi = fep->fpi;
@@ -334,41 +309,7 @@ static void restart(struct net_device *dev)
 	 * Clear any outstanding interrupt.
 	 */
 	FW(fecp, ievent, 0xffc0);
-#ifndef CONFIG_PPC_MERGE
-	FW(fecp, ivec, (fep->interrupt / 2) << 29);
-#else
 	FW(fecp, ivec, (virq_to_hw(fep->interrupt) / 2) << 29);
-#endif
-
-	/*
-	 * adjust to speed (only for DUET & RMII)
-	 */
-#ifdef CONFIG_DUET
-	if (fpi->use_rmii) {
-		cptr = in_be32(&immap->im_cpm.cp_cptr);
-		switch (fs_get_fec_index(fpi->fs_no)) {
-		case 0:
-			cptr |= 0x100;
-			if (fep->speed == 10)
-				cptr |= 0x0000010;
-			else if (fep->speed == 100)
-				cptr &= ~0x0000010;
-			break;
-		case 1:
-			cptr |= 0x80;
-			if (fep->speed == 10)
-				cptr |= 0x0000008;
-			else if (fep->speed == 100)
-				cptr &= ~0x0000008;
-			break;
-		default:
-			BUG();	/* should never happen */
-			break;
-		}
-		out_be32(&immap->im_cpm.cp_cptr, cptr);
-	}
-#endif
-
 
 	FW(fecp, r_cntrl, FEC_RCNTRL_MII_MODE);	/* MII enable */
 	/*
@@ -432,30 +373,6 @@ static void stop(struct net_device *dev)
 		FW(fecp, ievent, FEC_ENET_MII);
 		FW(fecp, mii_speed, feci->mii_speed);
 	}
-}
-
-static void pre_request_irq(struct net_device *dev, int irq)
-{
-#ifndef CONFIG_PPC_MERGE
-	immap_t *immap = fs_enet_immap;
-	u32 siel;
-
-	/* SIU interrupt */
-	if (irq >= SIU_IRQ0 && irq < SIU_LEVEL7) {
-
-		siel = in_be32(&immap->im_siu_conf.sc_siel);
-		if ((irq & 1) == 0)
-			siel |= (0x80000000 >> irq);
-		else
-			siel &= ~(0x80000000 >> (irq & ~1));
-		out_be32(&immap->im_siu_conf.sc_siel, siel);
-	}
-#endif
-}
-
-static void post_free_irq(struct net_device *dev, int irq)
-{
-	/* nothing */
 }
 
 static void napi_clear_rx_event(struct net_device *dev)
@@ -550,8 +467,6 @@ const struct fs_ops fs_fec_ops = {
 	.set_multicast_list	= set_multicast_list,
 	.restart		= restart,
 	.stop			= stop,
-	.pre_request_irq	= pre_request_irq,
-	.post_free_irq		= post_free_irq,
 	.napi_clear_rx_event	= napi_clear_rx_event,
 	.napi_enable_rx		= napi_enable_rx,
 	.napi_disable_rx	= napi_disable_rx,

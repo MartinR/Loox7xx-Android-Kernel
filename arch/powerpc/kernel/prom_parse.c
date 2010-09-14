@@ -128,31 +128,6 @@ static void of_bus_pci_count_cells(struct device_node *np,
 		*sizec = 2;
 }
 
-static u64 of_bus_pci_map(u32 *addr, const u32 *range, int na, int ns, int pna)
-{
-	u64 cp, s, da;
-
-	/* Check address type match */
-	if ((addr[0] ^ range[0]) & 0x03000000)
-		return OF_BAD_ADDR;
-
-	/* Read address values, skipping high cell */
-	cp = of_read_number(range + 1, na - 1);
-	s  = of_read_number(range + na + pna, ns);
-	da = of_read_number(addr + 1, na - 1);
-
-	DBG("OF: PCI map, cp="PRu64", s="PRu64", da="PRu64"\n", cp, s, da);
-
-	if (da < cp || da >= (cp + s))
-		return OF_BAD_ADDR;
-	return da - cp;
-}
-
-static int of_bus_pci_translate(u32 *addr, u64 offset, int na)
-{
-	return of_bus_default_translate(addr + 1, offset, na - 1);
-}
-
 static unsigned int of_bus_pci_get_flags(const u32 *addr)
 {
 	unsigned int flags = 0;
@@ -170,6 +145,35 @@ static unsigned int of_bus_pci_get_flags(const u32 *addr)
 	if (w & 0x40000000)
 		flags |= IORESOURCE_PREFETCH;
 	return flags;
+}
+
+static u64 of_bus_pci_map(u32 *addr, const u32 *range, int na, int ns, int pna)
+{
+	u64 cp, s, da;
+	unsigned int af, rf;
+
+	af = of_bus_pci_get_flags(addr);
+	rf = of_bus_pci_get_flags(range);
+
+	/* Check address type match */
+	if ((af ^ rf) & (IORESOURCE_MEM | IORESOURCE_IO))
+		return OF_BAD_ADDR;
+
+	/* Read address values, skipping high cell */
+	cp = of_read_number(range + 1, na - 1);
+	s  = of_read_number(range + na + pna, ns);
+	da = of_read_number(addr + 1, na - 1);
+
+	DBG("OF: PCI map, cp="PRu64", s="PRu64", da="PRu64"\n", cp, s, da);
+
+	if (da < cp || da >= (cp + s))
+		return OF_BAD_ADDR;
+	return da - cp;
+}
+
+static int of_bus_pci_translate(u32 *addr, u64 offset, int na)
+{
+	return of_bus_default_translate(addr + 1, offset, na - 1);
 }
 
 const u32 *of_get_pci_address(struct device_node *dev, int bar_no, u64 *size,
@@ -228,11 +232,6 @@ int of_pci_address_to_resource(struct device_node *dev, int bar,
 }
 EXPORT_SYMBOL_GPL(of_pci_address_to_resource);
 
-static u8 of_irq_pci_swizzle(u8 slot, u8 pin)
-{
-	return (((pin - 1) + slot) % 4) + 1;
-}
-
 int of_irq_map_pci(struct pci_dev *pdev, struct of_irq *out_irq)
 {
 	struct device_node *dn, *ppnode;
@@ -246,8 +245,11 @@ int of_irq_map_pci(struct pci_dev *pdev, struct of_irq *out_irq)
 	 * parsing
 	 */
 	dn = pci_device_to_OF_node(pdev);
-	if (dn)
-		return of_irq_map_one(dn, 0, out_irq);
+	if (dn) {
+		rc = of_irq_map_one(dn, 0, out_irq);
+		if (!rc)
+			return rc;
+	}
 
 	/* Ok, we don't, time to have fun. Let's start by building up an
 	 * interrupt spec.  we assume #interrupt-cells is 1, which is standard
@@ -299,7 +301,7 @@ int of_irq_map_pci(struct pci_dev *pdev, struct of_irq *out_irq)
 		/* We can only get here if we hit a P2P bridge with no node,
 		 * let's do standard swizzling and try again
 		 */
-		lspec = of_irq_pci_swizzle(PCI_SLOT(pdev->devfn), lspec);
+		lspec = pci_swizzle_interrupt_pin(pdev, lspec);
 		pdev = ppdev;
 	}
 
@@ -727,10 +729,7 @@ void of_irq_map_init(unsigned int flags)
 	if (flags & OF_IMAP_NO_PHANDLE) {
 		struct device_node *np;
 
-		for(np = NULL; (np = of_find_all_nodes(np)) != NULL;) {
-			if (of_get_property(np, "interrupt-controller", NULL)
-			    == NULL)
-				continue;
+		for_each_node_with_property(np, "interrupt-controller") {
 			/* Skip /chosen/interrupt-controller */
 			if (strcmp(np->name, "chosen") == 0)
 				continue;
@@ -972,7 +971,7 @@ int of_irq_map_one(struct device_node *device, int index, struct of_irq *out_irq
 	struct device_node *p;
 	const u32 *intspec, *tmp, *addr;
 	u32 intsize, intlen;
-	int res;
+	int res = -EINVAL;
 
 	DBG("of_irq_map_one: dev=%s, index=%d\n", device->full_name, index);
 
@@ -996,21 +995,20 @@ int of_irq_map_one(struct device_node *device, int index, struct of_irq *out_irq
 
 	/* Get size of interrupt specifier */
 	tmp = of_get_property(p, "#interrupt-cells", NULL);
-	if (tmp == NULL) {
-		of_node_put(p);
-		return -EINVAL;
-	}
+	if (tmp == NULL)
+		goto out;
 	intsize = *tmp;
 
 	DBG(" intsize=%d intlen=%d\n", intsize, intlen);
 
 	/* Check index */
 	if ((index + 1) * intsize > intlen)
-		return -EINVAL;
+		goto out;
 
 	/* Get new specifier and map it */
 	res = of_irq_map_raw(p, intspec + index * intsize, intsize,
 			     addr, out_irq);
+out:
 	of_node_put(p);
 	return res;
 }

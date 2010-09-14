@@ -1,7 +1,7 @@
 /*
  * helper functions for vmalloc video4linux capture buffers
  *
- * The functions expect the hardware being able to scatter gatter
+ * The functions expect the hardware being able to scatter gather
  * (i.e. the buffers are not linear in physical memory, but fragmented
  * into PAGE_SIZE chunks).  They also assume the driver does not need
  * to touch the video data.
@@ -116,7 +116,7 @@ static void videobuf_vm_close(struct vm_area_struct *vma)
 	return;
 }
 
-static struct vm_operations_struct videobuf_vm_ops =
+static const struct vm_operations_struct videobuf_vm_ops =
 {
 	.open     = videobuf_vm_open,
 	.close    = videobuf_vm_close,
@@ -203,7 +203,7 @@ static int __videobuf_iolock (struct videobuf_queue* q,
 			return 0;
 
 		/* FIXME: to properly support USERPTR, remap should occur.
-		   The code bellow won't work, since mem->vma = NULL
+		   The code below won't work, since mem->vma = NULL
 		 */
 		/* Try to remap memory */
 		rc = remap_vmalloc_range(mem->vma, (void *)vb->baddr, 0);
@@ -425,7 +425,7 @@ void videobuf_vmalloc_free (struct videobuf_buffer *buf)
 	   So, it should free memory only if the memory were allocated for
 	   read() operation.
 	 */
-	if ((buf->memory != V4L2_MEMORY_USERPTR) || (buf->baddr == 0))
+	if ((buf->memory != V4L2_MEMORY_USERPTR) || buf->baddr)
 		return;
 
 	if (!mem)

@@ -25,6 +25,7 @@
 #include <linux/timer.h>
 #include <linux/mm.h>
 #include <linux/highmem.h>
+#include <linux/hrtimer.h>
 
 static void __journal_temp_unlink_buffer(struct journal_head *jh);
 
@@ -49,12 +50,14 @@ get_transaction(journal_t *journal, transaction_t *transaction)
 {
 	transaction->t_journal = journal;
 	transaction->t_state = T_RUNNING;
+	transaction->t_start_time = ktime_get();
 	transaction->t_tid = journal->j_transaction_sequence++;
 	transaction->t_expires = jiffies + journal->j_commit_interval;
 	spin_lock_init(&transaction->t_handle_lock);
 
 	/* Set up the commit timer for the new transaction. */
-	journal->j_commit_timer.expires = round_jiffies(transaction->t_expires);
+	journal->j_commit_timer.expires =
+				round_jiffies_up(transaction->t_expires);
 	add_timer(&journal->j_commit_timer);
 
 	J_ASSERT(journal->j_running_transaction == NULL);
@@ -226,6 +229,8 @@ repeat_locked:
 		  __log_space_left(journal));
 	spin_unlock(&transaction->t_handle_lock);
 	spin_unlock(&journal->j_state_lock);
+
+	lock_map_acquire(&handle->h_lockdep_map);
 out:
 	if (unlikely(new_transaction))		/* It's usually NULL */
 		kfree(new_transaction);
@@ -290,9 +295,6 @@ handle_t *journal_start(journal_t *journal, int nblocks)
 		handle = ERR_PTR(err);
 		goto out;
 	}
-
-	lock_acquire(&handle->h_lockdep_map, 0, 0, 0, 2, _THIS_IP_);
-
 out:
 	return handle;
 }
@@ -414,6 +416,7 @@ int journal_restart(handle_t *handle, int nblocks)
 	__log_start_commit(journal, transaction->t_tid);
 	spin_unlock(&journal->j_state_lock);
 
+	lock_map_release(&handle->h_lockdep_map);
 	handle->h_buffer_credits = nblocks;
 	ret = start_this_handle(journal, handle);
 	return ret;
@@ -487,34 +490,15 @@ void journal_unlock_updates (journal_t *journal)
 	wake_up(&journal->j_wait_transaction_locked);
 }
 
-/*
- * Report any unexpected dirty buffers which turn up.  Normally those
- * indicate an error, but they can occur if the user is running (say)
- * tune2fs to modify the live filesystem, so we need the option of
- * continuing as gracefully as possible.  #
- *
- * The caller should already hold the journal lock and
- * j_list_lock spinlock: most callers will need those anyway
- * in order to probe the buffer's journaling state safely.
- */
-static void jbd_unexpected_dirty_buffer(struct journal_head *jh)
+static void warn_dirty_buffer(struct buffer_head *bh)
 {
-	int jlist;
+	char b[BDEVNAME_SIZE];
 
-	/* If this buffer is one which might reasonably be dirty
-	 * --- ie. data, or not part of this journal --- then
-	 * we're OK to leave it alone, but otherwise we need to
-	 * move the dirty bit to the journal's own internal
-	 * JBDDirty bit. */
-	jlist = jh->b_jlist;
-
-	if (jlist == BJ_Metadata || jlist == BJ_Reserved ||
-	    jlist == BJ_Shadow || jlist == BJ_Forget) {
-		struct buffer_head *bh = jh2bh(jh);
-
-		if (test_clear_buffer_dirty(bh))
-			set_buffer_jbddirty(bh);
-	}
+	printk(KERN_WARNING
+	       "JBD: Spotted dirty metadata buffer (dev = %s, blocknr = %llu). "
+	       "There's a risk of filesystem corruption in case of system "
+	       "crash.\n",
+	       bdevname(bh->b_bdev, b), (unsigned long long)bh->b_blocknr);
 }
 
 /*
@@ -581,14 +565,16 @@ repeat:
 			if (jh->b_next_transaction)
 				J_ASSERT_JH(jh, jh->b_next_transaction ==
 							transaction);
+			warn_dirty_buffer(bh);
 		}
 		/*
 		 * In any case we need to clean the dirty flag and we must
 		 * do it under the buffer lock to be sure we don't race
 		 * with running write-out.
 		 */
-		JBUFFER_TRACE(jh, "Unexpected dirty buffer");
-		jbd_unexpected_dirty_buffer(jh);
+		JBUFFER_TRACE(jh, "Journalling dirty buffer");
+		clear_buffer_dirty(bh);
+		set_buffer_jbddirty(bh);
 	}
 
 	unlock_buffer(bh);
@@ -752,7 +738,6 @@ out:
  * int journal_get_write_access() - notify intent to modify a buffer for metadata (not data) update.
  * @handle: transaction to add buffer modifications to
  * @bh:     bh to be used for metadata writes
- * @credits: variable that will receive credits for the buffer
  *
  * Returns an error code or 0 on success.
  *
@@ -825,6 +810,15 @@ int journal_get_create_access(handle_t *handle, struct buffer_head *bh)
 	J_ASSERT_JH(jh, buffer_locked(jh2bh(jh)));
 
 	if (jh->b_transaction == NULL) {
+		/*
+		 * Previous journal_forget() could have left the buffer
+		 * with jbddirty bit set because it was being committed. When
+		 * the commit finished, we've filed the buffer for
+		 * checkpointing and marked it dirty. Now we are reallocating
+		 * the buffer so the transaction freeing it must have
+		 * committed and so it's safe to clear the dirty bit.
+		 */
+		clear_buffer_dirty(jh2bh(jh));
 		jh->b_transaction = transaction;
 
 		/* first access by this transaction */
@@ -860,7 +854,6 @@ out:
  * int journal_get_undo_access() - Notify intent to modify metadata with non-rewindable consequences
  * @handle: transaction
  * @bh: buffer to undo
- * @credits: store the number of taken credits here (if not NULL)
  *
  * Sometimes there is a need to distinguish between metadata which has
  * been committed to disk and that which has not.  The ext3fs code uses
@@ -954,9 +947,10 @@ int journal_dirty_data(handle_t *handle, struct buffer_head *bh)
 	journal_t *journal = handle->h_transaction->t_journal;
 	int need_brelse = 0;
 	struct journal_head *jh;
+	int ret = 0;
 
 	if (is_handle_aborted(handle))
-		return 0;
+		return ret;
 
 	jh = journal_add_journal_head(bh);
 	JBUFFER_TRACE(jh, "entry");
@@ -1067,7 +1061,16 @@ int journal_dirty_data(handle_t *handle, struct buffer_head *bh)
 				   time if it is redirtied */
 			}
 
-			/* journal_clean_data_list() may have got there first */
+			/*
+			 * We cannot remove the buffer with io error from the
+			 * committing transaction, because otherwise it would
+			 * miss the error and the commit would not abort.
+			 */
+			if (unlikely(!buffer_uptodate(bh))) {
+				ret = -EIO;
+				goto no_journal;
+			}
+
 			if (jh->b_transaction != NULL) {
 				JBUFFER_TRACE(jh, "unfile from commit");
 				__journal_temp_unlink_buffer(jh);
@@ -1108,7 +1111,7 @@ no_journal:
 	}
 	JBUFFER_TRACE(jh, "exit");
 	journal_put_journal_head(jh);
-	return 0;
+	return ret;
 }
 
 /**
@@ -1361,7 +1364,7 @@ int journal_stop(handle_t *handle)
 {
 	transaction_t *transaction = handle->h_transaction;
 	journal_t *journal = transaction->t_journal;
-	int old_handle_count, err;
+	int err;
 	pid_t pid;
 
 	J_ASSERT(journal_current_handle() == handle);
@@ -1390,6 +1393,17 @@ int journal_stop(handle_t *handle)
 	 * on IO anyway.  Speeds up many-threaded, many-dir operations
 	 * by 30x or more...
 	 *
+	 * We try and optimize the sleep time against what the underlying disk
+	 * can do, instead of having a static sleep time.  This is usefull for
+	 * the case where our storage is so fast that it is more optimal to go
+	 * ahead and force a flush and wait for the transaction to be committed
+	 * than it is to wait for an arbitrary amount of time for new writers to
+	 * join the transaction.  We acheive this by measuring how long it takes
+	 * to commit a transaction, and compare it with how long this
+	 * transaction has been running, and if run time < commit time then we
+	 * sleep for the delta and commit.  This greatly helps super fast disks
+	 * that would see slowdowns as more threads started doing fsyncs.
+	 *
 	 * But don't do this if this process was the most recent one to
 	 * perform a synchronous write.  We do this to detect the case where a
 	 * single process is doing a stream of sync writes.  No point in waiting
@@ -1397,13 +1411,30 @@ int journal_stop(handle_t *handle)
 	 */
 	pid = current->pid;
 	if (handle->h_sync && journal->j_last_sync_writer != pid) {
+		u64 commit_time, trans_time;
+
 		journal->j_last_sync_writer = pid;
-		do {
-			old_handle_count = transaction->t_handle_count;
-			schedule_timeout_uninterruptible(1);
-		} while (old_handle_count != transaction->t_handle_count);
+
+		spin_lock(&journal->j_state_lock);
+		commit_time = journal->j_average_commit_time;
+		spin_unlock(&journal->j_state_lock);
+
+		trans_time = ktime_to_ns(ktime_sub(ktime_get(),
+						   transaction->t_start_time));
+
+		commit_time = min_t(u64, commit_time,
+				    1000*jiffies_to_usecs(1));
+
+		if (trans_time < commit_time) {
+			ktime_t expires = ktime_add_ns(ktime_get(),
+						       commit_time);
+			set_current_state(TASK_UNINTERRUPTIBLE);
+			schedule_hrtimeout(&expires, HRTIMER_MODE_ABS);
+		}
 	}
 
+	if (handle->h_sync)
+		transaction->t_synchronous_commit = 1;
 	current->journal_info = NULL;
 	spin_lock(&journal->j_state_lock);
 	spin_lock(&transaction->t_handle_lock);
@@ -1448,7 +1479,7 @@ int journal_stop(handle_t *handle)
 		spin_unlock(&journal->j_state_lock);
 	}
 
-	lock_release(&handle->h_lockdep_map, 1, _THIS_IP_);
+	lock_map_release(&handle->h_lockdep_map);
 
 	jbd_free_handle(handle);
 	return err;
@@ -1648,12 +1679,13 @@ out:
 	return;
 }
 
-
 /**
  * int journal_try_to_free_buffers() - try to free page buffers.
  * @journal: journal for operation
  * @page: to try and free
- * @unused_gfp_mask: unused
+ * @gfp_mask: we use the mask to detect how hard should we try to release
+ * buffers. If __GFP_WAIT and __GFP_FS is set, we wait for commit code to
+ * release the buffers.
  *
  *
  * For all the buffers on this page,
@@ -1682,9 +1714,11 @@ out:
  * journal_try_to_free_buffer() is changing its state.  But that
  * cannot happen because we never reallocate freed data as metadata
  * while the data is part of a transaction.  Yes?
+ *
+ * Return 0 on failure, 1 on success
  */
 int journal_try_to_free_buffers(journal_t *journal,
-				struct page *page, gfp_t unused_gfp_mask)
+				struct page *page, gfp_t gfp_mask)
 {
 	struct buffer_head *head;
 	struct buffer_head *bh;
@@ -1713,7 +1747,9 @@ int journal_try_to_free_buffers(journal_t *journal,
 		if (buffer_jbd(bh))
 			goto busy;
 	} while ((bh = bh->b_this_page) != head);
+
 	ret = try_to_free_buffers(page);
+
 busy:
 	return ret;
 }
@@ -1739,8 +1775,13 @@ static int __dispose_buffer(struct journal_head *jh, transaction_t *transaction)
 
 	if (jh->b_cp_transaction) {
 		JBUFFER_TRACE(jh, "on running+cp transaction");
+		/*
+		 * We don't want to write the buffer anymore, clear the
+		 * bit so that we don't confuse checks in
+		 * __journal_file_buffer
+		 */
+		clear_buffer_dirty(bh);
 		__journal_file_buffer(jh, transaction, BJ_Forget);
-		clear_buffer_jbddirty(bh);
 		may_free = 0;
 	} else {
 		JBUFFER_TRACE(jh, "on running transaction");
@@ -1998,12 +2039,17 @@ void __journal_file_buffer(struct journal_head *jh,
 	if (jh->b_transaction && jh->b_jlist == jlist)
 		return;
 
-	/* The following list of buffer states needs to be consistent
-	 * with __jbd_unexpected_dirty_buffer()'s handling of dirty
-	 * state. */
-
 	if (jlist == BJ_Metadata || jlist == BJ_Reserved ||
 	    jlist == BJ_Shadow || jlist == BJ_Forget) {
+		/*
+		 * For metadata buffers, we track dirty bit in buffer_jbddirty
+		 * instead of buffer_dirty. We should not see a dirty bit set
+		 * here because we clear it in do_get_write_access but e.g.
+		 * tune2fs can modify the sb and set the dirty bit at any time
+		 * so we try to gracefully handle that.
+		 */
+		if (buffer_dirty(bh))
+			warn_dirty_buffer(bh);
 		if (test_clear_buffer_dirty(bh) ||
 		    test_clear_buffer_jbddirty(bh))
 			was_dirty = 1;

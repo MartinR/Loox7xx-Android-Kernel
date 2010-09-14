@@ -1,10 +1,10 @@
 #include <linux/pci.h>
 #include <linux/init.h>
-#include "pci.h"
+#include <asm/pci_x86.h>
 
 /* arch_initcall has too random ordering, so call the initializers
    in the right sequence from here. */
-static __init int pci_access_init(void)
+static __init int pci_arch_init(void)
 {
 #ifdef CONFIG_PCI_DIRECT
 	int type = 0;
@@ -12,7 +12,8 @@ static __init int pci_access_init(void)
 	type = pci_direct_probe();
 #endif
 
-	pci_mmcfg_early_init();
+	if (!(pci_probe & PCI_PROBE_NOEARLY))
+		pci_mmcfg_early_init();
 
 #ifdef CONFIG_PCI_OLPC
 	if (!pci_olpc_init())
@@ -40,4 +41,4 @@ static __init int pci_access_init(void)
 
 	return 0;
 }
-arch_initcall(pci_access_init);
+arch_initcall(pci_arch_init);

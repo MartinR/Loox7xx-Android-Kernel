@@ -53,7 +53,7 @@ MODULE_LICENSE("GPL");
 
 static char config[MAX_PARAM_LENGTH];
 module_param_string(netconsole, config, MAX_PARAM_LENGTH, 0);
-MODULE_PARM_DESC(netconsole, " netconsole=[src-port]@[src-ip]/[dev],[tgt-port]@<tgt-ip>/[tgt-macaddr]\n");
+MODULE_PARM_DESC(netconsole, " netconsole=[src-port]@[src-ip]/[dev],[tgt-port]@<tgt-ip>/[tgt-macaddr]");
 
 #ifndef	MODULE
 static int __init option_setup(char *opt)
@@ -294,30 +294,25 @@ static ssize_t show_remote_port(struct netconsole_target *nt, char *buf)
 
 static ssize_t show_local_ip(struct netconsole_target *nt, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, "%d.%d.%d.%d\n",
-			HIPQUAD(nt->np.local_ip));
+	return snprintf(buf, PAGE_SIZE, "%pI4\n", &nt->np.local_ip);
 }
 
 static ssize_t show_remote_ip(struct netconsole_target *nt, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, "%d.%d.%d.%d\n",
-			HIPQUAD(nt->np.remote_ip));
+	return snprintf(buf, PAGE_SIZE, "%pI4\n", &nt->np.remote_ip);
 }
 
 static ssize_t show_local_mac(struct netconsole_target *nt, char *buf)
 {
 	struct net_device *dev = nt->np.dev;
+	static const u8 bcast[ETH_ALEN] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
 
-	DECLARE_MAC_BUF(mac);
-	return snprintf(buf, PAGE_SIZE, "%s\n", dev ?
-			print_mac(mac, dev->dev_addr) : "ff:ff:ff:ff:ff:ff");
+	return snprintf(buf, PAGE_SIZE, "%pM\n", dev ? dev->dev_addr : bcast);
 }
 
 static ssize_t show_remote_mac(struct netconsole_target *nt, char *buf)
 {
-	DECLARE_MAC_BUF(mac);
-	return snprintf(buf, PAGE_SIZE, "%s\n",
-			print_mac(mac, nt->np.remote_mac));
+	return snprintf(buf, PAGE_SIZE, "%pM\n", nt->np.remote_mac);
 }
 
 /*
@@ -441,7 +436,7 @@ static ssize_t store_local_ip(struct netconsole_target *nt,
 		return -EINVAL;
 	}
 
-	nt->np.local_ip = ntohl(in_aton(buf));
+	nt->np.local_ip = in_aton(buf);
 
 	return strnlen(buf, count);
 }
@@ -457,7 +452,7 @@ static ssize_t store_remote_ip(struct netconsole_target *nt,
 		return -EINVAL;
 	}
 
-	nt->np.remote_ip = ntohl(in_aton(buf));
+	nt->np.remote_ip = in_aton(buf);
 
 	return strnlen(buf, count);
 }
@@ -598,7 +593,7 @@ static struct config_item *make_netconsole_target(struct config_group *group,
 	nt = kzalloc(sizeof(*nt), GFP_KERNEL);
 	if (!nt) {
 		printk(KERN_ERR "netconsole: failed to allocate memory\n");
-		return NULL;
+		return ERR_PTR(-ENOMEM);
 	}
 
 	nt->np.name = "netconsole";
@@ -669,7 +664,7 @@ static int netconsole_netdev_event(struct notifier_block *this,
 	struct netconsole_target *nt;
 	struct net_device *dev = ptr;
 
-	if (!(event == NETDEV_CHANGENAME))
+	if (!(event == NETDEV_CHANGENAME || event == NETDEV_UNREGISTER))
 		goto done;
 
 	spin_lock_irqsave(&target_list_lock, flags);
@@ -679,6 +674,15 @@ static int netconsole_netdev_event(struct notifier_block *this,
 			switch (event) {
 			case NETDEV_CHANGENAME:
 				strlcpy(nt->np.dev_name, dev->name, IFNAMSIZ);
+				break;
+			case NETDEV_UNREGISTER:
+				if (!nt->enabled)
+					break;
+				netpoll_cleanup(&nt->np);
+				nt->enabled = 0;
+				printk(KERN_INFO "netconsole: network logging stopped"
+					", interface %s unregistered\n",
+					dev->name);
 				break;
 			}
 		}

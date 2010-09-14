@@ -30,6 +30,7 @@
 #include <asm/ppc_asm.h>
 #include <asm/asm-offsets.h>
 #include <asm/unistd.h>
+#include <asm/ftrace.h>
 
 #undef SHOW_SYSCALLS
 #undef SHOW_SYSCALLS_TASK
@@ -44,29 +45,54 @@
 #endif
 
 #ifdef CONFIG_BOOKE
-#include "head_booke.h"
-#define TRANSFER_TO_HANDLER_EXC_LEVEL(exc_level)	\
-	mtspr	exc_level##_SPRG,r8;			\
-	BOOKE_LOAD_EXC_LEVEL_STACK(exc_level);		\
-	lwz	r0,GPR10-INT_FRAME_SIZE(r8);		\
-	stw	r0,GPR10(r11);				\
-	lwz	r0,GPR11-INT_FRAME_SIZE(r8);		\
-	stw	r0,GPR11(r11);				\
-	mfspr	r8,exc_level##_SPRG
-
 	.globl	mcheck_transfer_to_handler
 mcheck_transfer_to_handler:
-	TRANSFER_TO_HANDLER_EXC_LEVEL(MCHECK)
-	b	transfer_to_handler_full
+	mfspr	r0,SPRN_DSRR0
+	stw	r0,_DSRR0(r11)
+	mfspr	r0,SPRN_DSRR1
+	stw	r0,_DSRR1(r11)
+	/* fall through */
 
 	.globl	debug_transfer_to_handler
 debug_transfer_to_handler:
-	TRANSFER_TO_HANDLER_EXC_LEVEL(DEBUG)
-	b	transfer_to_handler_full
+	mfspr	r0,SPRN_CSRR0
+	stw	r0,_CSRR0(r11)
+	mfspr	r0,SPRN_CSRR1
+	stw	r0,_CSRR1(r11)
+	/* fall through */
 
 	.globl	crit_transfer_to_handler
 crit_transfer_to_handler:
-	TRANSFER_TO_HANDLER_EXC_LEVEL(CRIT)
+#ifdef CONFIG_PPC_BOOK3E_MMU
+	mfspr	r0,SPRN_MAS0
+	stw	r0,MAS0(r11)
+	mfspr	r0,SPRN_MAS1
+	stw	r0,MAS1(r11)
+	mfspr	r0,SPRN_MAS2
+	stw	r0,MAS2(r11)
+	mfspr	r0,SPRN_MAS3
+	stw	r0,MAS3(r11)
+	mfspr	r0,SPRN_MAS6
+	stw	r0,MAS6(r11)
+#ifdef CONFIG_PHYS_64BIT
+	mfspr	r0,SPRN_MAS7
+	stw	r0,MAS7(r11)
+#endif /* CONFIG_PHYS_64BIT */
+#endif /* CONFIG_PPC_BOOK3E_MMU */
+#ifdef CONFIG_44x
+	mfspr	r0,SPRN_MMUCR
+	stw	r0,MMUCR(r11)
+#endif
+	mfspr	r0,SPRN_SRR0
+	stw	r0,_SRR0(r11)
+	mfspr	r0,SPRN_SRR1
+	stw	r0,_SRR1(r11)
+
+	mfspr	r8,SPRN_SPRG_THREAD
+	lwz	r0,KSP_LIMIT(r8)
+	stw	r0,SAVED_KSP_LIMIT(r11)
+	rlwimi	r0,r1,0,0,(31-THREAD_SHIFT)
+	stw	r0,KSP_LIMIT(r8)
 	/* fall through */
 #endif
 
@@ -77,6 +103,16 @@ crit_transfer_to_handler:
 	stw	r0,GPR10(r11)
 	lwz	r0,crit_r11@l(0)
 	stw	r0,GPR11(r11)
+	mfspr	r0,SPRN_SRR0
+	stw	r0,crit_srr0@l(0)
+	mfspr	r0,SPRN_SRR1
+	stw	r0,crit_srr1@l(0)
+
+	mfspr	r8,SPRN_SPRG_THREAD
+	lwz	r0,KSP_LIMIT(r8)
+	stw	r0,saved_ksp_limit@l(0)
+	rlwimi	r0,r1,0,0,(31-THREAD_SHIFT)
+	stw	r0,KSP_LIMIT(r8)
 	/* fall through */
 #endif
 
@@ -102,7 +138,7 @@ transfer_to_handler:
 	mfspr	r2,SPRN_XER
 	stw	r12,_CTR(r11)
 	stw	r2,_XER(r11)
-	mfspr	r12,SPRN_SPRG3
+	mfspr	r12,SPRN_SPRG_THREAD
 	addi	r2,r12,-THREAD
 	tovirt(r2,r2)			/* set r2 to current */
 	beq	2f			/* if from user, fix up THREAD.regs */
@@ -141,29 +177,75 @@ transfer_to_handler:
 	cmplw	r1,r9			/* if r1 <= ksp_limit */
 	ble-	stack_ovf		/* then the kernel stack overflowed */
 5:
-#ifdef CONFIG_6xx
+#if defined(CONFIG_6xx) || defined(CONFIG_E500)
 	rlwinm	r9,r1,0,0,31-THREAD_SHIFT
 	tophys(r9,r9)			/* check local flags */
 	lwz	r12,TI_LOCAL_FLAGS(r9)
 	mtcrf	0x01,r12
 	bt-	31-TLF_NAPPING,4f
-#endif /* CONFIG_6xx */
+	bt-	31-TLF_SLEEPING,7f
+#endif /* CONFIG_6xx || CONFIG_E500 */
 	.globl transfer_to_handler_cont
 transfer_to_handler_cont:
 3:
 	mflr	r9
 	lwz	r11,0(r9)		/* virtual address of handler */
 	lwz	r9,4(r9)		/* where to go when done */
+#ifdef CONFIG_TRACE_IRQFLAGS
+	lis	r12,reenable_mmu@h
+	ori	r12,r12,reenable_mmu@l
+	mtspr	SPRN_SRR0,r12
+	mtspr	SPRN_SRR1,r10
+	SYNC
+	RFI
+reenable_mmu:				/* re-enable mmu so we can */
+	mfmsr	r10
+	lwz	r12,_MSR(r1)
+	xor	r10,r10,r12
+	andi.	r10,r10,MSR_EE		/* Did EE change? */
+	beq	1f
+
+	/* Save handler and return address into the 2 unused words
+	 * of the STACK_FRAME_OVERHEAD (sneak sneak sneak). Everything
+	 * else can be recovered from the pt_regs except r3 which for
+	 * normal interrupts has been set to pt_regs and for syscalls
+	 * is an argument, so we temporarily use ORIG_GPR3 to save it
+	 */
+	stw	r9,8(r1)
+	stw	r11,12(r1)
+	stw	r3,ORIG_GPR3(r1)
+	bl	trace_hardirqs_off
+	lwz	r0,GPR0(r1)
+	lwz	r3,ORIG_GPR3(r1)
+	lwz	r4,GPR4(r1)
+	lwz	r5,GPR5(r1)
+	lwz	r6,GPR6(r1)
+	lwz	r7,GPR7(r1)
+	lwz	r8,GPR8(r1)
+	lwz	r9,8(r1)
+	lwz	r11,12(r1)
+1:	mtctr	r11
+	mtlr	r9
+	bctr				/* jump to handler */
+#else /* CONFIG_TRACE_IRQFLAGS */
 	mtspr	SPRN_SRR0,r11
 	mtspr	SPRN_SRR1,r10
 	mtlr	r9
 	SYNC
 	RFI				/* jump to handler, enable MMU */
+#endif /* CONFIG_TRACE_IRQFLAGS */
 
-#ifdef CONFIG_6xx
+#if defined (CONFIG_6xx) || defined(CONFIG_E500)
 4:	rlwinm	r12,r12,0,~_TLF_NAPPING
 	stw	r12,TI_LOCAL_FLAGS(r9)
-	b	power_save_6xx_restore
+	b	power_save_ppc32_restore
+
+7:	rlwinm	r12,r12,0,~_TLF_SLEEPING
+	stw	r12,TI_LOCAL_FLAGS(r9)
+	lwz	r9,_MSR(r11)		/* if sleeping, clear MSR.EE */
+	rlwinm	r9,r9,0,~MSR_EE
+	lwz	r12,_LINK(r11)		/* and return to address in LR */
+	b	fast_exception_return
 #endif
 
 /*
@@ -207,6 +289,31 @@ _GLOBAL(DoSyscall)
 #ifdef SHOW_SYSCALLS
 	bl	do_show_syscall
 #endif /* SHOW_SYSCALLS */
+#ifdef CONFIG_TRACE_IRQFLAGS
+	/* Return from syscalls can (and generally will) hard enable
+	 * interrupts. You aren't supposed to call a syscall with
+	 * interrupts disabled in the first place. However, to ensure
+	 * that we get it right vs. lockdep if it happens, we force
+	 * that hard enable here with appropriate tracing if we see
+	 * that we have been called with interrupts off
+	 */
+	mfmsr	r11
+	andi.	r12,r11,MSR_EE
+	bne+	1f
+	/* We came in with interrupts disabled, we enable them now */
+	bl	trace_hardirqs_on
+	mfmsr	r11
+	lwz	r0,GPR0(r1)
+	lwz	r3,GPR3(r1)
+	lwz	r4,GPR4(r1)
+	ori	r11,r11,MSR_EE
+	lwz	r5,GPR5(r1)
+	lwz	r6,GPR6(r1)
+	lwz	r7,GPR7(r1)
+	lwz	r8,GPR8(r1)
+	mtmsr	r11
+1:
+#endif /* CONFIG_TRACE_IRQFLAGS */
 	rlwinm	r10,r1,0,0,(31-THREAD_SHIFT)	/* current_thread_info() */
 	lwz	r11,TI_FLAGS(r10)
 	andi.	r11,r11,_TIF_SYSCALL_T_OR_A
@@ -231,6 +338,7 @@ ret_from_syscall:
 	rlwinm	r12,r1,0,0,(31-THREAD_SHIFT)	/* current_thread_info() */
 	/* disable interrupts so current_thread_info()->flags can't change */
 	LOAD_MSR_KERNEL(r10,MSR_KERNEL)	/* doesn't include MSR_EE */
+	/* Note: We don't bother telling lockdep about it */
 	SYNC
 	MTMSRD(r10)
 	lwz	r9,TI_FLAGS(r12)
@@ -244,6 +352,19 @@ ret_from_syscall:
 	oris	r11,r11,0x1000	/* Set SO bit in CR */
 	stw	r11,_CCR(r1)
 syscall_exit_cont:
+	lwz	r8,_MSR(r1)
+#ifdef CONFIG_TRACE_IRQFLAGS
+	/* If we are going to return from the syscall with interrupts
+	 * off, we trace that here. It shouldn't happen though but we
+	 * want to catch the bugger if it does right ?
+	 */
+	andi.	r10,r8,MSR_EE
+	bne+	1f
+	stw	r3,GPR3(r1)
+	bl      trace_hardirqs_off
+	lwz	r3,GPR3(r1)
+1:
+#endif /* CONFIG_TRACE_IRQFLAGS */
 #if defined(CONFIG_4xx) || defined(CONFIG_BOOKE)
 	/* If the process has its own DBCR0 value, load it up.  The internal
 	   debug mode bit tells us that dbcr0 should be loaded. */
@@ -267,7 +388,6 @@ END_FTR_SECTION_IFSET(CPU_FTR_NEED_PAIRED_STWCX)
 	mtlr	r4
 	mtcr	r5
 	lwz	r7,_NIP(r1)
-	lwz	r8,_MSR(r1)
 	FIX_SRR1(r8, r0)
 	lwz	r2,GPR2(r1)
 	lwz	r1,GPR1(r1)
@@ -299,7 +419,12 @@ syscall_dotrace:
 	stw	r0,_TRAP(r1)
 	addi	r3,r1,STACK_FRAME_OVERHEAD
 	bl	do_syscall_trace_enter
-	lwz	r0,GPR0(r1)	/* Restore original registers */
+	/*
+	 * Restore argument registers possibly just changed.
+	 * We use the return value of do_syscall_trace_enter
+	 * for call number to look up in the table (r0).
+	 */
+	mr	r0,r3
 	lwz	r3,GPR3(r1)
 	lwz	r4,GPR4(r1)
 	lwz	r5,GPR5(r1)
@@ -345,7 +470,9 @@ syscall_exit_work:
 	andi.	r0,r9,(_TIF_SYSCALL_T_OR_A|_TIF_SINGLESTEP)
 	beq	ret_from_except
 
-	/* Re-enable interrupts */
+	/* Re-enable interrupts. There is no need to trace that with
+	 * lockdep as we are supposed to have IRQs on at this point
+	 */
 	ori	r10,r10,MSR_EE
 	SYNC
 	MTMSRD(r10)
@@ -553,7 +680,7 @@ END_FTR_SECTION_IFSET(CPU_FTR_SPE)
 
 	tophys(r0,r4)
 	CLR_TOP32(r0)
-	mtspr	SPRN_SPRG3,r0	/* Update current THREAD phys addr */
+	mtspr	SPRN_SPRG_THREAD,r0	/* Update current THREAD phys addr */
 	lwz	r1,KSP(r4)	/* Load new stack pointer */
 
 	/* save the old current 'last' for return value */
@@ -656,6 +783,7 @@ ret_from_except:
 	/* Hard-disable interrupts so that current_thread_info()->flags
 	 * can't change between when we test it and when we return
 	 * from the interrupt. */
+	/* Note: We don't bother telling lockdep about it */
 	LOAD_MSR_KERNEL(r10,MSR_KERNEL)
 	SYNC			/* Some chip revs have problems here... */
 	MTMSRD(r10)		/* disable interrupts */
@@ -668,7 +796,7 @@ user_exc_return:		/* r10 contains MSR_KERNEL here */
 	/* Check current_thread_info()->flags */
 	rlwinm	r9,r1,0,0,(31-THREAD_SHIFT)
 	lwz	r9,TI_FLAGS(r9)
-	andi.	r0,r9,(_TIF_SIGPENDING|_TIF_RESTORE_SIGMASK|_TIF_NEED_RESCHED)
+	andi.	r0,r9,_TIF_USER_WORK_MASK
 	bne	do_work
 
 restore_user:
@@ -695,11 +823,24 @@ resume_kernel:
 	beq+	restore
 	andi.	r0,r3,MSR_EE	/* interrupts off? */
 	beq	restore		/* don't schedule if so */
+#ifdef CONFIG_TRACE_IRQFLAGS
+	/* Lockdep thinks irqs are enabled, we need to call
+	 * preempt_schedule_irq with IRQs off, so we inform lockdep
+	 * now that we -did- turn them off already
+	 */
+	bl	trace_hardirqs_off
+#endif
 1:	bl	preempt_schedule_irq
 	rlwinm	r9,r1,0,0,(31-THREAD_SHIFT)
 	lwz	r3,TI_FLAGS(r9)
 	andi.	r0,r3,_TIF_NEED_RESCHED
 	bne-	1b
+#ifdef CONFIG_TRACE_IRQFLAGS
+	/* And now, to properly rebalance the above, we tell lockdep they
+	 * are being turned back on, which will happen when we return
+	 */
+	bl	trace_hardirqs_on
+#endif
 #else
 resume_kernel:
 #endif /* CONFIG_PREEMPT */
@@ -716,6 +857,28 @@ restore:
 	stw	r6,icache_44x_need_flush@l(r4)
 1:
 #endif  /* CONFIG_44x */
+
+	lwz	r9,_MSR(r1)
+#ifdef CONFIG_TRACE_IRQFLAGS
+	/* Lockdep doesn't know about the fact that IRQs are temporarily turned
+	 * off in this assembly code while peeking at TI_FLAGS() and such. However
+	 * we need to inform it if the exception turned interrupts off, and we
+	 * are about to trun them back on.
+	 *
+	 * The problem here sadly is that we don't know whether the exceptions was
+	 * one that turned interrupts off or not. So we always tell lockdep about
+	 * turning them on here when we go back to wherever we came from with EE
+	 * on, even if that may meen some redudant calls being tracked. Maybe later
+	 * we could encode what the exception did somewhere or test the exception
+	 * type in the pt_regs but that sounds overkill
+	 */
+	andi.	r10,r9,MSR_EE
+	beq	1f
+	bl	trace_hardirqs_on
+	lwz	r9,_MSR(r1)
+1:
+#endif /* CONFIG_TRACE_IRQFLAGS */
+
 	lwz	r0,GPR0(r1)
 	lwz	r2,GPR2(r1)
 	REST_4GPRS(3, r1)
@@ -733,7 +896,6 @@ END_FTR_SECTION_IFSET(CPU_FTR_NEED_PAIRED_STWCX)
 	stwcx.	r0,0,r1			/* to clear the reservation */
 
 #if !(defined(CONFIG_4xx) || defined(CONFIG_BOOKE))
-	lwz	r9,_MSR(r1)
 	andi.	r10,r9,MSR_RI		/* check if this exception occurred */
 	beql	nonrecoverable		/* at a bad place (MSR:RI = 0) */
 
@@ -756,7 +918,6 @@ END_FTR_SECTION_IFSET(CPU_FTR_NEED_PAIRED_STWCX)
 	MTMSRD(r10)		/* clear the RI bit */
 	.globl exc_exit_restart
 exc_exit_restart:
-	lwz	r9,_MSR(r1)
 	lwz	r12,_NIP(r1)
 	FIX_SRR1(r9,r10)
 	mtspr	SPRN_SRR0,r12
@@ -859,18 +1020,91 @@ exc_exit_restart_end:
 	exc_lvl_rfi;							\
 	b	.;		/* prevent prefetch past exc_lvl_rfi */
 
+#define	RESTORE_xSRR(exc_lvl_srr0, exc_lvl_srr1)			\
+	lwz	r9,_##exc_lvl_srr0(r1);					\
+	lwz	r10,_##exc_lvl_srr1(r1);				\
+	mtspr	SPRN_##exc_lvl_srr0,r9;					\
+	mtspr	SPRN_##exc_lvl_srr1,r10;
+
+#if defined(CONFIG_PPC_BOOK3E_MMU)
+#ifdef CONFIG_PHYS_64BIT
+#define	RESTORE_MAS7							\
+	lwz	r11,MAS7(r1);						\
+	mtspr	SPRN_MAS7,r11;
+#else
+#define	RESTORE_MAS7
+#endif /* CONFIG_PHYS_64BIT */
+#define RESTORE_MMU_REGS						\
+	lwz	r9,MAS0(r1);						\
+	lwz	r10,MAS1(r1);						\
+	lwz	r11,MAS2(r1);						\
+	mtspr	SPRN_MAS0,r9;						\
+	lwz	r9,MAS3(r1);						\
+	mtspr	SPRN_MAS1,r10;						\
+	lwz	r10,MAS6(r1);						\
+	mtspr	SPRN_MAS2,r11;						\
+	mtspr	SPRN_MAS3,r9;						\
+	mtspr	SPRN_MAS6,r10;						\
+	RESTORE_MAS7;
+#elif defined(CONFIG_44x)
+#define RESTORE_MMU_REGS						\
+	lwz	r9,MMUCR(r1);						\
+	mtspr	SPRN_MMUCR,r9;
+#else
+#define RESTORE_MMU_REGS
+#endif
+
+#ifdef CONFIG_40x
 	.globl	ret_from_crit_exc
 ret_from_crit_exc:
-	RET_FROM_EXC_LEVEL(SPRN_CSRR0, SPRN_CSRR1, RFCI)
+	mfspr	r9,SPRN_SPRG_THREAD
+	lis	r10,saved_ksp_limit@ha;
+	lwz	r10,saved_ksp_limit@l(r10);
+	tovirt(r9,r9);
+	stw	r10,KSP_LIMIT(r9)
+	lis	r9,crit_srr0@ha;
+	lwz	r9,crit_srr0@l(r9);
+	lis	r10,crit_srr1@ha;
+	lwz	r10,crit_srr1@l(r10);
+	mtspr	SPRN_SRR0,r9;
+	mtspr	SPRN_SRR1,r10;
+	RET_FROM_EXC_LEVEL(SPRN_CSRR0, SPRN_CSRR1, PPC_RFCI)
+#endif /* CONFIG_40x */
 
 #ifdef CONFIG_BOOKE
+	.globl	ret_from_crit_exc
+ret_from_crit_exc:
+	mfspr	r9,SPRN_SPRG_THREAD
+	lwz	r10,SAVED_KSP_LIMIT(r1)
+	stw	r10,KSP_LIMIT(r9)
+	RESTORE_xSRR(SRR0,SRR1);
+	RESTORE_MMU_REGS;
+	RET_FROM_EXC_LEVEL(SPRN_CSRR0, SPRN_CSRR1, PPC_RFCI)
+
 	.globl	ret_from_debug_exc
 ret_from_debug_exc:
-	RET_FROM_EXC_LEVEL(SPRN_DSRR0, SPRN_DSRR1, RFDI)
+	mfspr	r9,SPRN_SPRG_THREAD
+	lwz	r10,SAVED_KSP_LIMIT(r1)
+	stw	r10,KSP_LIMIT(r9)
+	lwz	r9,THREAD_INFO-THREAD(r9)
+	rlwinm	r10,r1,0,0,(31-THREAD_SHIFT)
+	lwz	r10,TI_PREEMPT(r10)
+	stw	r10,TI_PREEMPT(r9)
+	RESTORE_xSRR(SRR0,SRR1);
+	RESTORE_xSRR(CSRR0,CSRR1);
+	RESTORE_MMU_REGS;
+	RET_FROM_EXC_LEVEL(SPRN_DSRR0, SPRN_DSRR1, PPC_RFDI)
 
 	.globl	ret_from_mcheck_exc
 ret_from_mcheck_exc:
-	RET_FROM_EXC_LEVEL(SPRN_MCSRR0, SPRN_MCSRR1, RFMCI)
+	mfspr	r9,SPRN_SPRG_THREAD
+	lwz	r10,SAVED_KSP_LIMIT(r1)
+	stw	r10,KSP_LIMIT(r9)
+	RESTORE_xSRR(SRR0,SRR1);
+	RESTORE_xSRR(CSRR0,CSRR1);
+	RESTORE_xSRR(DSRR0,DSRR1);
+	RESTORE_MMU_REGS;
+	RET_FROM_EXC_LEVEL(SPRN_MCSRR0, SPRN_MCSRR1, PPC_RFMCI)
 #endif /* CONFIG_BOOKE */
 
 /*
@@ -913,11 +1147,18 @@ do_work:			/* r10 contains MSR_KERNEL here */
 	beq	do_user_signal
 
 do_resched:			/* r10 contains MSR_KERNEL here */
+	/* Note: We don't need to inform lockdep that we are enabling
+	 * interrupts here. As far as it knows, they are already enabled
+	 */
 	ori	r10,r10,MSR_EE
 	SYNC
 	MTMSRD(r10)		/* hard-enable interrupts */
 	bl	schedule
 recheck:
+	/* Note: And we don't tell it we are disabling them again
+	 * neither. Those disable/enable cycles used to peek at
+	 * TI_FLAGS aren't advertised.
+	 */
 	LOAD_MSR_KERNEL(r10,MSR_KERNEL)
 	SYNC
 	MTMSRD(r10)		/* disable interrupts */
@@ -925,7 +1166,7 @@ recheck:
 	lwz	r9,TI_FLAGS(r9)
 	andi.	r0,r9,_TIF_NEED_RESCHED
 	bne-	do_resched
-	andi.	r0,r9,_TIF_SIGPENDING|_TIF_RESTORE_SIGMASK
+	andi.	r0,r9,_TIF_USER_WORK_MASK
 	beq	restore_user
 do_user_signal:			/* r10 contains MSR_KERNEL here */
 	ori	r10,r10,MSR_EE
@@ -938,8 +1179,8 @@ do_user_signal:			/* r10 contains MSR_KERNEL here */
 	SAVE_NVGPRS(r1)
 	rlwinm	r3,r3,0,0,30
 	stw	r3,_TRAP(r1)
-2:	li	r3,0
-	addi	r4,r1,STACK_FRAME_OVERHEAD
+2:	addi	r3,r1,STACK_FRAME_OVERHEAD
+	mr	r4,r9
 	bl	do_signal
 	REST_NVGPRS(r1)
 	b	recheck
@@ -1014,7 +1255,7 @@ _GLOBAL(enter_rtas)
 	MTMSRD(r0)		/* don't get trashed */
 	li	r9,MSR_KERNEL & ~(MSR_IR|MSR_DR)
 	mtlr	r6
-	mtspr	SPRN_SPRG2,r7
+	mtspr	SPRN_SPRG_RTAS,r7
 	mtspr	SPRN_SRR0,r8
 	mtspr	SPRN_SRR1,r9
 	RFI
@@ -1024,7 +1265,7 @@ _GLOBAL(enter_rtas)
 	FIX_SRR1(r9,r0)
 	addi	r1,r1,INT_FRAME_SIZE
 	li	r0,0
-	mtspr	SPRN_SPRG2,r0
+	mtspr	SPRN_SPRG_RTAS,r0
 	mtspr	SPRN_SRR0,r8
 	mtspr	SPRN_SRR1,r9
 	RFI			/* return to caller */
@@ -1035,3 +1276,102 @@ machine_check_in_rtas:
 	/* XXX load up BATs and panic */
 
 #endif /* CONFIG_PPC_RTAS */
+
+#ifdef CONFIG_FUNCTION_TRACER
+#ifdef CONFIG_DYNAMIC_FTRACE
+_GLOBAL(mcount)
+_GLOBAL(_mcount)
+	/*
+	 * It is required that _mcount on PPC32 must preserve the
+	 * link register. But we have r0 to play with. We use r0
+	 * to push the return address back to the caller of mcount
+	 * into the ctr register, restore the link register and
+	 * then jump back using the ctr register.
+	 */
+	mflr	r0
+	mtctr	r0
+	lwz	r0, 4(r1)
+	mtlr	r0
+	bctr
+
+_GLOBAL(ftrace_caller)
+	MCOUNT_SAVE_FRAME
+	/* r3 ends up with link register */
+	subi	r3, r3, MCOUNT_INSN_SIZE
+.globl ftrace_call
+ftrace_call:
+	bl	ftrace_stub
+	nop
+#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+.globl ftrace_graph_call
+ftrace_graph_call:
+	b	ftrace_graph_stub
+_GLOBAL(ftrace_graph_stub)
+#endif
+	MCOUNT_RESTORE_FRAME
+	/* old link register ends up in ctr reg */
+	bctr
+#else
+_GLOBAL(mcount)
+_GLOBAL(_mcount)
+
+	MCOUNT_SAVE_FRAME
+
+	subi	r3, r3, MCOUNT_INSN_SIZE
+	LOAD_REG_ADDR(r5, ftrace_trace_function)
+	lwz	r5,0(r5)
+
+	mtctr	r5
+	bctrl
+	nop
+
+#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+	b	ftrace_graph_caller
+#endif
+	MCOUNT_RESTORE_FRAME
+	bctr
+#endif
+
+_GLOBAL(ftrace_stub)
+	blr
+
+#ifdef CONFIG_FUNCTION_GRAPH_TRACER
+_GLOBAL(ftrace_graph_caller)
+	/* load r4 with local address */
+	lwz	r4, 44(r1)
+	subi	r4, r4, MCOUNT_INSN_SIZE
+
+	/* get the parent address */
+	addi	r3, r1, 52
+
+	bl	prepare_ftrace_return
+	nop
+
+	MCOUNT_RESTORE_FRAME
+	/* old link register ends up in ctr reg */
+	bctr
+
+_GLOBAL(return_to_handler)
+	/* need to save return values */
+	stwu	r1, -32(r1)
+	stw	r3, 20(r1)
+	stw	r4, 16(r1)
+	stw	r31, 12(r1)
+	mr	r31, r1
+
+	bl	ftrace_return_to_handler
+	nop
+
+	/* return value has real return address */
+	mtlr	r3
+
+	lwz	r3, 20(r1)
+	lwz	r4, 16(r1)
+	lwz	r31,12(r1)
+	lwz	r1, 0(r1)
+
+	/* Jump back to real return address */
+	blr
+#endif /* CONFIG_FUNCTION_GRAPH_TRACER */
+
+#endif /* CONFIG_MCOUNT */

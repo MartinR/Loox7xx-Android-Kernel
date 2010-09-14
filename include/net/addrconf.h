@@ -80,15 +80,16 @@ extern struct inet6_ifaddr      *ipv6_get_ifaddr(struct net *net,
 						 struct net_device *dev,
 						 int strict);
 
-extern int			ipv6_dev_get_saddr(struct net_device *dev, 
+extern int			ipv6_dev_get_saddr(struct net *net,
+					       struct net_device *dev,
 					       const struct in6_addr *daddr,
 					       unsigned int srcprefs,
 					       struct in6_addr *saddr);
 extern int			ipv6_get_lladdr(struct net_device *dev,
 						struct in6_addr *addr,
 						unsigned char banned_flags);
-extern int			ipv6_rcv_saddr_equal(const struct sock *sk, 
-						      const struct sock *sk2);
+extern int 			ipv6_rcv_saddr_equal(const struct sock *sk,
+						    const struct sock *sk2);
 extern void			addrconf_join_solict(struct net_device *dev,
 					struct in6_addr *addr);
 extern void			addrconf_leave_solict(struct inet6_dev *idev,
@@ -121,7 +122,8 @@ static inline int addrconf_finite_timeout(unsigned long timeout)
  */
 extern int			ipv6_addr_label_init(void);
 extern void			ipv6_addr_label_rtnl_register(void);
-extern u32			ipv6_addr_label(const struct in6_addr *addr,
+extern u32			ipv6_addr_label(struct net *net,
+						const struct in6_addr *addr,
 						int type, int ifindex);
 
 /*
@@ -141,6 +143,8 @@ extern int __ipv6_dev_mc_dec(struct inet6_dev *idev, const struct in6_addr *addr
 extern int ipv6_dev_mc_dec(struct net_device *dev, const struct in6_addr *addr);
 extern void ipv6_mc_up(struct inet6_dev *idev);
 extern void ipv6_mc_down(struct inet6_dev *idev);
+extern void ipv6_mc_unmap(struct inet6_dev *idev);
+extern void ipv6_mc_remap(struct inet6_dev *idev);
 extern void ipv6_mc_init_dev(struct inet6_dev *idev);
 extern void ipv6_mc_destroy_dev(struct inet6_dev *idev);
 extern void addrconf_dad_failure(struct inet6_ifaddr *ifp);

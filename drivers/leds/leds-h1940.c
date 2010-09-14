@@ -16,14 +16,17 @@
 #include <linux/string.h>
 #include <linux/ctype.h>
 #include <linux/leds.h>
-#include <asm/arch/regs-gpio.h>
-#include <asm/hardware.h>
-#include <asm/arch/h1940-latch.h>
+#include <linux/gpio.h>
+
+#include <mach/regs-gpio.h>
+#include <mach/hardware.h>
+#include <mach/h1940-latch.h>
 
 /*
  * Green led.
  */
-void h1940_greenled_set(struct led_classdev *led_dev, enum led_brightness value)
+static void h1940_greenled_set(struct led_classdev *led_dev,
+			       enum led_brightness value)
 {
 	switch (value) {
 	case LED_HALF:
@@ -52,7 +55,8 @@ static struct led_classdev h1940_greenled = {
 /*
  * Red led.
  */
-void h1940_redled_set(struct led_classdev *led_dev, enum led_brightness value)
+static void h1940_redled_set(struct led_classdev *led_dev,
+			     enum led_brightness value)
 {
 	switch (value) {
 	case LED_HALF:
@@ -82,7 +86,8 @@ static struct led_classdev h1940_redled = {
  * Blue led.
  * (it can only be blue flashing led)
  */
-void h1940_blueled_set(struct led_classdev *led_dev, enum led_brightness value)
+static void h1940_blueled_set(struct led_classdev *led_dev,
+			      enum led_brightness value)
 {
 	if (value) {
 		/* flashing Blue */
@@ -101,7 +106,7 @@ static struct led_classdev h1940_blueled = {
 	.default_trigger	= "h1940-bluetooth",
 };
 
-static int __init h1940leds_probe(struct platform_device *pdev)
+static int __devinit h1940leds_probe(struct platform_device *pdev)
 {
 	int ret;
 

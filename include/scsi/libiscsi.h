@@ -24,15 +24,19 @@
 #define LIBISCSI_H
 
 #include <linux/types.h>
+#include <linux/wait.h>
 #include <linux/mutex.h>
 #include <linux/timer.h>
 #include <linux/workqueue.h>
 #include <scsi/iscsi_proto.h>
 #include <scsi/iscsi_if.h>
+#include <scsi/scsi_transport_iscsi.h>
 
 struct scsi_transport_template;
+struct scsi_host_template;
 struct scsi_device;
 struct Scsi_Host;
+struct scsi_target;
 struct scsi_cmnd;
 struct socket;
 struct iscsi_transport;
@@ -40,21 +44,12 @@ struct iscsi_cls_session;
 struct iscsi_cls_conn;
 struct iscsi_session;
 struct iscsi_nopin;
-
-/* #define DEBUG_SCSI */
-#ifdef DEBUG_SCSI
-#define debug_scsi(fmt...) printk(KERN_INFO "iscsi: " fmt)
-#else
-#define debug_scsi(fmt...)
-#endif
+struct device;
 
 #define ISCSI_DEF_XMIT_CMDS_MAX	128	/* must be power of 2 */
-#define ISCSI_MGMT_CMDS_MAX	16	/* must be power of 2 */
+#define ISCSI_MGMT_CMDS_MAX	15
 
-#define ISCSI_MGMT_ITT_OFFSET	0xa00
-
-#define ISCSI_DEF_CMD_PER_LUN		32
-#define ISCSI_MAX_CMD_PER_LUN		128
+#define ISCSI_DEF_CMD_PER_LUN	32
 
 /* Task Mgmt states */
 enum {
@@ -69,9 +64,12 @@ enum {
 /* Connection suspend "bit" */
 #define ISCSI_SUSPEND_BIT		1
 
-#define ISCSI_ITT_MASK			(0xfff)
+#define ISCSI_ITT_MASK			0x1fff
+#define ISCSI_TOTAL_CMDS_MAX		4096
+/* this must be a power of two greater than ISCSI_MGMT_CMDS_MAX */
+#define ISCSI_TOTAL_CMDS_MIN		16
 #define ISCSI_AGE_SHIFT			28
-#define ISCSI_AGE_MASK			(0xf << ISCSI_AGE_SHIFT)
+#define ISCSI_AGE_MASK			0xf
 
 #define ISCSI_ADDRESS_BUF_LEN		64
 
@@ -82,45 +80,55 @@ enum {
 	ISCSI_DIGEST_SIZE = sizeof(__u32),
 };
 
-struct iscsi_mgmt_task {
-	/*
-	 * Becuae LLDs allocate their hdr differently, this is a pointer to
-	 * that storage. It must be setup at session creation time.
-	 */
-	struct iscsi_hdr	*hdr;
-	char			*data;		/* mgmt payload */
-	unsigned		data_count;	/* counts data to be sent */
-	uint32_t		itt;		/* this ITT */
-	void			*dd_data;	/* driver/transport data */
-	struct list_head	running;
-};
 
 enum {
+	ISCSI_TASK_FREE,
 	ISCSI_TASK_COMPLETED,
 	ISCSI_TASK_PENDING,
 	ISCSI_TASK_RUNNING,
+	ISCSI_TASK_ABRT_TMF,		/* aborted due to TMF */
+	ISCSI_TASK_ABRT_SESS_RECOV,	/* aborted due to session recovery */
 };
 
-struct iscsi_cmd_task {
+struct iscsi_r2t_info {
+	__be32			ttt;		/* copied from R2T */
+	__be32			exp_statsn;	/* copied from R2T */
+	uint32_t		data_length;	/* copied from R2T */
+	uint32_t		data_offset;	/* copied from R2T */
+	int			data_count;	/* DATA-Out payload progress */
+	int			datasn;
+	/* LLDs should set/update these values */
+	int			sent;		/* R2T sequence progress */
+};
+
+struct iscsi_task {
 	/*
 	 * Because LLDs allocate their hdr differently, this is a pointer
 	 * and length to that storage. It must be setup at session
 	 * creation time.
 	 */
-	struct iscsi_cmd	*hdr;
+	struct iscsi_hdr	*hdr;
 	unsigned short		hdr_max;
 	unsigned short		hdr_len;	/* accumulated size of hdr used */
+	/* copied values in case we need to send tmfs */
+	itt_t			hdr_itt;
+	__be32			cmdsn;
+	uint8_t			lun[8];
+
 	int			itt;		/* this ITT */
 
-	uint32_t		unsol_datasn;
 	unsigned		imm_count;	/* imm-data (bytes)   */
-	unsigned		unsol_count;	/* unsolicited (bytes)*/
 	/* offset in unsolicited stream (bytes); */
-	unsigned		unsol_offset;
-	unsigned		data_count;	/* remaining Data-Out */
+	struct iscsi_r2t_info	unsol_r2t;
+	char			*data;		/* mgmt payload */
+	unsigned		data_count;
 	struct scsi_cmnd	*sc;		/* associated SCSI cmd*/
 	struct iscsi_conn	*conn;		/* used connection    */
 
+	/* data processing tracking */
+	unsigned long		last_xfer;
+	unsigned long		last_timeout;
+	bool			have_checked_conn;
 	/* state set/tested under session->lock */
 	int			state;
 	atomic_t		refcount;
@@ -128,9 +136,14 @@ struct iscsi_cmd_task {
 	void			*dd_data;	/* driver/transport data */
 };
 
-static inline void* iscsi_next_hdr(struct iscsi_cmd_task *ctask)
+static inline int iscsi_task_has_unsol_data(struct iscsi_task *task)
 {
-	return (void*)ctask->hdr + ctask->hdr_len;
+	return task->unsol_r2t.data_length > task->unsol_r2t.sent;
+}
+
+static inline void* iscsi_next_hdr(struct iscsi_task *task)
+{
+	return (void*)task->hdr + task->hdr_len;
 }
 
 /* Connection's states */
@@ -146,11 +159,6 @@ struct iscsi_conn {
 	void			*dd_data;	/* iscsi_transport data */
 	struct iscsi_session	*session;	/* parent session */
 	/*
-	 * LLDs should set this lock. It protects the transport recv
-	 * code
-	 */
-	rwlock_t		*recv_lock;
-	/*
 	 * conn_stop() flag: stop to recover, stop to terminate
 	 */
         int			stop_stage;
@@ -159,7 +167,7 @@ struct iscsi_conn {
 	unsigned long		last_ping;
 	int			ping_timeout;
 	int			recv_timeout;
-	struct iscsi_mgmt_task	*ping_mtask;
+	struct iscsi_task 	*ping_task;
 
 	/* iSCSI connection-wide sequencing */
 	uint32_t		exp_statsn;
@@ -175,15 +183,12 @@ struct iscsi_conn {
 	 * should always fit in this buffer
 	 */
 	char			*data;
-	struct iscsi_mgmt_task	*login_mtask;	/* mtask used for login/text */
-	struct iscsi_mgmt_task	*mtask;		/* xmit mtask in progress */
-	struct iscsi_cmd_task	*ctask;		/* xmit ctask in progress */
+	struct iscsi_task 	*login_task;	/* mtask used for login/text */
+	struct iscsi_task	*task;		/* xmit task in progress */
 
 	/* xmit */
 	struct list_head	mgmtqueue;	/* mgmt (control) xmit queue */
-	struct list_head	mgmt_run_list;	/* list of control tasks */
-	struct list_head	xmitqueue;	/* data-path cmd queue */
-	struct list_head	run_list;	/* list of cmds in progress */
+	struct list_head	cmdqueue;	/* data-path cmd queue */
 	struct list_head	requeue;	/* tasks needing another run */
 	struct work_struct	xmitwork;	/* per-conn. xmit workqueue */
 	unsigned long		suspend_tx;	/* suspend Tx */
@@ -208,9 +213,6 @@ struct iscsi_conn {
 	/* remote portal currently connected to */
 	int			portal_port;
 	char			portal_address[ISCSI_ADDRESS_BUF_LEN];
-	/* local address */
-	int			local_port;
-	char			local_address[ISCSI_ADDRESS_BUF_LEN];
 
 	/* MIB-statistics */
 	uint64_t		txdata_octets;
@@ -246,6 +248,7 @@ enum {
 };
 
 struct iscsi_session {
+	struct iscsi_cls_session *cls_session;
 	/*
 	 * Syncs up the scsi eh thread with the iscsi eh thread when sending
 	 * task management functions. This must be taken before the session
@@ -281,10 +284,8 @@ struct iscsi_session {
 	char			*password;
 	char			*password_in;
 	char			*targetname;
+	char			*ifacename;
 	char			*initiatorname;
-	/* hw address or netdev iscsi connection is bound to */
-	char			*hwaddress;
-	char			*netdev;
 	/* control data */
 	struct iscsi_transport	*tt;
 	struct Scsi_Host	*host;
@@ -298,12 +299,35 @@ struct iscsi_session {
 	int			state;		/* session state           */
 	int			age;		/* counts session re-opens */
 
+	int			scsi_cmds_max; 	/* max scsi commands */
 	int			cmds_max;	/* size of cmds array */
-	struct iscsi_cmd_task	**cmds;		/* Original Cmds arr */
+	struct iscsi_task	**cmds;		/* Original Cmds arr */
 	struct iscsi_pool	cmdpool;	/* PDU's pool */
-	int			mgmtpool_max;	/* size of mgmt array */
-	struct iscsi_mgmt_task	**mgmt_cmds;	/* Original mgmt arr */
-	struct iscsi_pool	mgmtpool;	/* Mgmt PDU's pool */
+	void			*dd_data;	/* LLD private data */
+};
+
+enum {
+	ISCSI_HOST_SETUP,
+	ISCSI_HOST_REMOVED,
+};
+
+struct iscsi_host {
+	char			*initiatorname;
+	/* hw address or netdev iscsi connection is bound to */
+	char			*hwaddress;
+	char			*netdev;
+	/* local address */
+	int			local_port;
+	char			local_address[ISCSI_ADDRESS_BUF_LEN];
+
+	wait_queue_head_t	session_removal_wq;
+	/* protects sessions and state */
+	spinlock_t		lock;
+	int			num_sessions;
+	int			state;
+
+	struct workqueue_struct	*workq;
+	char			workq_name[20];
 };
 
 /*
@@ -311,74 +335,90 @@ struct iscsi_session {
  */
 extern int iscsi_change_queue_depth(struct scsi_device *sdev, int depth);
 extern int iscsi_eh_abort(struct scsi_cmnd *sc);
-extern int iscsi_eh_host_reset(struct scsi_cmnd *sc);
+extern int iscsi_eh_target_reset(struct scsi_cmnd *sc);
 extern int iscsi_eh_device_reset(struct scsi_cmnd *sc);
 extern int iscsi_queuecommand(struct scsi_cmnd *sc,
 			      void (*done)(struct scsi_cmnd *));
 
-
 /*
  * iSCSI host helpers.
  */
+#define iscsi_host_priv(_shost) \
+	(shost_priv(_shost) + sizeof(struct iscsi_host))
+
 extern int iscsi_host_set_param(struct Scsi_Host *shost,
 				enum iscsi_host_param param, char *buf,
 				int buflen);
 extern int iscsi_host_get_param(struct Scsi_Host *shost,
 				enum iscsi_host_param param, char *buf);
+extern int iscsi_host_add(struct Scsi_Host *shost, struct device *pdev);
+extern struct Scsi_Host *iscsi_host_alloc(struct scsi_host_template *sht,
+					  int dd_data_size,
+					  bool xmit_can_sleep);
+extern void iscsi_host_remove(struct Scsi_Host *shost);
+extern void iscsi_host_free(struct Scsi_Host *shost);
+extern int iscsi_target_alloc(struct scsi_target *starget);
 
 /*
  * session management
  */
 extern struct iscsi_cls_session *
-iscsi_session_setup(struct iscsi_transport *, struct scsi_transport_template *,
-		    uint16_t, uint16_t, int, int, uint32_t, uint32_t *);
+iscsi_session_setup(struct iscsi_transport *, struct Scsi_Host *shost,
+		    uint16_t, int, int, uint32_t, unsigned int);
 extern void iscsi_session_teardown(struct iscsi_cls_session *);
-extern struct iscsi_session *class_to_transport_session(struct iscsi_cls_session *);
 extern void iscsi_session_recovery_timedout(struct iscsi_cls_session *);
 extern int iscsi_set_param(struct iscsi_cls_conn *cls_conn,
 			   enum iscsi_param param, char *buf, int buflen);
 extern int iscsi_session_get_param(struct iscsi_cls_session *cls_session,
 				   enum iscsi_param param, char *buf);
 
-#define session_to_cls(_sess) \
-	hostdata_session(_sess->host->hostdata)
-
 #define iscsi_session_printk(prefix, _sess, fmt, a...)	\
-	iscsi_cls_session_printk(prefix,		\
-		(struct iscsi_cls_session *)session_to_cls(_sess), fmt, ##a)
+	iscsi_cls_session_printk(prefix, _sess->cls_session, fmt, ##a)
 
 /*
  * connection management
  */
 extern struct iscsi_cls_conn *iscsi_conn_setup(struct iscsi_cls_session *,
-					       uint32_t);
+					       int, uint32_t);
 extern void iscsi_conn_teardown(struct iscsi_cls_conn *);
 extern int iscsi_conn_start(struct iscsi_cls_conn *);
 extern void iscsi_conn_stop(struct iscsi_cls_conn *, int);
 extern int iscsi_conn_bind(struct iscsi_cls_session *, struct iscsi_cls_conn *,
 			   int);
 extern void iscsi_conn_failure(struct iscsi_conn *conn, enum iscsi_err err);
+extern void iscsi_session_failure(struct iscsi_session *session,
+				  enum iscsi_err err);
 extern int iscsi_conn_get_param(struct iscsi_cls_conn *cls_conn,
 				enum iscsi_param param, char *buf);
+extern void iscsi_suspend_tx(struct iscsi_conn *conn);
+extern void iscsi_suspend_queue(struct iscsi_conn *conn);
+extern void iscsi_conn_queue_work(struct iscsi_conn *conn);
 
 #define iscsi_conn_printk(prefix, _c, fmt, a...) \
-	iscsi_cls_conn_printk(prefix, _c->cls_conn, fmt, ##a)
+	iscsi_cls_conn_printk(prefix, ((struct iscsi_conn *)_c)->cls_conn, \
+			      fmt, ##a)
 
 /*
  * pdu and task processing
  */
 extern void iscsi_update_cmdsn(struct iscsi_session *, struct iscsi_nopin *);
-extern void iscsi_prep_unsolicit_data_pdu(struct iscsi_cmd_task *,
-					struct iscsi_data *hdr);
+extern void iscsi_prep_data_out_pdu(struct iscsi_task *task,
+				    struct iscsi_r2t_info *r2t,
+				    struct iscsi_data *hdr);
 extern int iscsi_conn_send_pdu(struct iscsi_cls_conn *, struct iscsi_hdr *,
 				char *, uint32_t);
 extern int iscsi_complete_pdu(struct iscsi_conn *, struct iscsi_hdr *,
 			      char *, int);
-extern int iscsi_verify_itt(struct iscsi_conn *, struct iscsi_hdr *,
-			    uint32_t *);
-extern void iscsi_requeue_ctask(struct iscsi_cmd_task *ctask);
-extern void iscsi_free_mgmt_task(struct iscsi_conn *conn,
-				 struct iscsi_mgmt_task *mtask);
+extern int __iscsi_complete_pdu(struct iscsi_conn *, struct iscsi_hdr *,
+				char *, int);
+extern int iscsi_verify_itt(struct iscsi_conn *, itt_t);
+extern struct iscsi_task *iscsi_itt_to_ctask(struct iscsi_conn *, itt_t);
+extern struct iscsi_task *iscsi_itt_to_task(struct iscsi_conn *, itt_t);
+extern void iscsi_requeue_task(struct iscsi_task *task);
+extern void iscsi_put_task(struct iscsi_task *task);
+extern void __iscsi_get_task(struct iscsi_task *task);
+extern void iscsi_complete_scsi_task(struct iscsi_task *task,
+				     uint32_t exp_cmdsn, uint32_t max_cmdsn);
 
 /*
  * generic helpers

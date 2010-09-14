@@ -4,7 +4,6 @@
  */
 
 #include <linux/device.h>
-#include <linux/kallsyms.h>
 #include <linux/kernel.h>
 #include <linux/sched.h>
 #include <linux/module.h>
@@ -84,9 +83,9 @@ void mips_mt_regdump(unsigned long mvpctl)
 				       read_vpe_c0_vpeconf0());
 				printk("   VPE%d.Status : %08lx\n",
 				       i, read_vpe_c0_status());
-				printk("   VPE%d.EPC : %08lx ",
-				       i, read_vpe_c0_epc());
-				print_symbol("%s\n", read_vpe_c0_epc());
+				printk("   VPE%d.EPC : %08lx %pS\n",
+				       i, read_vpe_c0_epc(),
+				       (void *) read_vpe_c0_epc());
 				printk("   VPE%d.Cause : %08lx\n",
 				       i, read_vpe_c0_cause());
 				printk("   VPE%d.Config7 : %08lx\n",
@@ -111,8 +110,8 @@ void mips_mt_regdump(unsigned long mvpctl)
 		}
 		printk("   TCStatus : %08lx\n", tcstatval);
 		printk("   TCBind : %08lx\n", read_tc_c0_tcbind());
-		printk("   TCRestart : %08lx ", read_tc_c0_tcrestart());
-		print_symbol("%s\n", read_tc_c0_tcrestart());
+		printk("   TCRestart : %08lx %pS\n",
+		       read_tc_c0_tcrestart(), (void *) read_tc_c0_tcrestart());
 		printk("   TCHalt : %08lx\n", haltval);
 		printk("   TCContext : %08lx\n", read_tc_c0_tccontext());
 		if (!haltval)
@@ -126,10 +125,10 @@ void mips_mt_regdump(unsigned long mvpctl)
 	local_irq_restore(flags);
 }
 
-static int mt_opt_norps = 0;
+static int mt_opt_norps;
 static int mt_opt_rpsctl = -1;
 static int mt_opt_nblsu = -1;
-static int mt_opt_forceconfig7 = 0;
+static int mt_opt_forceconfig7;
 static int mt_opt_config7 = -1;
 
 static int __init rps_disable(char *s)
@@ -162,8 +161,8 @@ static int __init config7_set(char *str)
 __setup("config7=", config7_set);
 
 /* Experimental cache flush control parameters that should go away some day */
-int mt_protiflush = 0;
-int mt_protdflush = 0;
+int mt_protiflush;
+int mt_protdflush;
 int mt_n_iflushes = 1;
 int mt_n_dflushes = 1;
 
@@ -195,7 +194,7 @@ static int __init ndflush(char *s)
 }
 __setup("ndflush=", ndflush);
 
-static unsigned int itc_base = 0;
+static unsigned int itc_base;
 
 static int __init set_itc_base(char *str)
 {

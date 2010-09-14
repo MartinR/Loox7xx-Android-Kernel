@@ -39,8 +39,6 @@ struct inet6_ifaddr
 	
 	__u32			valid_lft;
 	__u32			prefered_lft;
-	unsigned long		cstamp;	/* created timestamp */
-	unsigned long		tstamp; /* updated timestamp */
 	atomic_t		refcnt;
 	spinlock_t		lock;
 
@@ -48,6 +46,9 @@ struct inet6_ifaddr
 	__u8			flags;
 
 	__u16			scope;
+
+	unsigned long		cstamp;	/* created timestamp */
+	unsigned long		tstamp; /* updated timestamp */
 
 	struct timer_list	timer;
 
@@ -148,7 +149,6 @@ struct ifacaddr6
 #define	IFA_HOST	IPV6_ADDR_LOOPBACK
 #define	IFA_LINK	IPV6_ADDR_LINKLOCAL
 #define	IFA_SITE	IPV6_ADDR_SITELOCAL
-#define	IFA_GLOBAL	0x0000U
 
 struct ipv6_devstat {
 	struct proc_dir_entry	*proc_dir_entry;
@@ -193,8 +193,6 @@ struct inet6_dev
 	unsigned long		tstamp; /* ipv6InterfaceTable update timestamp */
 	struct rcu_head		rcu;
 };
-
-extern struct ipv6_devconf ipv6_devconf;
 
 static inline void ipv6_eth_mc_map(struct in6_addr *addr, char *buf)
 {

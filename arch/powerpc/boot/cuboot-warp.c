@@ -10,6 +10,7 @@
 #include "ops.h"
 #include "4xx.h"
 #include "cuboot.h"
+#include "stdio.h"
 
 #define TARGET_4xx
 #define TARGET_44x
@@ -19,14 +20,11 @@ static bd_t bd;
 
 static void warp_fixups(void)
 {
-	unsigned long sysclk = 66000000;
-
-	ibm440ep_fixup_clocks(sysclk, 11059200, 50000000);
+	ibm440ep_fixup_clocks(66000000, 11059200, 50000000);
 	ibm4xx_sdram_fixup_memsize();
 	ibm4xx_fixup_ebc_ranges("/plb/opb/ebc");
 	dt_fixup_mac_address_by_alias("ethernet0", bd.bi_enetaddr);
 }
-
 
 void platform_init(unsigned long r3, unsigned long r4, unsigned long r5,
 		   unsigned long r6, unsigned long r7)

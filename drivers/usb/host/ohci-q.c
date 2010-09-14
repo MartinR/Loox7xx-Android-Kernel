@@ -49,6 +49,12 @@ __acquires(ohci->lock)
 	switch (usb_pipetype (urb->pipe)) {
 	case PIPE_ISOCHRONOUS:
 		ohci_to_hcd(ohci)->self.bandwidth_isoc_reqs--;
+		if (ohci_to_hcd(ohci)->self.bandwidth_isoc_reqs == 0) {
+			if (quirk_amdiso(ohci))
+				quirk_amd_pll(1);
+			if (quirk_amdprefetch(ohci))
+				sb800_prefetch(ohci, 0);
+		}
 		break;
 	case PIPE_INTERRUPT:
 		ohci_to_hcd(ohci)->self.bandwidth_int_reqs--;
@@ -158,9 +164,6 @@ static void periodic_link (struct ohci_hcd *ohci, struct ed *ed)
 static int ed_schedule (struct ohci_hcd *ohci, struct ed *ed)
 {
 	int	branch;
-
-	if (ohci_to_hcd(ohci)->state == HC_STATE_QUIESCING)
-		return -EAGAIN;
 
 	ed->state = ED_OPER;
 	ed->ed_prev = NULL;
@@ -418,7 +421,7 @@ static struct ed *ed_get (
 		is_out = !(ep->desc.bEndpointAddress & USB_DIR_IN);
 
 		/* FIXME usbcore changes dev->devnum before SET_ADDRESS
-		 * suceeds ... otherwise we wouldn't need "pipe".
+		 * succeeds ... otherwise we wouldn't need "pipe".
 		 */
 		info = usb_pipedevice (pipe);
 		ed->type = usb_pipetype(pipe);
@@ -679,6 +682,12 @@ static void td_submit_urb (
 			td_fill (ohci, TD_CC | TD_ISO | frame,
 				data + urb->iso_frame_desc [cnt].offset,
 				urb->iso_frame_desc [cnt].length, urb, cnt);
+		}
+		if (ohci_to_hcd(ohci)->self.bandwidth_isoc_reqs == 0) {
+			if (quirk_amdiso(ohci))
+				quirk_amd_pll(0);
+			if (quirk_amdprefetch(ohci))
+				sb800_prefetch(ohci, 1);
 		}
 		periodic = ohci_to_hcd(ohci)->self.bandwidth_isoc_reqs++ == 0
 			&& ohci_to_hcd(ohci)->self.bandwidth_int_reqs == 0;

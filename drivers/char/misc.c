@@ -49,6 +49,7 @@
 #include <linux/device.h>
 #include <linux/tty.h>
 #include <linux/kmod.h>
+#include <linux/smp_lock.h>
 
 /*
  * Head entry for the doubly linked miscdevice list
@@ -90,7 +91,7 @@ static int misc_seq_show(struct seq_file *seq, void *v)
 }
 
 
-static struct seq_operations misc_seq_ops = {
+static const struct seq_operations misc_seq_ops = {
 	.start = misc_seq_start,
 	.next  = misc_seq_next,
 	.stop  = misc_seq_stop,
@@ -118,6 +119,7 @@ static int misc_open(struct inode * inode, struct file * file)
 	int err = -ENODEV;
 	const struct file_operations *old_fops, *new_fops = NULL;
 	
+	lock_kernel();
 	mutex_lock(&misc_mtx);
 	
 	list_for_each_entry(c, &misc_list, list) {
@@ -155,6 +157,7 @@ static int misc_open(struct inode * inode, struct file * file)
 	fops_put(old_fops);
 fail:
 	mutex_unlock(&misc_mtx);
+	unlock_kernel();
 	return err;
 }
 
@@ -164,7 +167,6 @@ static const struct file_operations misc_fops = {
 	.owner		= THIS_MODULE,
 	.open		= misc_open,
 };
-
 
 /**
  *	misc_register	-	register a miscellaneous device
@@ -215,7 +217,7 @@ int misc_register(struct miscdevice * misc)
 	dev = MKDEV(MISC_MAJOR, misc->minor);
 
 	misc->this_device = device_create(misc_class, misc->parent, dev,
-					  "%s", misc->name);
+					  misc, "%s", misc->name);
 	if (IS_ERR(misc->this_device)) {
 		err = PTR_ERR(misc->this_device);
 		goto out;
@@ -261,6 +263,17 @@ int misc_deregister(struct miscdevice *misc)
 EXPORT_SYMBOL(misc_register);
 EXPORT_SYMBOL(misc_deregister);
 
+static char *misc_devnode(struct device *dev, mode_t *mode)
+{
+	struct miscdevice *c = dev_get_drvdata(dev);
+
+	if (mode && c->mode)
+		*mode = c->mode;
+	if (c->nodename)
+		return kstrdup(c->nodename, GFP_KERNEL);
+	return NULL;
+}
+
 static int __init misc_init(void)
 {
 	int err;
@@ -276,6 +289,7 @@ static int __init misc_init(void)
 	err = -EIO;
 	if (register_chrdev(MISC_MAJOR,"misc",&misc_fops))
 		goto fail_printk;
+	misc_class->devnode = misc_devnode;
 	return 0;
 
 fail_printk:

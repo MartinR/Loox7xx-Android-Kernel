@@ -3,7 +3,7 @@
  *
  * SMP support for the SuperH processors.
  *
- * Copyright (C) 2002 - 2007 Paul Mundt
+ * Copyright (C) 2002 - 2008 Paul Mundt
  * Copyright (C) 2006 - 2007 Akio Idehara
  *
  * This file is subject to the terms and conditions of the GNU General Public
@@ -18,6 +18,7 @@
 #include <linux/spinlock.h>
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/cpu.h>
 #include <linux/interrupt.h>
 #include <asm/atomic.h>
 #include <asm/processor.h>
@@ -30,22 +31,11 @@
 int __cpu_number_map[NR_CPUS];		/* Map physical to logical */
 int __cpu_logical_map[NR_CPUS];		/* Map logical to physical */
 
-cpumask_t cpu_possible_map;
-EXPORT_SYMBOL(cpu_possible_map);
-
-cpumask_t cpu_online_map;
-EXPORT_SYMBOL(cpu_online_map);
-
-static atomic_t cpus_booted = ATOMIC_INIT(0);
-
-/*
- * Run specified function on a particular processor.
- */
-void __smp_call_function(unsigned int cpu);
-
 static inline void __init smp_store_cpu_info(unsigned int cpu)
 {
 	struct sh_cpuinfo *c = cpu_data + cpu;
+
+	memcpy(c, &boot_cpu_data, sizeof(struct sh_cpuinfo));
 
 	c->loops_per_jiffy = loops_per_jiffy;
 }
@@ -59,7 +49,7 @@ void __init smp_prepare_cpus(unsigned int max_cpus)
 	plat_prepare_cpus(max_cpus);
 
 #ifndef CONFIG_HOTPLUG_CPU
-	cpu_present_map = cpu_possible_map;
+	init_cpu_present(&cpu_possible_map);
 #endif
 }
 
@@ -70,8 +60,8 @@ void __devinit smp_prepare_boot_cpu(void)
 	__cpu_number_map[0] = cpu;
 	__cpu_logical_map[0] = cpu;
 
-	cpu_set(cpu, cpu_online_map);
-	cpu_set(cpu, cpu_possible_map);
+	set_cpu_online(cpu, true);
+	set_cpu_possible(cpu, true);
 }
 
 asmlinkage void __cpuinit start_secondary(void)
@@ -89,11 +79,16 @@ asmlinkage void __cpuinit start_secondary(void)
 
 	preempt_disable();
 
+	notify_cpu_starting(smp_processor_id());
+
 	local_irq_enable();
 
+	cpu = smp_processor_id();
+
+	/* Enable local timers */
+	local_timer_setup(cpu);
 	calibrate_delay();
 
-	cpu = smp_processor_id();
 	smp_store_cpu_info(cpu);
 
 	cpu_set(cpu, cpu_online_map);
@@ -175,45 +170,56 @@ static void stop_this_cpu(void *unused)
 
 void smp_send_stop(void)
 {
-	smp_call_function(stop_this_cpu, 0, 1, 0);
+	smp_call_function(stop_this_cpu, 0, 0);
 }
 
-struct smp_fn_call_struct smp_fn_call = {
-	.lock		= __SPIN_LOCK_UNLOCKED(smp_fn_call.lock),
-	.finished	= ATOMIC_INIT(0),
-};
-
-/*
- * The caller of this wants the passed function to run on every cpu.  If wait
- * is set, wait until all cpus have finished the function before returning.
- * The lock is here to protect the call structure.
- * You must not call this function with disabled interrupts or from a
- * hardware interrupt handler or from a bottom half handler.
- */
-int smp_call_function(void (*func)(void *info), void *info, int retry, int wait)
+void arch_send_call_function_ipi_mask(const struct cpumask *mask)
 {
-	unsigned int nr_cpus = atomic_read(&cpus_booted);
-	int i;
+	int cpu;
 
-	/* Can deadlock when called with interrupts disabled */
-	WARN_ON(irqs_disabled());
+	for_each_cpu(cpu, mask)
+		plat_send_ipi(cpu, SMP_MSG_FUNCTION);
+}
 
-	spin_lock(&smp_fn_call.lock);
+void arch_send_call_function_single_ipi(int cpu)
+{
+	plat_send_ipi(cpu, SMP_MSG_FUNCTION_SINGLE);
+}
 
-	atomic_set(&smp_fn_call.finished, 0);
-	smp_fn_call.fn = func;
-	smp_fn_call.data = info;
+void smp_timer_broadcast(const struct cpumask *mask)
+{
+	int cpu;
 
-	for (i = 0; i < nr_cpus; i++)
-		if (i != smp_processor_id())
-			plat_send_ipi(i, SMP_MSG_FUNCTION);
+	for_each_cpu(cpu, mask)
+		plat_send_ipi(cpu, SMP_MSG_TIMER);
+}
 
-	if (wait)
-		while (atomic_read(&smp_fn_call.finished) != (nr_cpus - 1));
+static void ipi_timer(void)
+{
+	irq_enter();
+	local_timer_interrupt();
+	irq_exit();
+}
 
-	spin_unlock(&smp_fn_call.lock);
-
-	return 0;
+void smp_message_recv(unsigned int msg)
+{
+	switch (msg) {
+	case SMP_MSG_FUNCTION:
+		generic_smp_call_function_interrupt();
+		break;
+	case SMP_MSG_RESCHEDULE:
+		break;
+	case SMP_MSG_FUNCTION_SINGLE:
+		generic_smp_call_function_single_interrupt();
+		break;
+	case SMP_MSG_TIMER:
+		ipi_timer();
+		break;
+	default:
+		printk(KERN_WARNING "SMP %d: %s(): unknown IPI %d\n",
+		       smp_processor_id(), __func__, msg);
+		break;
+	}
 }
 
 /* Not really SMP stuff ... */
@@ -229,7 +235,7 @@ static void flush_tlb_all_ipi(void *info)
 
 void flush_tlb_all(void)
 {
-	on_each_cpu(flush_tlb_all_ipi, 0, 1, 1);
+	on_each_cpu(flush_tlb_all_ipi, 0, 1);
 }
 
 static void flush_tlb_mm_ipi(void *mm)
@@ -255,7 +261,7 @@ void flush_tlb_mm(struct mm_struct *mm)
 	preempt_disable();
 
 	if ((atomic_read(&mm->mm_users) != 1) || (current->mm != mm)) {
-		smp_call_function(flush_tlb_mm_ipi, (void *)mm, 1, 1);
+		smp_call_function(flush_tlb_mm_ipi, (void *)mm, 1);
 	} else {
 		int i;
 		for (i = 0; i < num_online_cpus(); i++)
@@ -292,7 +298,7 @@ void flush_tlb_range(struct vm_area_struct *vma,
 		fd.vma = vma;
 		fd.addr1 = start;
 		fd.addr2 = end;
-		smp_call_function(flush_tlb_range_ipi, (void *)&fd, 1, 1);
+		smp_call_function(flush_tlb_range_ipi, (void *)&fd, 1);
 	} else {
 		int i;
 		for (i = 0; i < num_online_cpus(); i++)
@@ -316,7 +322,7 @@ void flush_tlb_kernel_range(unsigned long start, unsigned long end)
 
 	fd.addr1 = start;
 	fd.addr2 = end;
-	on_each_cpu(flush_tlb_kernel_range_ipi, (void *)&fd, 1, 1);
+	on_each_cpu(flush_tlb_kernel_range_ipi, (void *)&fd, 1);
 }
 
 static void flush_tlb_page_ipi(void *info)
@@ -335,7 +341,7 @@ void flush_tlb_page(struct vm_area_struct *vma, unsigned long page)
 
 		fd.vma = vma;
 		fd.addr1 = page;
-		smp_call_function(flush_tlb_page_ipi, (void *)&fd, 1, 1);
+		smp_call_function(flush_tlb_page_ipi, (void *)&fd, 1);
 	} else {
 		int i;
 		for (i = 0; i < num_online_cpus(); i++)
@@ -359,6 +365,6 @@ void flush_tlb_one(unsigned long asid, unsigned long vaddr)
 	fd.addr1 = asid;
 	fd.addr2 = vaddr;
 
-	smp_call_function(flush_tlb_one_ipi, (void *)&fd, 1, 1);
+	smp_call_function(flush_tlb_one_ipi, (void *)&fd, 1);
 	local_flush_tlb_one(asid, vaddr);
 }

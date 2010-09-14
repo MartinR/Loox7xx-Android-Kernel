@@ -40,7 +40,7 @@
  *
  *
  * Alan Cox	     :  security fixes.
- *			<Alan.Cox@linux.org>
+ *			<alan@lxorguk.ukuu.org.uk>
  *
  * Al Viro           :  safe handling of mm_struct
  *
@@ -80,15 +80,13 @@
 #include <linux/delayacct.h>
 #include <linux/seq_file.h>
 #include <linux/pid_namespace.h>
+#include <linux/ptrace.h>
+#include <linux/tracehook.h>
+#include <linux/swapops.h>
 
 #include <asm/pgtable.h>
 #include <asm/processor.h>
 #include "internal.h"
-
-/* Gcc optimizes away "strlen(x)" for constant x */
-#define ADDBUF(buffer, string) \
-do { memcpy(buffer, string, strlen(string)); \
-     buffer += strlen(string); } while (0)
 
 static inline void task_name(struct seq_file *m, struct task_struct *p)
 {
@@ -163,13 +161,19 @@ static inline void task_state(struct seq_file *m, struct pid_namespace *ns,
 	struct group_info *group_info;
 	int g;
 	struct fdtable *fdt = NULL;
+	const struct cred *cred;
 	pid_t ppid, tpid;
 
 	rcu_read_lock();
 	ppid = pid_alive(p) ?
 		task_tgid_nr_ns(rcu_dereference(p->real_parent), ns) : 0;
-	tpid = pid_alive(p) && p->ptrace ?
-		task_pid_nr_ns(rcu_dereference(p->parent), ns) : 0;
+	tpid = 0;
+	if (pid_alive(p)) {
+		struct task_struct *tracer = tracehook_tracer_task(p);
+		if (tracer)
+			tpid = task_pid_nr_ns(tracer, ns);
+	}
+	cred = get_cred((struct cred *) __task_cred(p));
 	seq_printf(m,
 		"State:\t%s\n"
 		"Tgid:\t%d\n"
@@ -182,8 +186,8 @@ static inline void task_state(struct seq_file *m, struct pid_namespace *ns,
 		task_tgid_nr_ns(p, ns),
 		pid_nr_ns(pid, ns),
 		ppid, tpid,
-		p->uid, p->euid, p->suid, p->fsuid,
-		p->gid, p->egid, p->sgid, p->fsgid);
+		cred->uid, cred->euid, cred->suid, cred->fsuid,
+		cred->gid, cred->egid, cred->sgid, cred->fsgid);
 
 	task_lock(p);
 	if (p->files)
@@ -194,13 +198,12 @@ static inline void task_state(struct seq_file *m, struct pid_namespace *ns,
 		fdt ? fdt->max_fds : 0);
 	rcu_read_unlock();
 
-	group_info = p->group_info;
-	get_group_info(group_info);
+	group_info = cred->group_info;
 	task_unlock(p);
 
 	for (g = 0; g < min(group_info->ngroups, NGROUPS_SMALL); g++)
 		seq_printf(m, "%d ", GROUP_AT(group_info, g));
-	put_group_info(group_info);
+	put_cred(cred);
 
 	seq_printf(m, "\n");
 }
@@ -256,18 +259,16 @@ static inline void task_sig(struct seq_file *m, struct task_struct *p)
 	sigemptyset(&ignored);
 	sigemptyset(&caught);
 
-	rcu_read_lock();
 	if (lock_task_sighand(p, &flags)) {
 		pending = p->pending.signal;
 		shpending = p->signal->shared_pending.signal;
 		blocked = p->blocked;
 		collect_sigign_sigcatch(p, &ignored, &caught);
 		num_threads = atomic_read(&p->signal->count);
-		qsize = atomic_read(&p->user->sigpending);
+		qsize = atomic_read(&__task_cred(p)->user->sigpending);
 		qlim = p->signal->rlim[RLIMIT_SIGPENDING].rlim_cur;
 		unlock_task_sighand(p, &flags);
 	}
-	rcu_read_unlock();
 
 	seq_printf(m, "Threads:\t%d\n", num_threads);
 	seq_printf(m, "SigQ:\t%lu/%lu\n", qsize, qlim);
@@ -295,10 +296,21 @@ static void render_cap_t(struct seq_file *m, const char *header,
 
 static inline void task_cap(struct seq_file *m, struct task_struct *p)
 {
-	render_cap_t(m, "CapInh:\t", &p->cap_inheritable);
-	render_cap_t(m, "CapPrm:\t", &p->cap_permitted);
-	render_cap_t(m, "CapEff:\t", &p->cap_effective);
-	render_cap_t(m, "CapBnd:\t", &p->cap_bset);
+	const struct cred *cred;
+	kernel_cap_t cap_inheritable, cap_permitted, cap_effective, cap_bset;
+
+	rcu_read_lock();
+	cred = __task_cred(p);
+	cap_inheritable	= cred->cap_inheritable;
+	cap_permitted	= cred->cap_permitted;
+	cap_effective	= cred->cap_effective;
+	cap_bset	= cred->cap_bset;
+	rcu_read_unlock();
+
+	render_cap_t(m, "CapInh:\t", &cap_inheritable);
+	render_cap_t(m, "CapPrm:\t", &cap_permitted);
+	render_cap_t(m, "CapEff:\t", &cap_effective);
+	render_cap_t(m, "CapBnd:\t", &cap_bset);
 }
 
 static inline void task_context_switch_counts(struct seq_file *m,
@@ -309,6 +321,94 @@ static inline void task_context_switch_counts(struct seq_file *m,
 			p->nvcsw,
 			p->nivcsw);
 }
+
+#ifdef CONFIG_MMU
+
+struct stack_stats {
+	struct vm_area_struct *vma;
+	unsigned long	startpage;
+	unsigned long	usage;
+};
+
+static int stack_usage_pte_range(pmd_t *pmd, unsigned long addr,
+				unsigned long end, struct mm_walk *walk)
+{
+	struct stack_stats *ss = walk->private;
+	struct vm_area_struct *vma = ss->vma;
+	pte_t *pte, ptent;
+	spinlock_t *ptl;
+	int ret = 0;
+
+	pte = pte_offset_map_lock(vma->vm_mm, pmd, addr, &ptl);
+	for (; addr != end; pte++, addr += PAGE_SIZE) {
+		ptent = *pte;
+
+#ifdef CONFIG_STACK_GROWSUP
+		if (pte_present(ptent) || is_swap_pte(ptent))
+			ss->usage = addr - ss->startpage + PAGE_SIZE;
+#else
+		if (pte_present(ptent) || is_swap_pte(ptent)) {
+			ss->usage = ss->startpage - addr + PAGE_SIZE;
+			pte++;
+			ret = 1;
+			break;
+		}
+#endif
+	}
+	pte_unmap_unlock(pte - 1, ptl);
+	cond_resched();
+	return ret;
+}
+
+static inline unsigned long get_stack_usage_in_bytes(struct vm_area_struct *vma,
+				struct task_struct *task)
+{
+	struct stack_stats ss;
+	struct mm_walk stack_walk = {
+		.pmd_entry = stack_usage_pte_range,
+		.mm = vma->vm_mm,
+		.private = &ss,
+	};
+
+	if (!vma->vm_mm || is_vm_hugetlb_page(vma))
+		return 0;
+
+	ss.vma = vma;
+	ss.startpage = task->stack_start & PAGE_MASK;
+	ss.usage = 0;
+
+#ifdef CONFIG_STACK_GROWSUP
+	walk_page_range(KSTK_ESP(task) & PAGE_MASK, vma->vm_end,
+		&stack_walk);
+#else
+	walk_page_range(vma->vm_start, (KSTK_ESP(task) & PAGE_MASK) + PAGE_SIZE,
+		&stack_walk);
+#endif
+	return ss.usage;
+}
+
+static inline void task_show_stack_usage(struct seq_file *m,
+						struct task_struct *task)
+{
+	struct vm_area_struct	*vma;
+	struct mm_struct	*mm = get_task_mm(task);
+
+	if (mm) {
+		down_read(&mm->mmap_sem);
+		vma = find_vma(mm, task->stack_start);
+		if (vma)
+			seq_printf(m, "Stack usage:\t%lu kB\n",
+				get_stack_usage_in_bytes(vma, task) >> 10);
+
+		up_read(&mm->mmap_sem);
+		mmput(mm);
+	}
+}
+#else
+static void task_show_stack_usage(struct seq_file *m, struct task_struct *task)
+{
+}
+#endif		/* CONFIG_MMU */
 
 int proc_pid_status(struct seq_file *m, struct pid_namespace *ns,
 			struct pid *pid, struct task_struct *task)
@@ -329,66 +429,8 @@ int proc_pid_status(struct seq_file *m, struct pid_namespace *ns,
 	task_show_regs(m, task);
 #endif
 	task_context_switch_counts(m, task);
+	task_show_stack_usage(m, task);
 	return 0;
-}
-
-/*
- * Use precise platform statistics if available:
- */
-#ifdef CONFIG_VIRT_CPU_ACCOUNTING
-static cputime_t task_utime(struct task_struct *p)
-{
-	return p->utime;
-}
-
-static cputime_t task_stime(struct task_struct *p)
-{
-	return p->stime;
-}
-#else
-static cputime_t task_utime(struct task_struct *p)
-{
-	clock_t utime = cputime_to_clock_t(p->utime),
-		total = utime + cputime_to_clock_t(p->stime);
-	u64 temp;
-
-	/*
-	 * Use CFS's precise accounting:
-	 */
-	temp = (u64)nsec_to_clock_t(p->se.sum_exec_runtime);
-
-	if (total) {
-		temp *= utime;
-		do_div(temp, total);
-	}
-	utime = (clock_t)temp;
-
-	p->prev_utime = max(p->prev_utime, clock_t_to_cputime(utime));
-	return p->prev_utime;
-}
-
-static cputime_t task_stime(struct task_struct *p)
-{
-	clock_t stime;
-
-	/*
-	 * Use CFS's precise accounting. (we subtract utime from
-	 * the total, to make sure the total observed by userspace
-	 * grows monotonically - apps rely on that):
-	 */
-	stime = nsec_to_clock_t(p->se.sum_exec_runtime) -
-			cputime_to_clock_t(task_utime(p));
-
-	if (stime >= 0)
-		p->prev_stime = max(p->prev_stime, clock_t_to_cputime(stime));
-
-	return p->prev_stime;
-}
-#endif
-
-static cputime_t task_gtime(struct task_struct *p)
-{
-	return p->gtime;
 }
 
 static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
@@ -401,6 +443,7 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
 	char state;
 	pid_t ppid = 0, pgid = -1, sid = -1;
 	int num_threads = 0;
+	int permitted;
 	struct mm_struct *mm;
 	unsigned long long start_time;
 	unsigned long cmin_flt = 0, cmaj_flt = 0;
@@ -413,11 +456,14 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
 
 	state = *get_task_state(task);
 	vsize = eip = esp = 0;
+	permitted = ptrace_may_access(task, PTRACE_MODE_READ);
 	mm = get_task_mm(task);
 	if (mm) {
 		vsize = task_vsize(mm);
-		eip = KSTK_EIP(task);
-		esp = KSTK_ESP(task);
+		if (permitted) {
+			eip = KSTK_EIP(task);
+			esp = KSTK_ESP(task);
+		}
 	}
 
 	get_task_comm(tcomm, task);
@@ -449,20 +495,20 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
 
 		/* add up live thread stats at the group level */
 		if (whole) {
+			struct task_cputime cputime;
 			struct task_struct *t = task;
 			do {
 				min_flt += t->min_flt;
 				maj_flt += t->maj_flt;
-				utime = cputime_add(utime, task_utime(t));
-				stime = cputime_add(stime, task_stime(t));
 				gtime = cputime_add(gtime, task_gtime(t));
 				t = next_thread(t);
 			} while (t != task);
 
 			min_flt += sig->min_flt;
 			maj_flt += sig->maj_flt;
-			utime = cputime_add(utime, sig->utime);
-			stime = cputime_add(stime, sig->stime);
+			thread_group_cputime(task, &cputime);
+			utime = cputime.utime;
+			stime = cputime.stime;
 			gtime = cputime_add(gtime, sig->gtime);
 		}
 
@@ -473,7 +519,7 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
 		unlock_task_sighand(task, &flags);
 	}
 
-	if (!whole || num_threads < 2)
+	if (permitted && (!whole || num_threads < 2))
 		wchan = get_wchan(task);
 	if (!whole) {
 		min_flt = task->min_flt;
@@ -525,7 +571,7 @@ static int do_task_stat(struct seq_file *m, struct pid_namespace *ns,
 		rsslim,
 		mm ? mm->start_code : 0,
 		mm ? mm->end_code : 0,
-		mm ? mm->start_stack : 0,
+		(permitted && mm) ? task->stack_start : 0,
 		esp,
 		eip,
 		/* The signal information here is obsolete.

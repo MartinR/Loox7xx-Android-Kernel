@@ -39,6 +39,7 @@
 #include <linux/skbuff.h>
 #include <linux/interrupt.h>
 #include <linux/notifier.h>
+#include <linux/rfkill.h>
 #include <net/sock.h>
 
 #include <asm/system.h>
@@ -47,11 +48,6 @@
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
-
-#ifndef CONFIG_BT_HCI_CORE_DEBUG
-#undef  BT_DBG
-#define BT_DBG(D...)
-#endif
 
 static void hci_cmd_task(unsigned long arg);
 static void hci_rx_task(unsigned long arg);
@@ -164,6 +160,9 @@ static inline int hci_request(struct hci_dev *hdev, void (*req)(struct hci_dev *
 {
 	int ret;
 
+	if (!test_bit(HCI_UP, &hdev->flags))
+		return -ENETDOWN;
+
 	/* Serialize all requests */
 	hci_req_lock(hdev);
 	ret = __hci_request(hdev, req, opt, timeout);
@@ -202,7 +201,7 @@ static void hci_init_req(struct hci_dev *hdev, unsigned long opt)
 	/* Mandatory initialization */
 
 	/* Reset */
-	if (test_bit(HCI_QUIRK_RESET_ON_INIT, &hdev->quirks))
+	if (!test_bit(HCI_QUIRK_NO_RESET, &hdev->quirks))
 			hci_send_cmd(hdev, HCI_OP_RESET, 0, NULL);
 
 	/* Read Local Supported Features */
@@ -279,8 +278,18 @@ static void hci_encrypt_req(struct hci_dev *hdev, unsigned long opt)
 
 	BT_DBG("%s %x", hdev->name, encrypt);
 
-	/* Authentication */
+	/* Encryption */
 	hci_send_cmd(hdev, HCI_OP_WRITE_ENCRYPT_MODE, 1, &encrypt);
+}
+
+static void hci_linkpol_req(struct hci_dev *hdev, unsigned long opt)
+{
+	__le16 policy = cpu_to_le16(opt);
+
+	BT_DBG("%s %x", hdev->name, policy);
+
+	/* Default link policy */
+	hci_send_cmd(hdev, HCI_OP_WRITE_DEF_LINK_POLICY, 2, &policy);
 }
 
 /* Get HCI device by index.
@@ -467,6 +476,11 @@ int hci_dev_open(__u16 dev)
 	BT_DBG("%s %p", hdev->name, hdev);
 
 	hci_req_lock(hdev);
+
+	if (hdev->rfkill && rfkill_blocked(hdev->rfkill)) {
+		ret = -ERFKILL;
+		goto done;
+	}
 
 	if (test_bit(HCI_UP, &hdev->flags)) {
 		ret = -EALREADY;
@@ -694,32 +708,35 @@ int hci_dev_cmd(unsigned int cmd, void __user *arg)
 					msecs_to_jiffies(HCI_INIT_TIMEOUT));
 		break;
 
+	case HCISETLINKPOL:
+		err = hci_request(hdev, hci_linkpol_req, dr.dev_opt,
+					msecs_to_jiffies(HCI_INIT_TIMEOUT));
+		break;
+
+	case HCISETLINKMODE:
+		hdev->link_mode = ((__u16) dr.dev_opt) &
+					(HCI_LM_MASTER | HCI_LM_ACCEPT);
+		break;
+
 	case HCISETPTYPE:
 		hdev->pkt_type = (__u16) dr.dev_opt;
 		break;
 
-	case HCISETLINKPOL:
-		hdev->link_policy = (__u16) dr.dev_opt;
-		break;
-
-	case HCISETLINKMODE:
-		hdev->link_mode = ((__u16) dr.dev_opt) & (HCI_LM_MASTER | HCI_LM_ACCEPT);
-		break;
-
 	case HCISETACLMTU:
-		hdev->acl_mtu  = *((__u16 *)&dr.dev_opt + 1);
-		hdev->acl_pkts = *((__u16 *)&dr.dev_opt + 0);
+		hdev->acl_mtu  = *((__u16 *) &dr.dev_opt + 1);
+		hdev->acl_pkts = *((__u16 *) &dr.dev_opt + 0);
 		break;
 
 	case HCISETSCOMTU:
-		hdev->sco_mtu  = *((__u16 *)&dr.dev_opt + 1);
-		hdev->sco_pkts = *((__u16 *)&dr.dev_opt + 0);
+		hdev->sco_mtu  = *((__u16 *) &dr.dev_opt + 1);
+		hdev->sco_pkts = *((__u16 *) &dr.dev_opt + 0);
 		break;
 
 	default:
 		err = -EINVAL;
 		break;
 	}
+
 	hci_dev_put(hdev);
 	return err;
 }
@@ -740,7 +757,7 @@ int hci_get_dev_list(void __user *arg)
 
 	size = sizeof(*dl) + dev_num * sizeof(*dr);
 
-	if (!(dl = kmalloc(size, GFP_KERNEL)))
+	if (!(dl = kzalloc(size, GFP_KERNEL)))
 		return -ENOMEM;
 
 	dr = dl->dev_req;
@@ -802,6 +819,24 @@ int hci_get_dev_info(void __user *arg)
 
 /* ---- Interface to HCI drivers ---- */
 
+static int hci_rfkill_set_block(void *data, bool blocked)
+{
+	struct hci_dev *hdev = data;
+
+	BT_DBG("%p name %s blocked %d", hdev, hdev->name, blocked);
+
+	if (!blocked)
+		return 0;
+
+	hci_dev_do_close(hdev);
+
+	return 0;
+}
+
+static const struct rfkill_ops hci_rfkill_ops = {
+	.set_block = hci_rfkill_set_block,
+};
+
 /* Alloc HCI device */
 struct hci_dev *hci_alloc_dev(void)
 {
@@ -833,7 +868,8 @@ int hci_register_dev(struct hci_dev *hdev)
 	struct list_head *head = &hci_dev_list, *p;
 	int i, id = 0;
 
-	BT_DBG("%p name %s type %d owner %p", hdev, hdev->name, hdev->type, hdev->owner);
+	BT_DBG("%p name %s type %d owner %p", hdev, hdev->name,
+						hdev->type, hdev->owner);
 
 	if (!hdev->open || !hdev->close || !hdev->destruct)
 		return -EINVAL;
@@ -875,7 +911,7 @@ int hci_register_dev(struct hci_dev *hdev)
 		hdev->reassembly[i] = NULL;
 
 	init_waitqueue_head(&hdev->req_wait_q);
-	init_MUTEX(&hdev->req_lock);
+	mutex_init(&hdev->req_lock);
 
 	inquiry_cache_init(hdev);
 
@@ -888,6 +924,15 @@ int hci_register_dev(struct hci_dev *hdev)
 	write_unlock_bh(&hci_dev_list_lock);
 
 	hci_register_sysfs(hdev);
+
+	hdev->rfkill = rfkill_alloc(hdev->name, &hdev->dev,
+				RFKILL_TYPE_BLUETOOTH, &hci_rfkill_ops, hdev);
+	if (hdev->rfkill) {
+		if (rfkill_register(hdev->rfkill) < 0) {
+			rfkill_destroy(hdev->rfkill);
+			hdev->rfkill = NULL;
+		}
+	}
 
 	hci_notify(hdev, HCI_DEV_REG);
 
@@ -912,6 +957,11 @@ int hci_unregister_dev(struct hci_dev *hdev)
 		kfree_skb(hdev->reassembly[i]);
 
 	hci_notify(hdev, HCI_DEV_UNREG);
+
+	if (hdev->rfkill) {
+		rfkill_unregister(hdev->rfkill);
+		rfkill_destroy(hdev->rfkill);
+	}
 
 	hci_unregister_sysfs(hdev);
 
@@ -1270,9 +1320,12 @@ static inline struct hci_conn *hci_low_sent(struct hci_dev *hdev, __u8 type, int
 		struct hci_conn *c;
 		c = list_entry(p, struct hci_conn, list);
 
-		if (c->type != type || c->state != BT_CONNECTED
-				|| skb_queue_empty(&c->data_q))
+		if (c->type != type || skb_queue_empty(&c->data_q))
 			continue;
+
+		if (c->state != BT_CONNECTED && c->state != BT_CONFIG)
+			continue;
+
 		num++;
 
 		if (c->sent < min) {
@@ -1551,8 +1604,7 @@ static void hci_cmd_task(unsigned long arg)
 
 	/* Send queued commands */
 	if (atomic_read(&hdev->cmd_cnt) && (skb = skb_dequeue(&hdev->cmd_q))) {
-		if (hdev->sent_cmd)
-			kfree_skb(hdev->sent_cmd);
+		kfree_skb(hdev->sent_cmd);
 
 		if ((hdev->sent_cmd = skb_clone(skb, GFP_ATOMIC))) {
 			atomic_dec(&hdev->cmd_cnt);

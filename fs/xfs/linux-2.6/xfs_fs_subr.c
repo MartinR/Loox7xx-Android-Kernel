@@ -24,6 +24,10 @@ int  fs_noerr(void) { return 0; }
 int  fs_nosys(void) { return ENOSYS; }
 void fs_noval(void) { return; }
 
+/*
+ * note: all filemap functions return negative error codes. These
+ * need to be inverted before returning to the xfs core functions.
+ */
 void
 xfs_tosspages(
 	xfs_inode_t	*ip,
@@ -31,7 +35,7 @@ xfs_tosspages(
 	xfs_off_t	last,
 	int		fiopt)
 {
-	struct address_space *mapping = ip->i_vnode->i_mapping;
+	struct address_space *mapping = VFS_I(ip)->i_mapping;
 
 	if (mapping->nrpages)
 		truncate_inode_pages(mapping, first);
@@ -44,7 +48,7 @@ xfs_flushinval_pages(
 	xfs_off_t	last,
 	int		fiopt)
 {
-	struct address_space *mapping = ip->i_vnode->i_mapping;
+	struct address_space *mapping = VFS_I(ip)->i_mapping;
 	int		ret = 0;
 
 	if (mapping->nrpages) {
@@ -53,7 +57,7 @@ xfs_flushinval_pages(
 		if (!ret)
 			truncate_inode_pages(mapping, first);
 	}
-	return ret;
+	return -ret;
 }
 
 int
@@ -64,18 +68,31 @@ xfs_flush_pages(
 	uint64_t	flags,
 	int		fiopt)
 {
-	struct address_space *mapping = ip->i_vnode->i_mapping;
+	struct address_space *mapping = VFS_I(ip)->i_mapping;
 	int		ret = 0;
 	int		ret2;
 
 	if (mapping_tagged(mapping, PAGECACHE_TAG_DIRTY)) {
 		xfs_iflags_clear(ip, XFS_ITRUNCATED);
-		ret = filemap_fdatawrite(mapping);
-		if (flags & XFS_B_ASYNC)
-			return ret;
-		ret2 = filemap_fdatawait(mapping);
-		if (!ret)
-			ret = ret2;
+		ret = -filemap_fdatawrite(mapping);
 	}
+	if (flags & XFS_B_ASYNC)
+		return ret;
+	ret2 = xfs_wait_on_pages(ip, first, last);
+	if (!ret)
+		ret = ret2;
 	return ret;
+}
+
+int
+xfs_wait_on_pages(
+	xfs_inode_t	*ip,
+	xfs_off_t	first,
+	xfs_off_t	last)
+{
+	struct address_space *mapping = VFS_I(ip)->i_mapping;
+
+	if (mapping_tagged(mapping, PAGECACHE_TAG_WRITEBACK))
+		return -filemap_fdatawait(mapping);
+	return 0;
 }

@@ -11,7 +11,7 @@
  * derived from
  *
  * Hardware driver for the AMD 768 Random Number Generator (RNG)
- * (c) Copyright 2001 Red Hat Inc <alan@redhat.com>
+ * (c) Copyright 2001 Red Hat Inc
  *
  * derived from
  *
@@ -31,6 +31,7 @@
 #include <asm/io.h>
 #include <asm/msr.h>
 #include <asm/cpufeature.h>
+#include <asm/i387.h>
 
 
 #define PFX	KBUILD_MODNAME ": "
@@ -67,16 +68,23 @@ enum {
  * Another possible performance boost may come from simply buffering
  * until we have 4 bytes, thus returning a u32 at a time,
  * instead of the current u8-at-a-time.
+ *
+ * Padlock instructions can generate a spurious DNA fault, so
+ * we have to call them in the context of irq_ts_save/restore()
  */
 
 static inline u32 xstore(u32 *addr, u32 edx_in)
 {
 	u32 eax_out;
+	int ts_state;
+
+	ts_state = irq_ts_save();
 
 	asm(".byte 0x0F,0xA7,0xC0 /* xstore %%edi (addr=%0) */"
 		:"=m"(*addr), "=a"(eax_out)
 		:"D"(addr), "d"(edx_in));
 
+	irq_ts_restore(ts_state);
 	return eax_out;
 }
 
@@ -123,6 +131,19 @@ static int via_rng_init(struct hwrng *rng)
 {
 	struct cpuinfo_x86 *c = &cpu_data(0);
 	u32 lo, hi, old_lo;
+
+	/* VIA Nano CPUs don't have the MSR_VIA_RNG anymore.  The RNG
+	 * is always enabled if CPUID rng_en is set.  There is no
+	 * RNG configuration like it used to be the case in this
+	 * register */
+	if ((c->x86 == 6) && (c->x86_model >= 0x0f)) {
+		if (!cpu_has_xstore_enabled) {
+			printk(KERN_ERR PFX "can't enable hardware RNG "
+				"if XSTORE is not enabled\n");
+			return -ENODEV;
+		}
+		return 0;
+	}
 
 	/* Control the RNG via MSR.  Tread lightly and pay very close
 	 * close attention to values written, as the reserved fields
@@ -197,5 +218,5 @@ static void __exit mod_exit(void)
 module_init(mod_init);
 module_exit(mod_exit);
 
-MODULE_DESCRIPTION("H/W RNG driver for VIA chipsets");
+MODULE_DESCRIPTION("H/W RNG driver for VIA CPU with PadLock");
 MODULE_LICENSE("GPL");

@@ -49,6 +49,7 @@ MODULE_DESCRIPTION("Adaptec I2O RAID Driver");
 #include <linux/kernel.h>	/* for printk */
 #include <linux/sched.h>
 #include <linux/reboot.h>
+#include <linux/smp_lock.h>
 #include <linux/spinlock.h>
 #include <linux/dma-mapping.h>
 
@@ -271,7 +272,7 @@ rebuild_sys_tab:
 		pHba->state &= ~DPTI_STATE_RESET;
 		if (adpt_sysfs_class) {
 			struct device *dev = device_create(adpt_sysfs_class,
-				NULL, MKDEV(DPTI_I2O_MAJOR, pHba->unit),
+				NULL, MKDEV(DPTI_I2O_MAJOR, pHba->unit), NULL,
 				"dpti%d", pHba->unit);
 			if (IS_ERR(dev)) {
 				printk(KERN_WARNING"dpti%d: unable to "
@@ -1013,15 +1014,15 @@ static int adpt_install_hba(struct scsi_host_template* sht, struct pci_dev* pDev
 	 *	See if we should enable dma64 mode.
 	 */
 	if (sizeof(dma_addr_t) > 4 &&
-	    pci_set_dma_mask(pDev, DMA_64BIT_MASK) == 0) {
-		if (dma_get_required_mask(&pDev->dev) > DMA_32BIT_MASK)
+	    pci_set_dma_mask(pDev, DMA_BIT_MASK(64)) == 0) {
+		if (dma_get_required_mask(&pDev->dev) > DMA_BIT_MASK(32))
 			dma64 = 1;
 	}
-	if (!dma64 && pci_set_dma_mask(pDev, DMA_32BIT_MASK) != 0)
+	if (!dma64 && pci_set_dma_mask(pDev, DMA_BIT_MASK(32)) != 0)
 		return -EINVAL;
 
 	/* adapter only supports message blocks below 4GB */
-	pci_set_consistent_dma_mask(pDev, DMA_32BIT_MASK);
+	pci_set_consistent_dma_mask(pDev, DMA_BIT_MASK(32));
 
 	base_addr0_phys = pci_resource_start(pDev,0);
 	hba_map0_area_size = pci_resource_len(pDev,0);
@@ -1727,10 +1728,12 @@ static int adpt_open(struct inode *inode, struct file *file)
 	int minor;
 	adpt_hba* pHba;
 
+	lock_kernel();
 	//TODO check for root access
 	//
 	minor = iminor(inode);
 	if (minor >= hba_count) {
+		unlock_kernel();
 		return -ENXIO;
 	}
 	mutex_lock(&adpt_configuration_lock);
@@ -1741,6 +1744,7 @@ static int adpt_open(struct inode *inode, struct file *file)
 	}
 	if (pHba == NULL) {
 		mutex_unlock(&adpt_configuration_lock);
+		unlock_kernel();
 		return -ENXIO;
 	}
 
@@ -1751,6 +1755,7 @@ static int adpt_open(struct inode *inode, struct file *file)
 
 	pHba->in_use = 1;
 	mutex_unlock(&adpt_configuration_lock);
+	unlock_kernel();
 
 	return 0;
 }
@@ -1913,6 +1918,10 @@ static int adpt_i2o_passthru(adpt_hba* pHba, u32 __user *arg)
 		}
 		size = size>>16;
 		size *= 4;
+		if (size > MAX_MESSAGE_SIZE) {
+			rcode = -EINVAL;
+			goto cleanup;
+		}
 		/* Copy in the user's I2O command */
 		if (copy_from_user (msg, user_msg, size)) {
 			rcode = -EFAULT;
@@ -2440,7 +2449,7 @@ static s32 adpt_i2o_to_scsi(void __iomem *reply, struct scsi_cmnd* cmd)
 	hba_status = detailed_status >> 8;
 
 	// calculate resid for sg 
-	scsi_set_resid(cmd, scsi_bufflen(cmd) - readl(reply+5));
+	scsi_set_resid(cmd, scsi_bufflen(cmd) - readl(reply+20));
 
 	pHba = (adpt_hba*) cmd->device->host->hostdata[0];
 
@@ -2451,7 +2460,7 @@ static s32 adpt_i2o_to_scsi(void __iomem *reply, struct scsi_cmnd* cmd)
 		case I2O_SCSI_DSC_SUCCESS:
 			cmd->result = (DID_OK << 16);
 			// handle underflow
-			if(readl(reply+5) < cmd->underflow ) {
+			if (readl(reply+20) < cmd->underflow) {
 				cmd->result = (DID_ERROR <<16);
 				printk(KERN_WARNING"%s: SCSI CMD underflow\n",pHba->name);
 			}

@@ -31,21 +31,37 @@ static ssize_t modalias_show(struct device *_d,
 	return sprintf(buf, "virtio:d%08Xv%08X\n",
 		       dev->id.device, dev->id.vendor);
 }
+static ssize_t features_show(struct device *_d,
+			     struct device_attribute *attr, char *buf)
+{
+	struct virtio_device *dev = container_of(_d, struct virtio_device, dev);
+	unsigned int i;
+	ssize_t len = 0;
+
+	/* We actually represent this as a bitstring, as it could be
+	 * arbitrary length in future. */
+	for (i = 0; i < ARRAY_SIZE(dev->features)*BITS_PER_LONG; i++)
+		len += sprintf(buf+len, "%c",
+			       test_bit(i, dev->features) ? '1' : '0');
+	len += sprintf(buf+len, "\n");
+	return len;
+}
 static struct device_attribute virtio_dev_attrs[] = {
 	__ATTR_RO(device),
 	__ATTR_RO(vendor),
 	__ATTR_RO(status),
 	__ATTR_RO(modalias),
+	__ATTR_RO(features),
 	__ATTR_NULL
 };
 
 static inline int virtio_id_match(const struct virtio_device *dev,
 				  const struct virtio_device_id *id)
 {
-	if (id->device != dev->id.device)
+	if (id->device != dev->id.device && id->device != VIRTIO_DEV_ANY_ID)
 		return 0;
 
-	return id->vendor == VIRTIO_DEV_ANY_ID || id->vendor != dev->id.vendor;
+	return id->vendor == VIRTIO_DEV_ANY_ID || id->vendor == dev->id.vendor;
 }
 
 /* This looks through all the IDs a driver claims to support.  If any of them
@@ -70,13 +86,6 @@ static int virtio_uevent(struct device *_dv, struct kobj_uevent_env *env)
 	return add_uevent_var(env, "MODALIAS=virtio:d%08Xv%08X",
 			      dev->id.device, dev->id.vendor);
 }
-
-static struct bus_type virtio_bus = {
-	.name  = "virtio",
-	.match = virtio_dev_match,
-	.dev_attrs = virtio_dev_attrs,
-	.uevent = virtio_uevent,
-};
 
 static void add_status(struct virtio_device *dev, unsigned status)
 {
@@ -120,14 +129,19 @@ static int virtio_dev_probe(struct device *_d)
 			set_bit(f, dev->features);
 	}
 
+	/* Transport features always preserved to pass to finalize_features. */
+	for (i = VIRTIO_TRANSPORT_F_START; i < VIRTIO_TRANSPORT_F_END; i++)
+		if (device_features & (1 << i))
+			set_bit(i, dev->features);
+
+	dev->config->finalize_features(dev);
+
 	err = drv->probe(dev);
 	if (err)
 		add_status(dev, VIRTIO_CONFIG_S_FAILED);
-	else {
-		/* They should never have set feature bits beyond 32 */
-		dev->config->set_features(dev, dev->features[0]);
+	else
 		add_status(dev, VIRTIO_CONFIG_S_DRIVER_OK);
-	}
+
 	return err;
 }
 
@@ -147,13 +161,20 @@ static int virtio_dev_remove(struct device *_d)
 	return 0;
 }
 
+static struct bus_type virtio_bus = {
+	.name  = "virtio",
+	.match = virtio_dev_match,
+	.dev_attrs = virtio_dev_attrs,
+	.uevent = virtio_uevent,
+	.probe = virtio_dev_probe,
+	.remove = virtio_dev_remove,
+};
+
 int register_virtio_driver(struct virtio_driver *driver)
 {
 	/* Catch this early. */
 	BUG_ON(driver->feature_table_size && !driver->feature_table);
 	driver->driver.bus = &virtio_bus;
-	driver->driver.probe = virtio_dev_probe;
-	driver->driver.remove = virtio_dev_remove;
 	return driver_register(&driver->driver);
 }
 EXPORT_SYMBOL_GPL(register_virtio_driver);
@@ -172,7 +193,7 @@ int register_virtio_device(struct virtio_device *dev)
 
 	/* Assign a unique device index and hence name. */
 	dev->index = dev_index++;
-	sprintf(dev->dev.bus_id, "virtio%u", dev->index);
+	dev_set_name(&dev->dev, "virtio%u", dev->index);
 
 	/* We always start by resetting the device, in case a previous
 	 * driver messed it up.  This also tests that code path a little. */
@@ -180,6 +201,8 @@ int register_virtio_device(struct virtio_device *dev)
 
 	/* Acknowledge that we've seen the device. */
 	add_status(dev, VIRTIO_CONFIG_S_ACKNOWLEDGE);
+
+	INIT_LIST_HEAD(&dev->vqs);
 
 	/* device_register() causes the bus infrastructure to look for a
 	 * matching driver. */

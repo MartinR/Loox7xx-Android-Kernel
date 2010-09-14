@@ -25,6 +25,7 @@ led-$(CONFIG_SA1100_CERF)		+= leds-cerf.o
 
 obj-$(CONFIG_SA1100_COLLIE)		+= collie.o
 
+obj-$(CONFIG_SA1100_H3100)		+= h3600.o
 obj-$(CONFIG_SA1100_H3600)		+= h3600.o
 
 obj-$(CONFIG_SA1100_HACKKIT)		+= hackkit.o
@@ -45,9 +46,6 @@ led-$(CONFIG_SA1100_SIMPAD)		+= leds-simpad.o
 
 # LEDs support
 obj-$(CONFIG_LEDS) += $(led-y)
-
-# SA1110 USB client support
-#obj-$(CONFIG_SA1100_USB)		+= usb/
 
 # Miscelaneous functions
 obj-$(CONFIG_PM)			+= pm.o sleep.o

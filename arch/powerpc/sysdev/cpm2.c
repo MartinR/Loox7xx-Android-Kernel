@@ -52,6 +52,7 @@ cpm_cpm2_t __iomem *cpmp; /* Pointer to comm processor space */
  * the communication processor devices.
  */
 cpm2_map_t __iomem *cpm2_immr;
+EXPORT_SYMBOL(cpm2_immr);
 
 #define CPM_MAP_SIZE	(0x40000)	/* 256k - the PQ3 reserve this amount
 					   of space for CPM as it is larger
@@ -60,7 +61,7 @@ cpm2_map_t __iomem *cpm2_immr;
 void __init cpm2_reset(void)
 {
 #ifdef CONFIG_PPC_85xx
-	cpm2_immr = ioremap(CPM_MAP_ADDR, CPM_MAP_SIZE);
+	cpm2_immr = ioremap(get_immrbase() + 0x80000, CPM_MAP_SIZE);
 #else
 	cpm2_immr = ioremap(get_immrbase(), CPM_MAP_SIZE);
 #endif
@@ -115,16 +116,10 @@ EXPORT_SYMBOL(cpm_command);
  * Baud rate clocks are zero-based in the driver code (as that maps
  * to port numbers).  Documentation uses 1-based numbering.
  */
-#define BRG_INT_CLK	(get_brgfreq())
-#define BRG_UART_CLK	(BRG_INT_CLK/16)
-
-/* This function is used by UARTS, or anything else that uses a 16x
- * oversampled clock.
- */
-void
-cpm_setbrg(uint brg, uint rate)
+void __cpm2_setbrg(uint brg, uint rate, uint clk, int div16, int src)
 {
 	u32 __iomem *bp;
+	u32 val;
 
 	/* This is good enough to get SMCs running.....
 	*/
@@ -135,34 +130,15 @@ cpm_setbrg(uint brg, uint rate)
 		brg -= 4;
 	}
 	bp += brg;
-	out_be32(bp, (((BRG_UART_CLK / rate) - 1) << 1) | CPM_BRG_EN);
-
-	cpm2_unmap(bp);
-}
-
-/* This function is used to set high speed synchronous baud rate
- * clocks.
- */
-void
-cpm2_fastbrg(uint brg, uint rate, int div16)
-{
-	u32 __iomem *bp;
-	u32 val;
-
-	if (brg < 4) {
-		bp = cpm2_map_size(im_brgc1, 16);
-	} else {
-		bp = cpm2_map_size(im_brgc5, 16);
-		brg -= 4;
-	}
-	bp += brg;
-	val = ((BRG_INT_CLK / rate) << 1) | CPM_BRG_EN;
+	/* Round the clock divider to the nearest integer. */
+	val = (((clk * 2 / rate) - 1) & ~1) | CPM_BRG_EN | src;
 	if (div16)
 		val |= CPM_BRG_DIV16;
 
 	out_be32(bp, val);
 	cpm2_unmap(bp);
 }
+EXPORT_SYMBOL(__cpm2_setbrg);
 
 int cpm2_clk_setup(enum cpm_clk_target target, int clock, int mode)
 {
@@ -377,3 +353,14 @@ void cpm2_set_pin(int port, int pin, int flags)
 	else
 		clrbits32(&iop[port].odr, pin);
 }
+
+static int cpm_init_par_io(void)
+{
+	struct device_node *np;
+
+	for_each_compatible_node(np, NULL, "fsl,cpm2-pario-bank")
+		cpm2_gpiochip_add32(np);
+	return 0;
+}
+arch_initcall(cpm_init_par_io);
+

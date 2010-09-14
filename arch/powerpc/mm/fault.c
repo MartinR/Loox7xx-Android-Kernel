@@ -29,7 +29,9 @@
 #include <linux/module.h>
 #include <linux/kprobes.h>
 #include <linux/kdebug.h>
+#include <linux/perf_event.h>
 
+#include <asm/firmware.h>
 #include <asm/page.h>
 #include <asm/pgtable.h>
 #include <asm/mmu.h>
@@ -100,31 +102,6 @@ static int store_updates_sp(struct pt_regs *regs)
 	return 0;
 }
 
-#if !(defined(CONFIG_4xx) || defined(CONFIG_BOOKE))
-static void do_dabr(struct pt_regs *regs, unsigned long address,
-		    unsigned long error_code)
-{
-	siginfo_t info;
-
-	if (notify_die(DIE_DABR_MATCH, "dabr_match", regs, error_code,
-			11, SIGSEGV) == NOTIFY_STOP)
-		return;
-
-	if (debugger_dabr_match(regs))
-		return;
-
-	/* Clear the DABR */
-	set_dabr(0);
-
-	/* Deliver the signal to userspace */
-	info.si_signo = SIGTRAP;
-	info.si_errno = 0;
-	info.si_code = TRAP_HWBKPT;
-	info.si_addr = (void __user *)address;
-	force_sig_info(SIGTRAP, &info, current);
-}
-#endif /* !(CONFIG_4xx || CONFIG_BOOKE)*/
-
 /*
  * For 600- and 800-family processors, the error_code parameter is DSISR
  * for a data fault, SRR1 for an instruction fault. For 400-family processors
@@ -193,6 +170,8 @@ int __kprobes do_page_fault(struct pt_regs *regs, unsigned long address,
 		       regs->nip, regs->msr);
 		die("Weird page fault", regs, SIGSEGV);
 	}
+
+	perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS, 1, 0, regs, address);
 
 	/* When running in the kernel we expect faults to occur only to
 	 * addresses in user space.  All other faults represent errors in the
@@ -277,44 +256,33 @@ good_area:
 #endif /* CONFIG_8xx */
 
 	if (is_exec) {
-#if !(defined(CONFIG_4xx) || defined(CONFIG_BOOKE))
-		/* protection fault */
+#ifdef CONFIG_PPC_STD_MMU
+		/* Protection fault on exec go straight to failure on
+		 * Hash based MMUs as they either don't support per-page
+		 * execute permission, or if they do, it's handled already
+		 * at the hash level. This test would probably have to
+		 * be removed if we change the way this works to make hash
+		 * processors use the same I/D cache coherency mechanism
+		 * as embedded.
+		 */
 		if (error_code & DSISR_PROTFAULT)
 			goto bad_area;
+#endif /* CONFIG_PPC_STD_MMU */
+
 		/*
 		 * Allow execution from readable areas if the MMU does not
 		 * provide separate controls over reading and executing.
+		 *
+		 * Note: That code used to not be enabled for 4xx/BookE.
+		 * It is now as I/D cache coherency for these is done at
+		 * set_pte_at() time and I see no reason why the test
+		 * below wouldn't be valid on those processors. This -may-
+		 * break programs compiled with a really old ABI though.
 		 */
 		if (!(vma->vm_flags & VM_EXEC) &&
 		    (cpu_has_feature(CPU_FTR_NOEXECUTE) ||
 		     !(vma->vm_flags & (VM_READ | VM_WRITE))))
 			goto bad_area;
-#else
-		pte_t *ptep;
-		pmd_t *pmdp;
-
-		/* Since 4xx/Book-E supports per-page execute permission,
-		 * we lazily flush dcache to icache. */
-		ptep = NULL;
-		if (get_pteptr(mm, address, &ptep, &pmdp)) {
-			spinlock_t *ptl = pte_lockptr(mm, pmdp);
-			spin_lock(ptl);
-			if (pte_present(*ptep)) {
-				struct page *page = pte_page(*ptep);
-
-				if (!test_bit(PG_arch_1, &page->flags)) {
-					flush_dcache_icache_page(page);
-					set_bit(PG_arch_1, &page->flags);
-				}
-				pte_update(ptep, 0, _PAGE_HWEXEC);
-				_tlbie(address, mm->context.id);
-				pte_unmap_unlock(ptep, ptl);
-				up_read(&mm->mmap_sem);
-				return 0;
-			}
-			pte_unmap_unlock(ptep, ptl);
-		}
-#endif
 	/* a write */
 	} else if (is_write) {
 		if (!(vma->vm_flags & VM_WRITE))
@@ -334,7 +302,7 @@ good_area:
 	 * the fault.
 	 */
  survive:
-	ret = handle_mm_fault(mm, vma, address, is_write);
+	ret = handle_mm_fault(mm, vma, address, is_write ? FAULT_FLAG_WRITE : 0);
 	if (unlikely(ret & VM_FAULT_ERROR)) {
 		if (ret & VM_FAULT_OOM)
 			goto out_of_memory;
@@ -342,10 +310,22 @@ good_area:
 			goto do_sigbus;
 		BUG();
 	}
-	if (ret & VM_FAULT_MAJOR)
+	if (ret & VM_FAULT_MAJOR) {
 		current->maj_flt++;
-	else
+		perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS_MAJ, 1, 0,
+				     regs, address);
+#ifdef CONFIG_PPC_SMLPAR
+		if (firmware_has_feature(FW_FEATURE_CMO)) {
+			preempt_disable();
+			get_lppaca()->page_ins += (1 << PAGE_FACTOR);
+			preempt_enable();
+		}
+#endif
+	} else {
 		current->min_flt++;
+		perf_sw_event(PERF_COUNT_SW_PAGE_FAULTS_MIN, 1, 0,
+				     regs, address);
+	}
 	up_read(&mm->mmap_sem);
 	return 0;
 
@@ -363,7 +343,7 @@ bad_area_nosemaphore:
 	    && printk_ratelimit())
 		printk(KERN_CRIT "kernel tried to execute NX-protected"
 		       " page (%lx) - exploit attempt? (uid: %d)\n",
-		       address, current->uid);
+		       address, current_uid());
 
 	return SIGSEGV;
 

@@ -18,22 +18,16 @@ HAS_BIARCH	:= $(call cc-option-yn, -m32)
 CROSS32_COMPILE ?=
 
 CROSS32CC		:= $(CROSS32_COMPILE)gcc
-CROSS32AS		:= $(CROSS32_COMPILE)as
-CROSS32LD		:= $(CROSS32_COMPILE)ld
 CROSS32AR		:= $(CROSS32_COMPILE)ar
-CROSS32OBJCOPY		:= $(CROSS32_COMPILE)objcopy
 
 ifeq ($(HAS_BIARCH),y)
 ifeq ($(CROSS32_COMPILE),)
 CROSS32CC	:= $(CC) -m32
-CROSS32AS	:= $(AS) -a32
-CROSS32LD	:= $(LD) -m elf32ppc
-CROSS32OBJCOPY	:= $(OBJCOPY)
 CROSS32AR	:= GNUTARGET=elf32-powerpc $(AR)
 endif
 endif
 
-export CROSS32CC CROSS32AS CROSS32LD CROSS32AR CROSS32OBJCOPY
+export CROSS32CC CROSS32AR
 
 ifeq ($(CROSS_COMPILE),)
 KBUILD_DEFCONFIG := $(shell uname -m)_defconfig
@@ -69,7 +63,9 @@ override CC	+= -m$(CONFIG_WORD_SIZE)
 override AR	:= GNUTARGET=elf$(CONFIG_WORD_SIZE)-powerpc $(AR)
 endif
 
-LDFLAGS_vmlinux	:= -Bstatic
+LDFLAGS_vmlinux-yy := -Bstatic
+LDFLAGS_vmlinux-$(CONFIG_PPC64)$(CONFIG_RELOCATABLE) := -pie
+LDFLAGS_vmlinux	:= $(LDFLAGS_vmlinux-yy)
 
 CFLAGS-$(CONFIG_PPC64)	:= -mminimal-toc -mtraceback=none  -mcall-aixdesc
 CFLAGS-$(CONFIG_PPC32)	:= -ffixed-r2 -mmultiple
@@ -81,7 +77,7 @@ CPP		= $(CC) -E $(KBUILD_CFLAGS)
 CHECKFLAGS	+= -m$(CONFIG_WORD_SIZE) -D__powerpc__ -D__powerpc$(CONFIG_WORD_SIZE)__
 
 ifeq ($(CONFIG_PPC64),y)
-GCC_BROKEN_VEC	:= $(shell if [ $(call cc-version) -lt 0400 ] ; then echo "y"; fi)
+GCC_BROKEN_VEC	:= $(call cc-ifversion, -lt, 0400, y)
 
 ifeq ($(CONFIG_POWER4_ONLY),y)
 ifeq ($(CONFIG_ALTIVEC),y)
@@ -108,7 +104,9 @@ endif
 KBUILD_CFLAGS += $(call cc-option,-mno-altivec)
 
 # No SPE instruction when building kernel
+# (We use all available options to help semi-broken compilers)
 KBUILD_CFLAGS += $(call cc-option,-mno-spe)
+KBUILD_CFLAGS += $(call cc-option,-mspe=no)
 
 # Enable unit-at-a-time mode when possible. It shrinks the
 # kernel considerably.
@@ -120,6 +118,11 @@ KBUILD_CFLAGS		+= -mno-string
 
 ifeq ($(CONFIG_6xx),y)
 KBUILD_CFLAGS		+= -mcpu=powerpc
+endif
+
+# Work around a gcc code-gen bug with -fno-omit-frame-pointer.
+ifeq ($(CONFIG_FUNCTION_TRACER),y)
+KBUILD_CFLAGS		+= -mno-sched-epilog
 endif
 
 cpu-as-$(CONFIG_4xx)		+= -Wa,-m405
@@ -139,13 +142,14 @@ head-$(CONFIG_FSL_BOOKE)	:= arch/powerpc/kernel/head_fsl_booke.o
 
 head-$(CONFIG_PPC64)		+= arch/powerpc/kernel/entry_64.o
 head-$(CONFIG_PPC_FPU)		+= arch/powerpc/kernel/fpu.o
+head-$(CONFIG_ALTIVEC)		+= arch/powerpc/kernel/vector.o
 
 core-y				+= arch/powerpc/kernel/ \
 				   arch/powerpc/mm/ \
 				   arch/powerpc/lib/ \
 				   arch/powerpc/sysdev/ \
-				   arch/powerpc/platforms/
-core-$(CONFIG_MATH_EMULATION)	+= arch/powerpc/math-emu/
+				   arch/powerpc/platforms/ \
+				   arch/powerpc/math-emu/
 core-$(CONFIG_XMON)		+= arch/powerpc/xmon/
 core-$(CONFIG_KVM) 		+= arch/powerpc/kvm/
 
@@ -154,13 +158,22 @@ drivers-$(CONFIG_OPROFILE)	+= arch/powerpc/oprofile/
 # Default to zImage, override when needed
 all: zImage
 
-CPPFLAGS_vmlinux.lds	:= -Upowerpc
-
 BOOT_TARGETS = zImage zImage.initrd uImage zImage% dtbImage% treeImage.% cuImage.% simpleImage.%
 
 PHONY += $(BOOT_TARGETS)
 
 boot := arch/$(ARCH)/boot
+
+ifeq ($(CONFIG_RELOCATABLE),y)
+quiet_cmd_relocs_check = CALL    $<
+      cmd_relocs_check = perl $< "$(OBJDUMP)" "$(obj)/vmlinux"
+
+PHONY += relocs_check
+relocs_check: arch/powerpc/relocs_check.pl vmlinux
+	$(call cmd,relocs_check)
+
+zImage: relocs_check
+endif
 
 $(BOOT_TARGETS): vmlinux
 	$(Q)$(MAKE) ARCH=ppc64 $(build)=$(boot) $(patsubst %,$(boot)/%,$@)
@@ -169,12 +182,25 @@ bootwrapper_install %.dtb:
 	$(Q)$(MAKE) ARCH=ppc64 $(build)=$(boot) $(patsubst %,$(boot)/%,$@)
 
 define archhelp
-  @echo '* zImage          - Compressed kernel image (arch/$(ARCH)/boot/zImage.*)'
+  @echo '* zImage          - Build default images selected by kernel config'
+  @echo '  zImage.*        - Compressed kernel image (arch/$(ARCH)/boot/zImage.*)'
+  @echo '  uImage          - U-Boot native image format'
+  @echo '  cuImage.<dt>    - Backwards compatible U-Boot image for older'
+  @echo '                    versions which do not support device trees'
+  @echo '  dtbImage.<dt>   - zImage with an embedded device tree blob'
+  @echo '  simpleImage.<dt> - Firmware independent image.'
+  @echo '  treeImage.<dt>  - Support for older IBM 4xx firmware (not U-Boot)'
   @echo '  install         - Install kernel using'
-  @echo '                    (your) ~/bin/installkernel or'
-  @echo '                    (distribution) /sbin/installkernel or'
+  @echo '                    (your) ~/bin/$(INSTALLKERNEL) or'
+  @echo '                    (distribution) /sbin/$(INSTALLKERNEL) or'
   @echo '                    install to $$(INSTALL_PATH) and run lilo'
   @echo '  *_defconfig     - Select default config from arch/$(ARCH)/configs'
+  @echo ''
+  @echo '  Targets with <dt> embed a device tree blob inside the image'
+  @echo '  These targets support board with firmware that does not'
+  @echo '  support passing a device tree directly.  Replace <dt> with the'
+  @echo '  name of a dts file from the arch/$(ARCH)/boot/dts/ directory'
+  @echo '  (minus the .dts extension).'
 endef
 
 install:

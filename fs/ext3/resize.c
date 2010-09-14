@@ -790,7 +790,8 @@ int ext3_group_add(struct super_block *sb, struct ext3_new_group_data *input)
 
 	if (reserved_gdb || gdb_off == 0) {
 		if (!EXT3_HAS_COMPAT_FEATURE(sb,
-					     EXT3_FEATURE_COMPAT_RESIZE_INODE)){
+					     EXT3_FEATURE_COMPAT_RESIZE_INODE)
+		    || !le16_to_cpu(es->s_reserved_gdt_blocks)) {
 			ext3_warning(sb, __func__,
 				     "No reserved GDT blocks, can't resize");
 			return -EPERM;
@@ -933,7 +934,6 @@ int ext3_group_add(struct super_block *sb, struct ext3_new_group_data *input)
 			   EXT3_INODES_PER_GROUP(sb));
 
 	ext3_journal_dirty_metadata(handle, sbi->s_sbh);
-	sb->s_dirt = 1;
 
 exit_journal:
 	unlock_super(sb);
@@ -990,7 +990,7 @@ int ext3_group_extend(struct super_block *sb, struct ext3_super_block *es,
 			sb->s_id, n_blocks_count);
 		if (sizeof(sector_t) < 8)
 			ext3_warning(sb, __func__,
-			"CONFIG_LBD not enabled\n");
+			"CONFIG_LBDAF not enabled\n");
 		return -EINVAL;
 	}
 
@@ -1065,7 +1065,6 @@ int ext3_group_extend(struct super_block *sb, struct ext3_super_block *es,
 	}
 	es->s_blocks_count = cpu_to_le32(o_blocks_count + add);
 	ext3_journal_dirty_metadata(handle, EXT3_SB(sb)->s_sbh);
-	sb->s_dirt = 1;
 	unlock_super(sb);
 	ext3_debug("freeing blocks %lu through "E3FSBLK"\n", o_blocks_count,
 		   o_blocks_count + add);

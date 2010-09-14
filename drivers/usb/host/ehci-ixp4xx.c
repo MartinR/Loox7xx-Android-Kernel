@@ -1,7 +1,7 @@
 /*
  * IXP4XX EHCI Host Controller Driver
  *
- * Author: Vladimir Barinov <vbarinov@ru.mvista.com>
+ * Author: Vladimir Barinov <vbarinov@embeddedalley.com>
  *
  * Based on "ehci-fsl.c" by Randy Vinson <rvinson@mvista.com>
  *
@@ -51,6 +51,7 @@ static const struct hc_driver ixp4xx_ehci_hc_driver = {
 	.urb_enqueue		= ehci_urb_enqueue,
 	.urb_dequeue		= ehci_urb_dequeue,
 	.endpoint_disable	= ehci_endpoint_disable,
+	.endpoint_reset		= ehci_endpoint_reset,
 	.get_frame_number	= ehci_get_frame,
 	.hub_status_data	= ehci_hub_status_data,
 	.hub_control		= ehci_hub_control,
@@ -60,6 +61,8 @@ static const struct hc_driver ixp4xx_ehci_hc_driver = {
 #endif
 	.relinquish_port	= ehci_relinquish_port,
 	.port_handed_over	= ehci_port_handed_over,
+
+	.clear_tt_buffer_complete	= ehci_clear_tt_buffer_complete,
 };
 
 static int ixp4xx_ehci_probe(struct platform_device *pdev)
@@ -77,12 +80,12 @@ static int ixp4xx_ehci_probe(struct platform_device *pdev)
 	if (!res) {
 		dev_err(&pdev->dev,
 			"Found HC with no IRQ. Check %s setup!\n",
-			pdev->dev.bus_id);
+			dev_name(&pdev->dev));
 		return -ENODEV;
 	}
 	irq = res->start;
 
-	hcd = usb_create_hcd(driver, &pdev->dev, pdev->dev.bus_id);
+	hcd = usb_create_hcd(driver, &pdev->dev, dev_name(&pdev->dev));
 	if (!hcd) {
 		retval = -ENOMEM;
 		goto fail_create_hcd;
@@ -92,7 +95,7 @@ static int ixp4xx_ehci_probe(struct platform_device *pdev)
 	if (!res) {
 		dev_err(&pdev->dev,
 			"Found HC with no register addr. Check %s setup!\n",
-			pdev->dev.bus_id);
+			dev_name(&pdev->dev));
 		retval = -ENODEV;
 		goto fail_request_resource;
 	}
@@ -126,7 +129,7 @@ fail_ioremap:
 fail_request_resource:
 	usb_put_hcd(hcd);
 fail_create_hcd:
-	dev_err(&pdev->dev, "init %s fail, %d\n", pdev->dev.bus_id, retval);
+	dev_err(&pdev->dev, "init %s fail, %d\n", dev_name(&pdev->dev), retval);
 	return retval;
 }
 

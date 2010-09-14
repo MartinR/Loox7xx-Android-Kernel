@@ -220,13 +220,13 @@ enum {
 #define ERR(format, arg...) \
 printk(KERN_ERR "%s:%s: " format "\n" , __FILE__,  __func__ , ## arg)
 
-#define WARN(format, arg...) \
+#define WARNING(format, arg...) \
 printk(KERN_WARNING "%s:%s: " format "\n" , __FILE__,  __func__ , ## arg)
 
 #define INFO(format, arg...) \
 printk(KERN_INFO "%s:%s: " format "\n" , __FILE__,  __func__ , ## arg)
 
-#include "isdnhdlc.h"
+#include <linux/isdn/hdlc.h>
 #include "fsm.h"
 #include "hisax_if.h"
 #include <linux/skbuff.h>
@@ -412,7 +412,7 @@ struct st5481_adapter {
 ({ \
 	int status; \
 	if ((status = usb_submit_urb(urb, mem_flags)) < 0) { \
-		WARN("usb_submit_urb failed,status=%d", status); \
+		WARNING("usb_submit_urb failed,status=%d", status); \
 	} \
         status; \
 })

@@ -38,11 +38,6 @@ struct route_info {
 #define RT6_LOOKUP_F_SRCPREF_COA	0x00000020
 
 
-#ifdef CONFIG_IPV6_MULTIPLE_TABLES
-extern struct rt6_info	*ip6_prohibit_entry;
-extern struct rt6_info	*ip6_blk_hole_entry;
-#endif
-
 extern void			ip6_route_input(struct sk_buff *skb);
 
 extern struct dst_entry *	ip6_route_output(struct net *net,
@@ -68,7 +63,7 @@ extern struct rt6_info		*rt6_lookup(struct net *net,
 extern struct dst_entry *icmp6_dst_alloc(struct net_device *dev,
 					 struct neighbour *neigh,
 					 const struct in6_addr *addr);
-extern int icmp6_dst_gc(int *more);
+extern int icmp6_dst_gc(void);
 
 extern void fib6_force_start_gc(struct net *net);
 
@@ -112,13 +107,13 @@ struct rt6_rtnl_dump_arg
 {
 	struct sk_buff *skb;
 	struct netlink_callback *cb;
+	struct net *net;
 };
 
 extern int rt6_dump_route(struct rt6_info *rt, void *p_arg);
 extern void rt6_ifdown(struct net *net, struct net_device *dev);
 extern void rt6_mtu_change(struct net_device *dev, unsigned mtu);
 
-extern rwlock_t rt6_lock;
 
 /*
  *	Store a destination cache entry in a socket
@@ -147,7 +142,7 @@ static inline void ip6_dst_store(struct sock *sk, struct dst_entry *dst,
 
 static inline int ipv6_unicast_destination(struct sk_buff *skb)
 {
-	struct rt6_info *rt = (struct rt6_info *) skb->dst;
+	struct rt6_info *rt = (struct rt6_info *) skb_dst(skb);
 
 	return rt->rt6i_flags & RTF_LOCAL;
 }

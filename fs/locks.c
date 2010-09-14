@@ -151,7 +151,7 @@ static struct file_lock *locks_alloc_lock(void)
 	return kmem_cache_alloc(filelock_cache, GFP_KERNEL);
 }
 
-static void locks_release_private(struct file_lock *fl)
+void locks_release_private(struct file_lock *fl)
 {
 	if (fl->fl_ops) {
 		if (fl->fl_ops->fl_release_private)
@@ -165,6 +165,7 @@ static void locks_release_private(struct file_lock *fl)
 	}
 
 }
+EXPORT_SYMBOL_GPL(locks_release_private);
 
 /* Free a lock which is not in use. */
 static void locks_free_lock(struct file_lock *fl)
@@ -201,7 +202,7 @@ EXPORT_SYMBOL(locks_init_lock);
  * Initialises the fields of the file lock which are invariant for
  * free file_locks.
  */
-static void init_once(struct kmem_cache *cache, void *foo)
+static void init_once(void *foo)
 {
 	struct file_lock *lock = (struct file_lock *) foo;
 
@@ -433,7 +434,7 @@ static int lease_mylease_callback(struct file_lock *fl, struct file_lock *try)
 	return fl->fl_file == try->fl_file;
 }
 
-static struct lock_manager_operations lease_manager_ops = {
+static const struct lock_manager_operations lease_manager_ops = {
 	.fl_break = lease_break_callback,
 	.fl_release_private = lease_release_private_callback,
 	.fl_mylease = lease_mylease_callback,
@@ -767,7 +768,7 @@ static int flock_lock_file(struct file *filp, struct file_lock *request)
 	 * give it the opportunity to lock the file.
 	 */
 	if (found)
-		cond_resched_bkl();
+		cond_resched();
 
 find_conflict:
 	for_each_lock(inode, before) {
@@ -779,8 +780,10 @@ find_conflict:
 		if (!flock_locks_conflict(request, fl))
 			continue;
 		error = -EAGAIN;
-		if (request->fl_flags & FL_SLEEP)
-			locks_insert_block(fl, request);
+		if (!(request->fl_flags & FL_SLEEP))
+			goto out;
+		error = FILE_LOCK_DEFERRED;
+		locks_insert_block(fl, request);
 		goto out;
 	}
 	if (request->fl_flags & FL_ACCESS)
@@ -836,7 +839,7 @@ static int __posix_lock_file(struct inode *inode, struct file_lock *request, str
 			error = -EDEADLK;
 			if (posix_locks_deadlock(request, fl))
 				goto out;
-			error = -EAGAIN;
+			error = FILE_LOCK_DEFERRED;
 			locks_insert_block(fl, request);
 			goto out;
   		}
@@ -1035,7 +1038,7 @@ int posix_lock_file_wait(struct file *filp, struct file_lock *fl)
 	might_sleep ();
 	for (;;) {
 		error = posix_lock_file(filp, fl, NULL);
-		if ((error != -EAGAIN) || !(fl->fl_flags & FL_SLEEP))
+		if (error != FILE_LOCK_DEFERRED)
 			break;
 		error = wait_event_interruptible(fl->fl_wait, !fl->fl_next);
 		if (!error)
@@ -1107,9 +1110,7 @@ int locks_mandatory_area(int read_write, struct inode *inode,
 
 	for (;;) {
 		error = __posix_lock_file(inode, &fl, NULL);
-		if (error != -EAGAIN)
-			break;
-		if (!(fl.fl_flags & FL_SLEEP))
+		if (error != FILE_LOCK_DEFERRED)
 			break;
 		error = wait_event_interruptible(fl.fl_wait, !fl.fl_next);
 		if (!error) {
@@ -1349,7 +1350,7 @@ int generic_setlease(struct file *filp, long arg, struct file_lock **flp)
 	struct inode *inode = dentry->d_inode;
 	int error, rdlease_count = 0, wrlease_count = 0;
 
-	if ((current->fsuid != inode->i_uid) && !capable(CAP_LEASE))
+	if ((current_fsuid() != inode->i_uid) && !capable(CAP_LEASE))
 		return -EACCES;
 	if (!S_ISREG(inode->i_mode))
 		return -EINVAL;
@@ -1531,7 +1532,7 @@ int flock_lock_file_wait(struct file *filp, struct file_lock *fl)
 	might_sleep();
 	for (;;) {
 		error = flock_lock_file(filp, fl);
-		if ((error != -EAGAIN) || !(fl->fl_flags & FL_SLEEP))
+		if (error != FILE_LOCK_DEFERRED)
 			break;
 		error = wait_event_interruptible(fl->fl_wait, !fl->fl_next);
 		if (!error)
@@ -1564,7 +1565,7 @@ EXPORT_SYMBOL(flock_lock_file_wait);
  *	%LOCK_MAND can be combined with %LOCK_READ or %LOCK_WRITE to allow other
  *	processes read and write access respectively.
  */
-asmlinkage long sys_flock(unsigned int fd, unsigned int cmd)
+SYSCALL_DEFINE2(flock, unsigned int, fd, unsigned int, cmd)
 {
 	struct file *filp;
 	struct file_lock *lock;
@@ -1580,7 +1581,8 @@ asmlinkage long sys_flock(unsigned int fd, unsigned int cmd)
 	cmd &= ~LOCK_NB;
 	unlock = (cmd == LOCK_UN);
 
-	if (!unlock && !(cmd & LOCK_MAND) && !(filp->f_mode & 3))
+	if (!unlock && !(cmd & LOCK_MAND) &&
+	    !(filp->f_mode & (FMODE_READ|FMODE_WRITE)))
 		goto out_putf;
 
 	error = flock_make_lock(filp, &lock, cmd);
@@ -1589,7 +1591,7 @@ asmlinkage long sys_flock(unsigned int fd, unsigned int cmd)
 	if (can_sleep)
 		lock->fl_flags |= FL_SLEEP;
 
-	error = security_file_lock(filp, cmd);
+	error = security_file_lock(filp, lock->fl_type);
 	if (error)
 		goto out_free;
 
@@ -1716,17 +1718,17 @@ out:
  * fl_grant is set. Callers expecting ->lock() to return asynchronously
  * will only use F_SETLK, not F_SETLKW; they will set FL_SLEEP if (and only if)
  * the request is for a blocking lock. When ->lock() does return asynchronously,
- * it must return -EINPROGRESS, and call ->fl_grant() when the lock
+ * it must return FILE_LOCK_DEFERRED, and call ->fl_grant() when the lock
  * request completes.
  * If the request is for non-blocking lock the file system should return
- * -EINPROGRESS then try to get the lock and call the callback routine with
- * the result. If the request timed out the callback routine will return a
+ * FILE_LOCK_DEFERRED then try to get the lock and call the callback routine
+ * with the result. If the request timed out the callback routine will return a
  * nonzero return code and the file system should release the lock. The file
  * system is also responsible to keep a corresponding posix lock when it
  * grants a lock so the VFS can find out which locks are locally held and do
  * the correct lock cleanup when required.
  * The underlying filesystem must not drop the kernel lock or call
- * ->fl_grant() before returning to the caller with a -EINPROGRESS
+ * ->fl_grant() before returning to the caller with a FILE_LOCK_DEFERRED
  * return code.
  */
 int vfs_lock_file(struct file *filp, unsigned int cmd, struct file_lock *fl, struct file_lock *conf)
@@ -1737,6 +1739,30 @@ int vfs_lock_file(struct file *filp, unsigned int cmd, struct file_lock *fl, str
 		return posix_lock_file(filp, fl, conf);
 }
 EXPORT_SYMBOL_GPL(vfs_lock_file);
+
+static int do_lock_file_wait(struct file *filp, unsigned int cmd,
+			     struct file_lock *fl)
+{
+	int error;
+
+	error = security_file_lock(filp, fl->fl_type);
+	if (error)
+		return error;
+
+	for (;;) {
+		error = vfs_lock_file(filp, cmd, fl, NULL);
+		if (error != FILE_LOCK_DEFERRED)
+			break;
+		error = wait_event_interruptible(fl->fl_wait, !fl->fl_next);
+		if (!error)
+			continue;
+
+		locks_delete_block(fl);
+		break;
+	}
+
+	return error;
+}
 
 /* Apply the lock described by l to an open file descriptor.
  * This implements both the F_SETLK and F_SETLKW commands of fcntl().
@@ -1795,26 +1821,7 @@ again:
 		goto out;
 	}
 
-	error = security_file_lock(filp, file_lock->fl_type);
-	if (error)
-		goto out;
-
-	if (filp->f_op && filp->f_op->lock != NULL)
-		error = filp->f_op->lock(filp, cmd, file_lock);
-	else {
-		for (;;) {
-			error = posix_lock_file(filp, file_lock, NULL);
-			if (error != -EAGAIN || cmd == F_SETLK)
-				break;
-			error = wait_event_interruptible(file_lock->fl_wait,
-					!file_lock->fl_next);
-			if (!error)
-				continue;
-
-			locks_delete_block(file_lock);
-			break;
-		}
-	}
+	error = do_lock_file_wait(filp, cmd, file_lock);
 
 	/*
 	 * Attempt to detect a close/fcntl race and recover by
@@ -1932,26 +1939,7 @@ again:
 		goto out;
 	}
 
-	error = security_file_lock(filp, file_lock->fl_type);
-	if (error)
-		goto out;
-
-	if (filp->f_op && filp->f_op->lock != NULL)
-		error = filp->f_op->lock(filp, cmd, file_lock);
-	else {
-		for (;;) {
-			error = posix_lock_file(filp, file_lock, NULL);
-			if (error != -EAGAIN || cmd == F_SETLK64)
-				break;
-			error = wait_event_interruptible(file_lock->fl_wait,
-					!file_lock->fl_next);
-			if (!error)
-				continue;
-
-			locks_delete_block(file_lock);
-			break;
-		}
-	}
+	error = do_lock_file_wait(filp, cmd, file_lock);
 
 	/*
 	 * Attempt to detect a close/fcntl race and recover by
@@ -2092,6 +2080,7 @@ int vfs_cancel_lock(struct file *filp, struct file_lock *fl)
 EXPORT_SYMBOL_GPL(vfs_cancel_lock);
 
 #ifdef CONFIG_PROC_FS
+#include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 
 static void lock_get_status(struct seq_file *f, struct file_lock *fl,
@@ -2197,12 +2186,31 @@ static void locks_stop(struct seq_file *f, void *v)
 	unlock_kernel();
 }
 
-struct seq_operations locks_seq_operations = {
+static const struct seq_operations locks_seq_operations = {
 	.start	= locks_start,
 	.next	= locks_next,
 	.stop	= locks_stop,
 	.show	= locks_show,
 };
+
+static int locks_open(struct inode *inode, struct file *filp)
+{
+	return seq_open(filp, &locks_seq_operations);
+}
+
+static const struct file_operations proc_locks_operations = {
+	.open		= locks_open,
+	.read		= seq_read,
+	.llseek		= seq_lseek,
+	.release	= seq_release,
+};
+
+static int __init proc_locks_init(void)
+{
+	proc_create("locks", 0, NULL, &proc_locks_operations);
+	return 0;
+}
+module_init(proc_locks_init);
 #endif
 
 /**

@@ -25,7 +25,6 @@
 #include <linux/unistd.h>
 #include <linux/slab.h>
 #include <linux/user.h>
-#include <linux/a.out.h>
 #include <linux/tty.h>
 #include <linux/major.h>
 #include <linux/interrupt.h>
@@ -64,10 +63,15 @@
 #include <asm/smp.h>
 #include <asm/firmware.h>
 #include <asm/eeh.h>
+#include <asm/pSeries_reconfig.h>
 
 #include "plpar_wrappers.h"
 #include "pseries.h"
 
+int CMO_PrPSP = -1;
+int CMO_SecPSP = -1;
+unsigned long CMO_PageSize = (ASM_CONST(1) << IOMMU_PAGE_SHIFT);
+EXPORT_SYMBOL(CMO_PageSize);
 
 int fwnmi_active;  /* TRUE if an FWNMI handler is present */
 
@@ -109,7 +113,7 @@ static void __init fwnmi_init(void)
 		fwnmi_active = 1;
 }
 
-void pseries_8259_cascade(unsigned int irq, struct irq_desc *desc)
+static void pseries_8259_cascade(unsigned int irq, struct irq_desc *desc)
 {
 	unsigned int cascade_irq = i8259_irq();
 	if (cascade_irq != NO_IRQ)
@@ -219,10 +223,6 @@ static void pseries_lpar_enable_pmcs(void)
 	set = 1UL << 63;
 	reset = 0;
 	plpar_hcall_norets(H_PERFMON, set, reset);
-
-	/* instruct hypervisor to maintain PMCs */
-	if (firmware_has_feature(FW_FEATURE_SPLPAR))
-		get_lppaca()->pmcregs_in_use = 1;
 }
 
 static void __init pseries_discover_pic(void)
@@ -251,6 +251,29 @@ static void __init pseries_discover_pic(void)
 	       " interrupt-controller\n");
 }
 
+static int pci_dn_reconfig_notifier(struct notifier_block *nb, unsigned long action, void *node)
+{
+	struct device_node *np = node;
+	struct pci_dn *pci = NULL;
+	int err = NOTIFY_OK;
+
+	switch (action) {
+	case PSERIES_RECONFIG_ADD:
+		pci = np->parent->data;
+		if (pci)
+			update_dn_pci_info(np, pci->phb);
+		break;
+	default:
+		err = NOTIFY_DONE;
+		break;
+	}
+	return err;
+}
+
+static struct notifier_block pci_dn_reconfig_nb = {
+	.notifier_call = pci_dn_reconfig_notifier,
+};
+
 static void __init pSeries_setup_arch(void)
 {
 	/* Discover PIC type and setup ppc_md accordingly */
@@ -268,6 +291,7 @@ static void __init pSeries_setup_arch(void)
 	/* Find and initialize PCI host bridges */
 	init_pci_config_tokens();
 	find_and_init_phbs();
+	pSeries_reconfig_notifier_register(&pci_dn_reconfig_nb);
 	eeh_init();
 
 	pSeries_nvram_init();
@@ -314,6 +338,85 @@ static int pseries_set_xdabr(unsigned long dabr)
 			H_DABRX_KERNEL | H_DABRX_USER);
 }
 
+#define CMO_CHARACTERISTICS_TOKEN 44
+#define CMO_MAXLENGTH 1026
+
+/**
+ * fw_cmo_feature_init - FW_FEATURE_CMO is not stored in ibm,hypertas-functions,
+ * handle that here. (Stolen from parse_system_parameter_string)
+ */
+void pSeries_cmo_feature_init(void)
+{
+	char *ptr, *key, *value, *end;
+	int call_status;
+	int page_order = IOMMU_PAGE_SHIFT;
+
+	pr_debug(" -> fw_cmo_feature_init()\n");
+	spin_lock(&rtas_data_buf_lock);
+	memset(rtas_data_buf, 0, RTAS_DATA_BUF_SIZE);
+	call_status = rtas_call(rtas_token("ibm,get-system-parameter"), 3, 1,
+				NULL,
+				CMO_CHARACTERISTICS_TOKEN,
+				__pa(rtas_data_buf),
+				RTAS_DATA_BUF_SIZE);
+
+	if (call_status != 0) {
+		spin_unlock(&rtas_data_buf_lock);
+		pr_debug("CMO not available\n");
+		pr_debug(" <- fw_cmo_feature_init()\n");
+		return;
+	}
+
+	end = rtas_data_buf + CMO_MAXLENGTH - 2;
+	ptr = rtas_data_buf + 2;	/* step over strlen value */
+	key = value = ptr;
+
+	while (*ptr && (ptr <= end)) {
+		/* Separate the key and value by replacing '=' with '\0' and
+		 * point the value at the string after the '='
+		 */
+		if (ptr[0] == '=') {
+			ptr[0] = '\0';
+			value = ptr + 1;
+		} else if (ptr[0] == '\0' || ptr[0] == ',') {
+			/* Terminate the string containing the key/value pair */
+			ptr[0] = '\0';
+
+			if (key == value) {
+				pr_debug("Malformed key/value pair\n");
+				/* Never found a '=', end processing */
+				break;
+			}
+
+			if (0 == strcmp(key, "CMOPageSize"))
+				page_order = simple_strtol(value, NULL, 10);
+			else if (0 == strcmp(key, "PrPSP"))
+				CMO_PrPSP = simple_strtol(value, NULL, 10);
+			else if (0 == strcmp(key, "SecPSP"))
+				CMO_SecPSP = simple_strtol(value, NULL, 10);
+			value = key = ptr + 1;
+		}
+		ptr++;
+	}
+
+	/* Page size is returned as the power of 2 of the page size,
+	 * convert to the page size in bytes before returning
+	 */
+	CMO_PageSize = 1 << page_order;
+	pr_debug("CMO_PageSize = %lu\n", CMO_PageSize);
+
+	if (CMO_PrPSP != -1 || CMO_SecPSP != -1) {
+		pr_info("CMO enabled\n");
+		pr_debug("CMO enabled, PrPSP=%d, SecPSP=%d\n", CMO_PrPSP,
+		         CMO_SecPSP);
+		powerpc_firmware_features |= FW_FEATURE_CMO;
+	} else
+		pr_debug("CMO not enabled, PrPSP=%d, SecPSP=%d\n", CMO_PrPSP,
+		         CMO_SecPSP);
+	spin_unlock(&rtas_data_buf_lock);
+	pr_debug(" <- fw_cmo_feature_init()\n");
+}
+
 /*
  * Early initialization.  Relocation is on but do not reference unbolted pages
  */
@@ -329,6 +432,7 @@ static void __init pSeries_init_early(void)
 	else if (firmware_has_feature(FW_FEATURE_XDABR))
 		ppc_md.set_dabr = pseries_set_xdabr;
 
+	pSeries_cmo_feature_init();
 	iommu_init_early_pSeries();
 
 	pr_debug(" <- pSeries_init_early()\n");
@@ -482,7 +586,7 @@ static int pSeries_pci_probe_mode(struct pci_bus *bus)
  * possible with power button press. If ibm,power-off-ups token is used
  * it will allow auto poweron after power is restored.
  */
-void pSeries_power_off(void)
+static void pSeries_power_off(void)
 {
 	int rc;
 	int rtas_poweroff_ups_token = rtas_token("ibm,power-off-ups");

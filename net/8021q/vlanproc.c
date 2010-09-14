@@ -18,16 +18,9 @@
  *****************************************************************************/
 
 #include <linux/module.h>
-#include <linux/stddef.h>	/* offsetof(), etc. */
-#include <linux/errno.h>	/* return codes */
+#include <linux/errno.h>
 #include <linux/kernel.h>
-#include <linux/slab.h>		/* kmalloc(), kfree() */
-#include <linux/mm.h>
-#include <linux/string.h>	/* inline mem*, str* functions */
-#include <linux/init.h>		/* __initfunc et al. */
-#include <asm/byteorder.h>	/* htons(), etc. */
-#include <asm/uaccess.h>	/* copy_to_user */
-#include <asm/io.h>
+#include <linux/string.h>
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/fs.h>
@@ -114,7 +107,7 @@ static const struct file_operations vlandev_fops = {
  */
 
 /* Strings */
-static const char *vlan_name_type_str[VLAN_NAME_TYPE_HIGHEST] = {
+static const char *const vlan_name_type_str[VLAN_NAME_TYPE_HIGHEST] = {
     [VLAN_NAME_TYPE_RAW_PLUS_VID]        = "VLAN_NAME_TYPE_RAW_PLUS_VID",
     [VLAN_NAME_TYPE_PLUS_VID_NO_PAD]	 = "VLAN_NAME_TYPE_PLUS_VID_NO_PAD",
     [VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD] = "VLAN_NAME_TYPE_RAW_PLUS_VID_NO_PAD",
@@ -286,13 +279,14 @@ static int vlandev_seq_show(struct seq_file *seq, void *offset)
 {
 	struct net_device *vlandev = (struct net_device *) seq->private;
 	const struct vlan_dev_info *dev_info = vlan_dev_info(vlandev);
-	struct net_device_stats *stats = &vlandev->stats;
+	const struct net_device_stats *stats;
 	static const char fmt[] = "%30s %12lu\n";
 	int i;
 
-	if (!(vlandev->priv_flags & IFF_802_1Q_VLAN))
+	if (!is_vlan_dev(vlandev))
 		return 0;
 
+	stats = dev_get_stats(vlandev);
 	seq_printf(seq,
 		   "%s  VID: %d	 REORDER_HDR: %i  dev->priv_flags: %hx\n",
 		   vlandev->name, dev_info->vlan_id,
@@ -321,7 +315,7 @@ static int vlandev_seq_show(struct seq_file *seq, void *offset)
 		   dev_info->ingress_priority_map[6],
 		   dev_info->ingress_priority_map[7]);
 
-	seq_printf(seq, "EGRESSS priority Mappings: ");
+	seq_printf(seq, " EGRESS priority mappings: ");
 	for (i = 0; i < 16; i++) {
 		const struct vlan_priority_tci_mapping *mp
 			= dev_info->egress_priority_map[i];

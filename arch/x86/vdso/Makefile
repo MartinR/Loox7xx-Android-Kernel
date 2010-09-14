@@ -38,7 +38,7 @@ $(obj)/%.so: $(obj)/%.so.dbg FORCE
 	$(call if_changed,objcopy)
 
 CFL := $(PROFILING) -mcmodel=small -fPIC -O2 -fasynchronous-unwind-tables -m64 \
-       $(filter -g%,$(KBUILD_CFLAGS))
+       $(filter -g%,$(KBUILD_CFLAGS)) $(call cc-option, -fno-stack-protector)
 
 $(vobjs): KBUILD_CFLAGS += $(CFL)
 
@@ -62,7 +62,7 @@ $(obj)/%-syms.lds: $(obj)/%.so.dbg FORCE
 # Build multiple 32-bit vDSO images to choose from at boot time.
 #
 obj-$(VDSO32-y)			+= vdso32-syms.lds
-vdso32.so-$(CONFIG_X86_32)	+= int80
+vdso32.so-$(VDSO32-y)		+= int80
 vdso32.so-$(CONFIG_COMPAT)	+= syscall
 vdso32.so-$(VDSO32-y)		+= sysenter
 
@@ -122,7 +122,8 @@ quiet_cmd_vdso = VDSO    $@
 		       $(VDSO_LDFLAGS) $(VDSO_LDFLAGS_$(filter %.lds,$(^F))) \
 		       -Wl,-T,$(filter %.lds,$^) $(filter %.o,$^)
 
-VDSO_LDFLAGS = -fPIC -shared $(call ld-option, -Wl$(comma)--hash-style=sysv)
+VDSO_LDFLAGS = -fPIC -shared $(call cc-ldoption, -Wl$(comma)--hash-style=sysv)
+GCOV_PROFILE := n
 
 #
 # Install the unstripped copy of vdso*.so listed in $(vdso-install-y).

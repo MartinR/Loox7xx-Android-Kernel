@@ -23,6 +23,7 @@
 #include <linux/init.h>
 #include <linux/cache.h>
 #include <linux/mutex.h>
+#include <linux/mod_devicetable.h>
 #include <linux/spi/spi.h>
 
 
@@ -47,7 +48,7 @@ modalias_show(struct device *dev, struct device_attribute *a, char *buf)
 {
 	const struct spi_device	*spi = to_spi_device(dev);
 
-	return snprintf(buf, BUS_ID_SIZE + 1, "%s\n", spi->modalias);
+	return sprintf(buf, "%s\n", spi->modalias);
 }
 
 static struct device_attribute spi_dev_attrs[] = {
@@ -59,18 +60,41 @@ static struct device_attribute spi_dev_attrs[] = {
  * and the sysfs version makes coldplug work too.
  */
 
+static const struct spi_device_id *spi_match_id(const struct spi_device_id *id,
+						const struct spi_device *sdev)
+{
+	while (id->name[0]) {
+		if (!strcmp(sdev->modalias, id->name))
+			return id;
+		id++;
+	}
+	return NULL;
+}
+
+const struct spi_device_id *spi_get_device_id(const struct spi_device *sdev)
+{
+	const struct spi_driver *sdrv = to_spi_driver(sdev->dev.driver);
+
+	return spi_match_id(sdrv->id_table, sdev);
+}
+EXPORT_SYMBOL_GPL(spi_get_device_id);
+
 static int spi_match_device(struct device *dev, struct device_driver *drv)
 {
 	const struct spi_device	*spi = to_spi_device(dev);
+	const struct spi_driver	*sdrv = to_spi_driver(drv);
 
-	return strncmp(spi->modalias, drv->name, BUS_ID_SIZE) == 0;
+	if (sdrv->id_table)
+		return !!spi_match_id(sdrv->id_table, spi);
+
+	return strcmp(spi->modalias, drv->name) == 0;
 }
 
 static int spi_uevent(struct device *dev, struct kobj_uevent_env *env)
 {
 	const struct spi_device		*spi = to_spi_device(dev);
 
-	add_uevent_var(env, "MODALIAS=%s", spi->modalias);
+	add_uevent_var(env, "MODALIAS=%s%s", SPI_MODULE_PREFIX, spi->modalias);
 	return 0;
 }
 
@@ -178,6 +202,113 @@ struct boardinfo {
 static LIST_HEAD(board_list);
 static DEFINE_MUTEX(board_lock);
 
+/**
+ * spi_alloc_device - Allocate a new SPI device
+ * @master: Controller to which device is connected
+ * Context: can sleep
+ *
+ * Allows a driver to allocate and initialize a spi_device without
+ * registering it immediately.  This allows a driver to directly
+ * fill the spi_device with device parameters before calling
+ * spi_add_device() on it.
+ *
+ * Caller is responsible to call spi_add_device() on the returned
+ * spi_device structure to add it to the SPI master.  If the caller
+ * needs to discard the spi_device without adding it, then it should
+ * call spi_dev_put() on it.
+ *
+ * Returns a pointer to the new device, or NULL.
+ */
+struct spi_device *spi_alloc_device(struct spi_master *master)
+{
+	struct spi_device	*spi;
+	struct device		*dev = master->dev.parent;
+
+	if (!spi_master_get(master))
+		return NULL;
+
+	spi = kzalloc(sizeof *spi, GFP_KERNEL);
+	if (!spi) {
+		dev_err(dev, "cannot alloc spi_device\n");
+		spi_master_put(master);
+		return NULL;
+	}
+
+	spi->master = master;
+	spi->dev.parent = dev;
+	spi->dev.bus = &spi_bus_type;
+	spi->dev.release = spidev_release;
+	device_initialize(&spi->dev);
+	return spi;
+}
+EXPORT_SYMBOL_GPL(spi_alloc_device);
+
+/**
+ * spi_add_device - Add spi_device allocated with spi_alloc_device
+ * @spi: spi_device to register
+ *
+ * Companion function to spi_alloc_device.  Devices allocated with
+ * spi_alloc_device can be added onto the spi bus with this function.
+ *
+ * Returns 0 on success; negative errno on failure
+ */
+int spi_add_device(struct spi_device *spi)
+{
+	static DEFINE_MUTEX(spi_add_lock);
+	struct device *dev = spi->master->dev.parent;
+	int status;
+
+	/* Chipselects are numbered 0..max; validate. */
+	if (spi->chip_select >= spi->master->num_chipselect) {
+		dev_err(dev, "cs%d >= max %d\n",
+			spi->chip_select,
+			spi->master->num_chipselect);
+		return -EINVAL;
+	}
+
+	/* Set the bus ID string */
+	dev_set_name(&spi->dev, "%s.%u", dev_name(&spi->master->dev),
+			spi->chip_select);
+
+
+	/* We need to make sure there's no other device with this
+	 * chipselect **BEFORE** we call setup(), else we'll trash
+	 * its configuration.  Lock against concurrent add() calls.
+	 */
+	mutex_lock(&spi_add_lock);
+
+	if (bus_find_device_by_name(&spi_bus_type, NULL, dev_name(&spi->dev))
+			!= NULL) {
+		dev_err(dev, "chipselect %d already in use\n",
+				spi->chip_select);
+		status = -EBUSY;
+		goto done;
+	}
+
+	/* Drivers may modify this initial i/o setup, but will
+	 * normally rely on the device being setup.  Devices
+	 * using SPI_CS_HIGH can't coexist well otherwise...
+	 */
+	status = spi_setup(spi);
+	if (status < 0) {
+		dev_err(dev, "can't %s %s, status %d\n",
+				"setup", dev_name(&spi->dev), status);
+		goto done;
+	}
+
+	/* Device may be bound to an active driver when this returns */
+	status = device_add(&spi->dev);
+	if (status < 0)
+		dev_err(dev, "can't %s %s, status %d\n",
+				"add", dev_name(&spi->dev), status);
+	else
+		dev_dbg(dev, "registered child %s\n", dev_name(&spi->dev));
+
+done:
+	mutex_unlock(&spi_add_lock);
+	return status;
+}
+EXPORT_SYMBOL_GPL(spi_add_device);
 
 /**
  * spi_new_device - instantiate one new SPI device
@@ -197,7 +328,6 @@ struct spi_device *spi_new_device(struct spi_master *master,
 				  struct spi_board_info *chip)
 {
 	struct spi_device	*proxy;
-	struct device		*dev = master->dev.parent;
 	int			status;
 
 	/* NOTE:  caller did any chip->bus_num checks necessary.
@@ -207,64 +337,28 @@ struct spi_device *spi_new_device(struct spi_master *master,
 	 * suggests syslogged diagnostics are best here (ugh).
 	 */
 
-	/* Chipselects are numbered 0..max; validate. */
-	if (chip->chip_select >= master->num_chipselect) {
-		dev_err(dev, "cs%d > max %d\n",
-			chip->chip_select,
-			master->num_chipselect);
-		return NULL;
-	}
-
-	if (!spi_master_get(master))
+	proxy = spi_alloc_device(master);
+	if (!proxy)
 		return NULL;
 
-	proxy = kzalloc(sizeof *proxy, GFP_KERNEL);
-	if (!proxy) {
-		dev_err(dev, "can't alloc dev for cs%d\n",
-			chip->chip_select);
-		goto fail;
-	}
-	proxy->master = master;
+	WARN_ON(strlen(chip->modalias) >= sizeof(proxy->modalias));
+
 	proxy->chip_select = chip->chip_select;
 	proxy->max_speed_hz = chip->max_speed_hz;
 	proxy->mode = chip->mode;
 	proxy->irq = chip->irq;
-	proxy->modalias = chip->modalias;
-
-	snprintf(proxy->dev.bus_id, sizeof proxy->dev.bus_id,
-			"%s.%u", master->dev.bus_id,
-			chip->chip_select);
-	proxy->dev.parent = dev;
-	proxy->dev.bus = &spi_bus_type;
+	strlcpy(proxy->modalias, chip->modalias, sizeof(proxy->modalias));
 	proxy->dev.platform_data = (void *) chip->platform_data;
 	proxy->controller_data = chip->controller_data;
 	proxy->controller_state = NULL;
-	proxy->dev.release = spidev_release;
 
-	/* drivers may modify this initial i/o setup */
-	status = master->setup(proxy);
+	status = spi_add_device(proxy);
 	if (status < 0) {
-		dev_err(dev, "can't %s %s, status %d\n",
-				"setup", proxy->dev.bus_id, status);
-		goto fail;
+		spi_dev_put(proxy);
+		return NULL;
 	}
 
-	/* driver core catches callers that misbehave by defining
-	 * devices that already exist.
-	 */
-	status = device_register(&proxy->dev);
-	if (status < 0) {
-		dev_err(dev, "can't %s %s, status %d\n",
-				"add", proxy->dev.bus_id, status);
-		goto fail;
-	}
-	dev_dbg(dev, "registered child %s\n", proxy->dev.bus_id);
 	return proxy;
-
-fail:
-	spi_master_put(master);
-	kfree(proxy);
-	return NULL;
 }
 EXPORT_SYMBOL_GPL(spi_new_device);
 
@@ -433,12 +527,11 @@ int spi_register_master(struct spi_master *master)
 	/* register the device, then userspace will see it.
 	 * registration fails if the bus ID is in use.
 	 */
-	snprintf(master->dev.bus_id, sizeof master->dev.bus_id,
-		"spi%u", master->bus_num);
+	dev_set_name(&master->dev, "spi%u", master->bus_num);
 	status = device_add(&master->dev);
 	if (status < 0)
 		goto done;
-	dev_dbg(dev, "registered master %s%s\n", master->dev.bus_id,
+	dev_dbg(dev, "registered master %s%s\n", dev_name(&master->dev),
 			dynamic ? " (dynamic)" : "");
 
 	/* populate children from any spi device tables */
@@ -502,7 +595,7 @@ struct spi_master *spi_busnum_to_master(u16 bus_num)
 	struct device		*dev;
 	struct spi_master	*master = NULL;
 
-	dev = class_find_device(&spi_master_class, &bus_num,
+	dev = class_find_device(&spi_master_class, NULL, &bus_num,
 				__spi_master_match);
 	if (dev)
 		master = container_of(dev, struct spi_master, dev);
@@ -513,6 +606,129 @@ EXPORT_SYMBOL_GPL(spi_busnum_to_master);
 
 
 /*-------------------------------------------------------------------------*/
+
+/* Core methods for SPI master protocol drivers.  Some of the
+ * other core methods are currently defined as inline functions.
+ */
+
+/**
+ * spi_setup - setup SPI mode and clock rate
+ * @spi: the device whose settings are being modified
+ * Context: can sleep, and no requests are queued to the device
+ *
+ * SPI protocol drivers may need to update the transfer mode if the
+ * device doesn't work with its default.  They may likewise need
+ * to update clock rates or word sizes from initial values.  This function
+ * changes those settings, and must be called from a context that can sleep.
+ * Except for SPI_CS_HIGH, which takes effect immediately, the changes take
+ * effect the next time the device is selected and data is transferred to
+ * or from it.  When this function returns, the spi device is deselected.
+ *
+ * Note that this call will fail if the protocol driver specifies an option
+ * that the underlying controller or its driver does not support.  For
+ * example, not all hardware supports wire transfers using nine bit words,
+ * LSB-first wire encoding, or active-high chipselects.
+ */
+int spi_setup(struct spi_device *spi)
+{
+	unsigned	bad_bits;
+	int		status;
+
+	/* help drivers fail *cleanly* when they need options
+	 * that aren't supported with their current master
+	 */
+	bad_bits = spi->mode & ~spi->master->mode_bits;
+	if (bad_bits) {
+		dev_dbg(&spi->dev, "setup: unsupported mode bits %x\n",
+			bad_bits);
+		return -EINVAL;
+	}
+
+	if (!spi->bits_per_word)
+		spi->bits_per_word = 8;
+
+	status = spi->master->setup(spi);
+
+	dev_dbg(&spi->dev, "setup mode %d, %s%s%s%s"
+				"%u bits/w, %u Hz max --> %d\n",
+			(int) (spi->mode & (SPI_CPOL | SPI_CPHA)),
+			(spi->mode & SPI_CS_HIGH) ? "cs_high, " : "",
+			(spi->mode & SPI_LSB_FIRST) ? "lsb, " : "",
+			(spi->mode & SPI_3WIRE) ? "3wire, " : "",
+			(spi->mode & SPI_LOOP) ? "loopback, " : "",
+			spi->bits_per_word, spi->max_speed_hz,
+			status);
+
+	return status;
+}
+EXPORT_SYMBOL_GPL(spi_setup);
+
+/**
+ * spi_async - asynchronous SPI transfer
+ * @spi: device with which data will be exchanged
+ * @message: describes the data transfers, including completion callback
+ * Context: any (irqs may be blocked, etc)
+ *
+ * This call may be used in_irq and other contexts which can't sleep,
+ * as well as from task contexts which can sleep.
+ *
+ * The completion callback is invoked in a context which can't sleep.
+ * Before that invocation, the value of message->status is undefined.
+ * When the callback is issued, message->status holds either zero (to
+ * indicate complete success) or a negative error code.  After that
+ * callback returns, the driver which issued the transfer request may
+ * deallocate the associated memory; it's no longer in use by any SPI
+ * core or controller driver code.
+ *
+ * Note that although all messages to a spi_device are handled in
+ * FIFO order, messages may go to different devices in other orders.
+ * Some device might be higher priority, or have various "hard" access
+ * time requirements, for example.
+ *
+ * On detection of any fault during the transfer, processing of
+ * the entire message is aborted, and the device is deselected.
+ * Until returning from the associated message completion callback,
+ * no other spi_message queued to that device will be processed.
+ * (This rule applies equally to all the synchronous transfer calls,
+ * which are wrappers around this core asynchronous primitive.)
+ */
+int spi_async(struct spi_device *spi, struct spi_message *message)
+{
+	struct spi_master *master = spi->master;
+
+	/* Half-duplex links include original MicroWire, and ones with
+	 * only one data pin like SPI_3WIRE (switches direction) or where
+	 * either MOSI or MISO is missing.  They can also be caused by
+	 * software limitations.
+	 */
+	if ((master->flags & SPI_MASTER_HALF_DUPLEX)
+			|| (spi->mode & SPI_3WIRE)) {
+		struct spi_transfer *xfer;
+		unsigned flags = master->flags;
+
+		list_for_each_entry(xfer, &message->transfers, transfer_list) {
+			if (xfer->rx_buf && xfer->tx_buf)
+				return -EINVAL;
+			if ((flags & SPI_MASTER_NO_TX) && xfer->tx_buf)
+				return -EINVAL;
+			if ((flags & SPI_MASTER_NO_RX) && xfer->rx_buf)
+				return -EINVAL;
+		}
+	}
+
+	message->spi = spi;
+	message->status = -EINPROGRESS;
+	return master->transfer(spi, message);
+}
+EXPORT_SYMBOL_GPL(spi_async);
+
+
+/*-------------------------------------------------------------------------*/
+
+/* Utility methods for SPI master protocol drivers, layered on
+ * top of the core.  Some other utility methods are defined as
+ * inline functions.
+ */
 
 static void spi_complete(void *arg)
 {
@@ -567,8 +783,8 @@ static u8	*buf;
  * @spi: device with which data will be exchanged
  * @txbuf: data to be written (need not be dma-safe)
  * @n_tx: size of txbuf, in bytes
- * @rxbuf: buffer into which data will be read
- * @n_rx: size of rxbuf, in bytes (need not be dma-safe)
+ * @rxbuf: buffer into which data will be read (need not be dma-safe)
+ * @n_rx: size of rxbuf, in bytes
  * Context: can sleep
  *
  * This performs a half duplex MicroWire style transaction with the
@@ -673,5 +889,5 @@ err0:
  * driver registration) _could_ be dynamically linked (modular) ... costs
  * include needing to have boardinfo data structures be much more public.
  */
-subsys_initcall(spi_init);
+postcore_initcall(spi_init);
 

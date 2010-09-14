@@ -307,7 +307,7 @@ xfs_trans_read_buf(
 			return (flags & XFS_BUF_TRYLOCK) ?
 					EAGAIN : XFS_ERROR(ENOMEM);
 
-		if ((bp != NULL) && (XFS_BUF_GETERROR(bp) != 0)) {
+		if (XFS_BUF_GETERROR(bp) != 0) {
 			xfs_ioerror_alert("xfs_trans_read_buf", mp,
 					  bp, blkno);
 			error = XFS_BUF_GETERROR(bp);
@@ -315,7 +315,7 @@ xfs_trans_read_buf(
 			return error;
 		}
 #ifdef DEBUG
-		if (xfs_do_error && (bp != NULL)) {
+		if (xfs_do_error) {
 			if (xfs_error_target == target) {
 				if (((xfs_req_num++) % xfs_error_mod) == 0) {
 					xfs_buf_relse(bp);
@@ -527,9 +527,8 @@ xfs_trans_brelse(xfs_trans_t	*tp,
 			lip = XFS_BUF_FSPRIVATE(bp, xfs_log_item_t *);
 			if (lip->li_type == XFS_LI_BUF) {
 				bip = XFS_BUF_FSPRIVATE(bp,xfs_buf_log_item_t*);
-				xfs_trans_unlocked_item(
-						bip->bli_item.li_mountp,
-						lip);
+				xfs_trans_unlocked_item(bip->bli_item.li_ailp,
+							lip);
 			}
 		}
 		xfs_buf_relse(bp);
@@ -626,7 +625,7 @@ xfs_trans_brelse(xfs_trans_t	*tp,
 	 * tell the AIL that the buffer is being unlocked.
 	 */
 	if (bip != NULL) {
-		xfs_trans_unlocked_item(bip->bli_item.li_mountp,
+		xfs_trans_unlocked_item(bip->bli_item.li_ailp,
 					(xfs_log_item_t*)bip);
 	}
 
@@ -1021,16 +1020,16 @@ xfs_trans_buf_item_match(
 	bp = NULL;
 	len = BBTOB(len);
 	licp = &tp->t_items;
-	if (!XFS_LIC_ARE_ALL_FREE(licp)) {
+	if (!xfs_lic_are_all_free(licp)) {
 		for (i = 0; i < licp->lic_unused; i++) {
 			/*
 			 * Skip unoccupied slots.
 			 */
-			if (XFS_LIC_ISFREE(licp, i)) {
+			if (xfs_lic_isfree(licp, i)) {
 				continue;
 			}
 
-			lidp = XFS_LIC_SLOT(licp, i);
+			lidp = xfs_lic_slot(licp, i);
 			blip = (xfs_buf_log_item_t *)lidp->lid_item;
 			if (blip->bli_item.li_type != XFS_LI_BUF) {
 				continue;
@@ -1074,7 +1073,7 @@ xfs_trans_buf_item_match_all(
 	bp = NULL;
 	len = BBTOB(len);
 	for (licp = &tp->t_items; licp != NULL; licp = licp->lic_next) {
-		if (XFS_LIC_ARE_ALL_FREE(licp)) {
+		if (xfs_lic_are_all_free(licp)) {
 			ASSERT(licp == &tp->t_items);
 			ASSERT(licp->lic_next == NULL);
 			return NULL;
@@ -1083,11 +1082,11 @@ xfs_trans_buf_item_match_all(
 			/*
 			 * Skip unoccupied slots.
 			 */
-			if (XFS_LIC_ISFREE(licp, i)) {
+			if (xfs_lic_isfree(licp, i)) {
 				continue;
 			}
 
-			lidp = XFS_LIC_SLOT(licp, i);
+			lidp = xfs_lic_slot(licp, i);
 			blip = (xfs_buf_log_item_t *)lidp->lid_item;
 			if (blip->bli_item.li_type != XFS_LI_BUF) {
 				continue;

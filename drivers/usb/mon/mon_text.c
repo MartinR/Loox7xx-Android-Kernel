@@ -87,7 +87,7 @@ struct mon_reader_text {
 
 static struct dentry *mon_dir;		/* Usually /sys/kernel/debug/usbmon */
 
-static void mon_text_ctor(struct kmem_cache *, void *);
+static void mon_text_ctor(void *);
 
 struct mon_text_ptr {
 	int cnt, limit;
@@ -148,20 +148,6 @@ static inline char mon_text_get_data(struct mon_event_text *ep, struct urb *urb,
 	} else {
 		if (ev_type != 'S')
 			return '>';
-	}
-
-	/*
-	 * The check to see if it's safe to poke at data has an enormous
-	 * number of corner cases, but it seems that the following is
-	 * more or less safe.
-	 *
-	 * We do not even try to look at transfer_buffer, because it can
-	 * contain non-NULL garbage in case the upper level promised to
-	 * set DMA for the HCD.
-	 */
-	if (urb->dev->bus->uses_dma &&
-	    (urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP)) {
-		return mon_dmapeek(ep->data, urb->transfer_dma, len);
 	}
 
 	if (urb->transfer_buffer == NULL)
@@ -720,7 +706,7 @@ void mon_text_del(struct mon_bus *mbus)
 /*
  * Slab interface: constructor.
  */
-static void mon_text_ctor(struct kmem_cache *slab, void *mem)
+static void mon_text_ctor(void *mem)
 {
 	/*
 	 * Nothing to initialize. No, really!
@@ -733,7 +719,7 @@ int __init mon_text_init(void)
 {
 	struct dentry *mondir;
 
-	mondir = debugfs_create_dir("usbmon", NULL);
+	mondir = debugfs_create_dir("usbmon", usb_debug_root);
 	if (IS_ERR(mondir)) {
 		printk(KERN_NOTICE TAG ": debugfs is not available\n");
 		return -ENODEV;

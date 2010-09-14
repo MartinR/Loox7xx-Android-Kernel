@@ -16,6 +16,8 @@
 #include <linux/cpu.h>
 #include <linux/cpuidle.h>
 #include <linux/ktime.h>
+#include <linux/hrtimer.h>
+#include <trace/events/power.h>
 
 #include "cpuidle.h"
 
@@ -56,25 +58,44 @@ static void cpuidle_idle_call(void)
 		if (pm_idle_old)
 			pm_idle_old();
 		else
+#if defined(CONFIG_ARCH_HAS_DEFAULT_IDLE)
+			default_idle();
+#else
 			local_irq_enable();
+#endif
 		return;
 	}
 
+#if 0
+	/* shows regressions, re-enable for 2.6.29 */
+	/*
+	 * run any timers that can be run now, at this point
+	 * before calculating the idle duration etc.
+	 */
+	hrtimer_peek_ahead_timers();
+#endif
 	/* ask the governor for the next state */
 	next_state = cpuidle_curr_governor->select(dev);
-	if (need_resched())
+	if (need_resched()) {
+		local_irq_enable();
 		return;
+	}
+
 	target_state = &dev->states[next_state];
 
 	/* enter the state and update stats */
-	dev->last_residency = target_state->enter(dev, target_state);
 	dev->last_state = target_state;
+	dev->last_residency = target_state->enter(dev, target_state);
+	if (dev->last_state)
+		target_state = dev->last_state;
+
 	target_state->time += (unsigned long long)dev->last_residency;
 	target_state->usage++;
 
 	/* give the governor an opportunity to reflect on the outcome */
 	if (cpuidle_curr_governor->reflect)
 		cpuidle_curr_governor->reflect(dev);
+	trace_power_end(0);
 }
 
 /**
@@ -94,7 +115,7 @@ void cpuidle_install_idle_handler(void)
  */
 void cpuidle_uninstall_idle_handler(void)
 {
-	if (enabled_devices && (pm_idle != pm_idle_old)) {
+	if (enabled_devices && pm_idle_old && (pm_idle != pm_idle_old)) {
 		pm_idle = pm_idle_old;
 		cpuidle_kick_cpus();
 	}
@@ -340,7 +361,7 @@ static void smp_callback(void *v)
 static int cpuidle_latency_notify(struct notifier_block *b,
 		unsigned long l, void *v)
 {
-	smp_call_function(smp_callback, NULL, 0, 1);
+	smp_call_function(smp_callback, NULL, 1);
 	return NOTIFY_OK;
 }
 

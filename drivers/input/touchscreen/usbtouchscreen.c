@@ -13,6 +13,7 @@
  *  - IdealTEK URTC1000
  *  - General Touch
  *  - GoTop Super_Q2/GogoPen/PenPower tablets
+ *  - JASTEC USB touch controller/DigiTech DTR-02U
  *
  * Copyright (C) 2004-2007 by Daniel Ritz <daniel.ritz@gmx.ch>
  * Copyright (C) by Todd E. Johnson (mtouchusb.c)
@@ -49,6 +50,7 @@
 #include <linux/init.h>
 #include <linux/usb.h>
 #include <linux/usb/input.h>
+#include <linux/hid.h>
 
 
 #define DRIVER_VERSION		"v0.6"
@@ -58,6 +60,10 @@
 static int swap_xy;
 module_param(swap_xy, bool, 0644);
 MODULE_PARM_DESC(swap_xy, "If set X and Y axes are swapped.");
+
+static int hwcalib_xy;
+module_param(hwcalib_xy, bool, 0644);
+MODULE_PARM_DESC(hwcalib_xy, "If set hw-calibrated X/Y are used if available");
 
 /* device specifc data/functions */
 struct usbtouch_usb;
@@ -101,7 +107,7 @@ struct usbtouch_usb {
 
 /* device types */
 enum {
-	DEVTPYE_DUMMY = -1,
+	DEVTYPE_IGNORE = -1,
 	DEVTYPE_EGALAX,
 	DEVTYPE_PANJIT,
 	DEVTYPE_3M,
@@ -113,10 +119,26 @@ enum {
 	DEVTYPE_IDEALTEK,
 	DEVTYPE_GENERAL_TOUCH,
 	DEVTYPE_GOTOP,
+	DEVTYPE_JASTEC,
+	DEVTYPE_E2I,
 };
+
+#define USB_DEVICE_HID_CLASS(vend, prod) \
+	.match_flags = USB_DEVICE_ID_MATCH_INT_CLASS \
+		| USB_DEVICE_ID_MATCH_INT_PROTOCOL \
+		| USB_DEVICE_ID_MATCH_DEVICE, \
+	.idVendor = (vend), \
+	.idProduct = (prod), \
+	.bInterfaceClass = USB_INTERFACE_CLASS_HID, \
+	.bInterfaceProtocol = USB_INTERFACE_PROTOCOL_MOUSE
 
 static struct usb_device_id usbtouch_devices[] = {
 #ifdef CONFIG_TOUCHSCREEN_USB_EGALAX
+	/* ignore the HID capable devices, handled by usbhid */
+	{USB_DEVICE_HID_CLASS(0x0eef, 0x0001), .driver_info = DEVTYPE_IGNORE},
+	{USB_DEVICE_HID_CLASS(0x0eef, 0x0002), .driver_info = DEVTYPE_IGNORE},
+
+	/* normal device IDs */
 	{USB_DEVICE(0x3823, 0x0001), .driver_info = DEVTYPE_EGALAX},
 	{USB_DEVICE(0x3823, 0x0002), .driver_info = DEVTYPE_EGALAX},
 	{USB_DEVICE(0x0123, 0x0001), .driver_info = DEVTYPE_EGALAX},
@@ -172,8 +194,48 @@ static struct usb_device_id usbtouch_devices[] = {
 	{USB_DEVICE(0x08f2, 0x00f4), .driver_info = DEVTYPE_GOTOP},
 #endif
 
+#ifdef CONFIG_TOUCHSCREEN_USB_JASTEC
+	{USB_DEVICE(0x0f92, 0x0001), .driver_info = DEVTYPE_JASTEC},
+#endif
+
+#ifdef CONFIG_TOUCHSCREEN_USB_E2I
+	{USB_DEVICE(0x1ac7, 0x0001), .driver_info = DEVTYPE_E2I},
+#endif
 	{}
 };
+
+
+/*****************************************************************************
+ * e2i Part
+ */
+
+#ifdef CONFIG_TOUCHSCREEN_USB_E2I
+static int e2i_init(struct usbtouch_usb *usbtouch)
+{
+	int ret;
+
+	ret = usb_control_msg(usbtouch->udev, usb_rcvctrlpipe(usbtouch->udev, 0),
+	                      0x01, 0x02, 0x0000, 0x0081,
+	                      NULL, 0, USB_CTRL_SET_TIMEOUT);
+
+	dbg("%s - usb_control_msg - E2I_RESET - bytes|err: %d",
+	    __func__, ret);
+	return ret;
+}
+
+static int e2i_read_data(struct usbtouch_usb *dev, unsigned char *pkt)
+{
+	int tmp = (pkt[0] << 8) | pkt[1];
+	dev->x  = (pkt[2] << 8) | pkt[3];
+	dev->y  = (pkt[4] << 8) | pkt[5];
+
+	tmp = tmp - 0xA000;
+	dev->touch = (tmp > 0);
+	dev->press = (tmp > 0 ? tmp : 0);
+
+	return 1;
+}
+#endif
 
 
 /*****************************************************************************
@@ -246,8 +308,13 @@ static int panjit_read_data(struct usbtouch_usb *dev, unsigned char *pkt)
 
 static int mtouch_read_data(struct usbtouch_usb *dev, unsigned char *pkt)
 {
-	dev->x = (pkt[8] << 8) | pkt[7];
-	dev->y = (pkt[10] << 8) | pkt[9];
+	if (hwcalib_xy) {
+		dev->x = (pkt[4] << 8) | pkt[3];
+		dev->y = 0xffff - ((pkt[6] << 8) | pkt[5]);
+	} else {
+		dev->x = (pkt[8] << 8) | pkt[7];
+		dev->y = (pkt[10] << 8) | pkt[9];
+	}
 	dev->touch = (pkt[2] & 0x40) ? 1 : 0;
 
 	return 1;
@@ -262,7 +329,7 @@ static int mtouch_init(struct usbtouch_usb *usbtouch)
 	                      USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
 	                      1, 0, NULL, 0, USB_CTRL_SET_TIMEOUT);
 	dbg("%s - usb_control_msg - MTOUCHUSB_RESET - bytes|err: %d",
-	    __FUNCTION__, ret);
+	    __func__, ret);
 	if (ret < 0)
 		return ret;
 	msleep(150);
@@ -273,11 +340,17 @@ static int mtouch_init(struct usbtouch_usb *usbtouch)
 				      USB_DIR_OUT | USB_TYPE_VENDOR | USB_RECIP_DEVICE,
 				      1, 1, NULL, 0, USB_CTRL_SET_TIMEOUT);
 		dbg("%s - usb_control_msg - MTOUCHUSB_ASYNC_REPORT - bytes|err: %d",
-		    __FUNCTION__, ret);
+		    __func__, ret);
 		if (ret >= 0)
 			break;
 		if (ret != -EPIPE)
 			return ret;
+	}
+
+	/* Default min/max xy are the raw values, override if using hw-calib */
+	if (hwcalib_xy) {
+		input_set_abs_params(usbtouch->input, ABS_X, 0, 0xffff, 0, 0);
+		input_set_abs_params(usbtouch->input, ABS_Y, 0, 0xffff, 0, 0);
 	}
 
 	return 0;
@@ -410,7 +483,7 @@ static int dmc_tsc10_init(struct usbtouch_usb *usbtouch)
 	                      0, 0, buf, 2, USB_CTRL_SET_TIMEOUT);
 	if (ret < 0)
 		goto err_out;
-	if (buf[0] != 0x06 || buf[1] != 0x00) {
+	if (buf[0] != 0x06) {
 		ret = -ENODEV;
 		goto err_out;
 	}
@@ -423,8 +496,7 @@ static int dmc_tsc10_init(struct usbtouch_usb *usbtouch)
 	                      TSC10_RATE_150, 0, buf, 2, USB_CTRL_SET_TIMEOUT);
 	if (ret < 0)
 		goto err_out;
-	if ((buf[0] != 0x06 || buf[1] != 0x00) &&
-	    (buf[0] != 0x15 || buf[1] != 0x01)) {
+	if ((buf[0] != 0x06) && (buf[0] != 0x15 || buf[1] != 0x01)) {
 		ret = -ENODEV;
 		goto err_out;
 	}
@@ -530,6 +602,21 @@ static int gotop_read_data(struct usbtouch_usb *dev, unsigned char *pkt)
 	dev->x = ((pkt[1] & 0x38) << 4) | pkt[2];
 	dev->y = ((pkt[1] & 0x07) << 7) | pkt[3];
 	dev->touch = pkt[0] & 0x01;
+
+	return 1;
+}
+#endif
+
+/*****************************************************************************
+ * JASTEC Part
+ */
+#ifdef CONFIG_TOUCHSCREEN_USB_JASTEC
+static int jastec_read_data(struct usbtouch_usb *dev, unsigned char *pkt)
+{
+	dev->x = ((pkt[0] & 0x3f) << 6) | (pkt[2] & 0x3f);
+	dev->y = ((pkt[1] & 0x3f) << 6) | (pkt[3] & 0x3f);
+	dev->touch = (pkt[0] & 0x40) >> 6;
+
 	return 1;
 }
 #endif
@@ -673,6 +760,29 @@ static struct usbtouch_device_info usbtouch_dev_info[] = {
 		.read_data	= gotop_read_data,
 	},
 #endif
+
+#ifdef CONFIG_TOUCHSCREEN_USB_JASTEC
+	[DEVTYPE_JASTEC] = {
+		.min_xc		= 0x0,
+		.max_xc		= 0x0fff,
+		.min_yc		= 0x0,
+		.max_yc		= 0x0fff,
+		.rept_size	= 4,
+		.read_data	= jastec_read_data,
+	},
+#endif
+
+#ifdef CONFIG_TOUCHSCREEN_USB_E2I
+	[DEVTYPE_E2I] = {
+		.min_xc		= 0x0,
+		.max_xc		= 0x7fff,
+		.min_yc		= 0x0,
+		.max_yc		= 0x7fff,
+		.rept_size	= 6,
+		.init		= e2i_init,
+		.read_data	= e2i_read_data,
+	},
+#endif
 };
 
 
@@ -793,18 +903,18 @@ static void usbtouch_irq(struct urb *urb)
 	case -ETIME:
 		/* this urb is timing out */
 		dbg("%s - urb timed out - was the device unplugged?",
-		    __FUNCTION__);
+		    __func__);
 		return;
 	case -ECONNRESET:
 	case -ENOENT:
 	case -ESHUTDOWN:
 		/* this urb is terminated, clean up */
 		dbg("%s - urb shutting down with status: %d",
-		    __FUNCTION__, urb->status);
+		    __func__, urb->status);
 		return;
 	default:
 		dbg("%s - nonzero urb status received: %d",
-		    __FUNCTION__, urb->status);
+		    __func__, urb->status);
 		goto exit;
 	}
 
@@ -814,7 +924,7 @@ exit:
 	retval = usb_submit_urb(urb, GFP_ATOMIC);
 	if (retval)
 		err("%s - usb_submit_urb failed with result: %d",
-		    __FUNCTION__, retval);
+		    __func__, retval);
 }
 
 static int usbtouch_open(struct input_dev *input)
@@ -857,6 +967,10 @@ static int usbtouch_probe(struct usb_interface *intf,
 	struct usbtouch_device_info *type;
 	int err = -ENOMEM;
 
+	/* some devices are ignored */
+	if (id->driver_info == DEVTYPE_IGNORE)
+		return -ENODEV;
+
 	interface = intf->cur_altsetting;
 	endpoint = &interface->endpoint[0].desc;
 
@@ -883,7 +997,7 @@ static int usbtouch_probe(struct usb_interface *intf,
 
 	usbtouch->irq = usb_alloc_urb(0, GFP_KERNEL);
 	if (!usbtouch->irq) {
-		dbg("%s - usb_alloc_urb failed: usbtouch->irq", __FUNCTION__);
+		dbg("%s - usb_alloc_urb failed: usbtouch->irq", __func__);
 		goto out_free_buffers;
 	}
 
@@ -939,14 +1053,14 @@ static int usbtouch_probe(struct usb_interface *intf,
 	if (type->init) {
 		err = type->init(usbtouch);
 		if (err) {
-			dbg("%s - type->init() failed, err: %d", __FUNCTION__, err);
+			dbg("%s - type->init() failed, err: %d", __func__, err);
 			goto out_free_buffers;
 		}
 	}
 
 	err = input_register_device(usbtouch->input);
 	if (err) {
-		dbg("%s - input_register_device failed, err: %d", __FUNCTION__, err);
+		dbg("%s - input_register_device failed, err: %d", __func__, err);
 		goto out_free_buffers;
 	}
 
@@ -966,12 +1080,12 @@ static void usbtouch_disconnect(struct usb_interface *intf)
 {
 	struct usbtouch_usb *usbtouch = usb_get_intfdata(intf);
 
-	dbg("%s - called", __FUNCTION__);
+	dbg("%s - called", __func__);
 
 	if (!usbtouch)
 		return;
 
-	dbg("%s - usbtouch is initialized, cleaning up", __FUNCTION__);
+	dbg("%s - usbtouch is initialized, cleaning up", __func__);
 	usb_set_intfdata(intf, NULL);
 	usb_kill_urb(usbtouch->irq);
 	input_unregister_device(usbtouch->input);

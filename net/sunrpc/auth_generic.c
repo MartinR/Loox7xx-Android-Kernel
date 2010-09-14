@@ -55,13 +55,13 @@ struct rpc_cred *rpc_lookup_machine_cred(void)
 EXPORT_SYMBOL_GPL(rpc_lookup_machine_cred);
 
 static void
-generic_bind_cred(struct rpc_task *task, struct rpc_cred *cred)
+generic_bind_cred(struct rpc_task *task, struct rpc_cred *cred, int lookupflags)
 {
 	struct rpc_auth *auth = task->tk_client->cl_auth;
 	struct auth_cred *acred = &container_of(cred, struct generic_cred, gc_base)->acred;
 	struct rpc_cred *ret;
 
-	ret = auth->au_ops->lookup_cred(auth, acred, 0);
+	ret = auth->au_ops->lookup_cred(auth, acred, lookupflags);
 	if (!IS_ERR(ret))
 		task->tk_msg.rpc_cred = ret;
 	else
@@ -133,13 +133,29 @@ static int
 generic_match(struct auth_cred *acred, struct rpc_cred *cred, int flags)
 {
 	struct generic_cred *gcred = container_of(cred, struct generic_cred, gc_base);
+	int i;
 
 	if (gcred->acred.uid != acred->uid ||
 	    gcred->acred.gid != acred->gid ||
-	    gcred->acred.group_info != acred->group_info ||
 	    gcred->acred.machine_cred != acred->machine_cred)
-		return 0;
+		goto out_nomatch;
+
+	/* Optimisation in the case where pointers are identical... */
+	if (gcred->acred.group_info == acred->group_info)
+		goto out_match;
+
+	/* Slow path... */
+	if (gcred->acred.group_info->ngroups != acred->group_info->ngroups)
+		goto out_nomatch;
+	for (i = 0; i < gcred->acred.group_info->ngroups; i++) {
+		if (GROUP_AT(gcred->acred.group_info, i) !=
+				GROUP_AT(acred->group_info, i))
+			goto out_nomatch;
+	}
+out_match:
 	return 1;
+out_nomatch:
+	return 0;
 }
 
 void __init rpc_init_generic_auth(void)

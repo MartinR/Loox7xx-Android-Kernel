@@ -5,8 +5,6 @@
  *
  *		IPv4 Forwarding Information Base: FIB frontend.
  *
- * Version:	$Id: fib_frontend.c,v 1.26 2001/10/31 21:55:54 davem Exp $
- *
  * Authors:	Alexey Kuznetsov, <kuznet@ms2.inr.ac.ru>
  *
  *		This program is free software; you can redistribute it and/or
@@ -42,7 +40,6 @@
 #include <net/route.h>
 #include <net/tcp.h>
 #include <net/sock.h>
-#include <net/icmp.h>
 #include <net/arp.h>
 #include <net/ip_fib.h>
 #include <net/rtnetlink.h>
@@ -146,7 +143,7 @@ static void fib_flush(struct net *net)
 	}
 
 	if (flushed)
-		rt_cache_flush(-1);
+		rt_cache_flush(net, -1);
 }
 
 /*
@@ -232,14 +229,17 @@ unsigned int inet_dev_addr_type(struct net *net, const struct net_device *dev,
  */
 
 int fib_validate_source(__be32 src, __be32 dst, u8 tos, int oif,
-			struct net_device *dev, __be32 *spec_dst, u32 *itag)
+			struct net_device *dev, __be32 *spec_dst,
+			u32 *itag, u32 mark)
 {
 	struct in_device *in_dev;
 	struct flowi fl = { .nl_u = { .ip4_u =
 				      { .daddr = src,
 					.saddr = dst,
 					.tos = tos } },
+			    .mark = mark,
 			    .iif = oif };
+
 	struct fib_result res;
 	int no_addr, rpf;
 	int ret;
@@ -277,7 +277,7 @@ int fib_validate_source(__be32 src, __be32 dst, u8 tos, int oif,
 	fib_res_put(&res);
 	if (no_addr)
 		goto last_resort;
-	if (rpf)
+	if (rpf == 1)
 		goto e_inval;
 	fl.oif = dev->ifindex;
 
@@ -580,7 +580,7 @@ errout:
 	return err;
 }
 
-static int inet_rtm_delroute(struct sk_buff *skb, struct nlmsghdr* nlh, void *arg)
+static int inet_rtm_delroute(struct sk_buff *skb, struct nlmsghdr *nlh, void *arg)
 {
 	struct net *net = sock_net(skb->sk);
 	struct fib_config cfg;
@@ -602,7 +602,7 @@ errout:
 	return err;
 }
 
-static int inet_rtm_newroute(struct sk_buff *skb, struct nlmsghdr* nlh, void *arg)
+static int inet_rtm_newroute(struct sk_buff *skb, struct nlmsghdr *nlh, void *arg)
 {
 	struct net *net = sock_net(skb->sk);
 	struct fib_config cfg;
@@ -899,21 +899,22 @@ static void fib_disable_ip(struct net_device *dev, int force)
 {
 	if (fib_sync_down_dev(dev, force))
 		fib_flush(dev_net(dev));
-	rt_cache_flush(0);
+	rt_cache_flush(dev_net(dev), 0);
 	arp_ifdown(dev);
 }
 
 static int fib_inetaddr_event(struct notifier_block *this, unsigned long event, void *ptr)
 {
-	struct in_ifaddr *ifa = (struct in_ifaddr*)ptr;
+	struct in_ifaddr *ifa = (struct in_ifaddr *)ptr;
+	struct net_device *dev = ifa->ifa_dev->dev;
 
 	switch (event) {
 	case NETDEV_UP:
 		fib_add_ifaddr(ifa);
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
-		fib_sync_up(ifa->ifa_dev->dev);
+		fib_sync_up(dev);
 #endif
-		rt_cache_flush(-1);
+		rt_cache_flush(dev_net(dev), -1);
 		break;
 	case NETDEV_DOWN:
 		fib_del_ifaddr(ifa);
@@ -921,9 +922,9 @@ static int fib_inetaddr_event(struct notifier_block *this, unsigned long event, 
 			/* Last address was deleted from this interface.
 			   Disable IP.
 			 */
-			fib_disable_ip(ifa->ifa_dev->dev, 1);
+			fib_disable_ip(dev, 1);
 		} else {
-			rt_cache_flush(-1);
+			rt_cache_flush(dev_net(dev), -1);
 		}
 		break;
 	}
@@ -951,25 +952,25 @@ static int fib_netdev_event(struct notifier_block *this, unsigned long event, vo
 #ifdef CONFIG_IP_ROUTE_MULTIPATH
 		fib_sync_up(dev);
 #endif
-		rt_cache_flush(-1);
+		rt_cache_flush(dev_net(dev), -1);
 		break;
 	case NETDEV_DOWN:
 		fib_disable_ip(dev, 0);
 		break;
 	case NETDEV_CHANGEMTU:
 	case NETDEV_CHANGE:
-		rt_cache_flush(0);
+		rt_cache_flush(dev_net(dev), 0);
 		break;
 	}
 	return NOTIFY_DONE;
 }
 
 static struct notifier_block fib_inetaddr_notifier = {
-	.notifier_call =fib_inetaddr_event,
+	.notifier_call = fib_inetaddr_event,
 };
 
 static struct notifier_block fib_netdev_notifier = {
-	.notifier_call =fib_netdev_event,
+	.notifier_call = fib_netdev_event,
 };
 
 static int __net_init ip_fib_net_init(struct net *net)

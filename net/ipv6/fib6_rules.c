@@ -93,7 +93,8 @@ static int fib6_rule_action(struct fib_rule *rule, struct flowi *flp,
 			if (flags & RT6_LOOKUP_F_SRCPREF_COA)
 				srcprefs |= IPV6_PREFER_SRC_COA;
 
-			if (ipv6_dev_get_saddr(ip6_dst_idev(&rt->u.dst)->dev,
+			if (ipv6_dev_get_saddr(net,
+					       ip6_dst_idev(&rt->u.dst)->dev,
 					       &flp->fl6_dst, srcprefs,
 					       &saddr))
 				goto again;
@@ -150,7 +151,7 @@ static const struct nla_policy fib6_rule_policy[FRA_MAX+1] = {
 };
 
 static int fib6_rule_configure(struct fib_rule *rule, struct sk_buff *skb,
-			       struct nlmsghdr *nlh, struct fib_rule_hdr *frh,
+			       struct fib_rule_hdr *frh,
 			       struct nlattr **tb)
 {
 	int err = -EINVAL;
@@ -210,7 +211,7 @@ static int fib6_rule_compare(struct fib_rule *rule, struct fib_rule_hdr *frh,
 }
 
 static int fib6_rule_fill(struct fib_rule *rule, struct sk_buff *skb,
-			  struct nlmsghdr *nlh, struct fib_rule_hdr *frh)
+			  struct fib_rule_hdr *frh)
 {
 	struct fib6_rule *rule6 = (struct fib6_rule *) rule;
 

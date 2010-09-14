@@ -7,6 +7,7 @@
  */
 
 #include <linux/module.h>
+#include <linux/smp_lock.h>
 #include <linux/types.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
@@ -16,7 +17,6 @@
 #include <linux/sunrpc/clnt.h>
 #include <linux/sunrpc/svc.h>
 #include <linux/lockd/lockd.h>
-#include <linux/lockd/sm_inter.h>
 
 #define NLMDBG_FACILITY		NLMDBG_CLIENT
 #define NLMCLNT_GRACE_WAIT	(5*HZ)
@@ -127,7 +127,6 @@ static void nlmclnt_setlockargs(struct nlm_rqst *req, struct file_lock *fl)
 	struct nlm_lock	*lock = &argp->lock;
 
 	nlmclnt_next_cookie(&argp->cookie);
-	argp->state   = nsm_local_state;
 	memcpy(&lock->fh, NFS_FH(fl->fl_file->f_path.dentry->d_inode), sizeof(struct nfs_fh));
 	lock->caller  = utsname()->nodename;
 	lock->oh.data = req->a_owner;
@@ -166,6 +165,7 @@ int nlmclnt_proc(struct nlm_host *host, int cmd, struct file_lock *fl)
 	/* Set up the argument struct */
 	nlmclnt_setlockargs(call, fl);
 
+	lock_kernel();
 	if (IS_SETLK(cmd) || IS_SETLKW(cmd)) {
 		if (fl->fl_type != F_UNLCK) {
 			call->a_args.block = IS_SETLKW(cmd) ? 1 : 0;
@@ -179,6 +179,7 @@ int nlmclnt_proc(struct nlm_host *host, int cmd, struct file_lock *fl)
 
 	fl->fl_ops->fl_release_private(fl);
 	fl->fl_ops = NULL;
+	unlock_kernel();
 
 	dprintk("lockd: clnt proc returns %d\n", status);
 	return status;
@@ -224,7 +225,9 @@ void nlm_release_call(struct nlm_rqst *call)
 
 static void nlmclnt_rpc_release(void *data)
 {
+	lock_kernel();
 	nlm_release_call(data);
+	unlock_kernel();
 }
 
 static int nlm_wait_on_grace(wait_queue_head_t *queue)
@@ -430,7 +433,7 @@ nlmclnt_test(struct nlm_rqst *req, struct file_lock *fl)
 			 * Report the conflicting lock back to the application.
 			 */
 			fl->fl_start = req->a_res.lock.fl.fl_start;
-			fl->fl_end = req->a_res.lock.fl.fl_start;
+			fl->fl_end = req->a_res.lock.fl.fl_end;
 			fl->fl_type = req->a_res.lock.fl.fl_type;
 			fl->fl_pid = 0;
 			break;
@@ -455,7 +458,7 @@ static void nlmclnt_locks_release_private(struct file_lock *fl)
 	nlm_put_lockowner(fl->fl_u.nfs_fl.owner);
 }
 
-static struct file_lock_operations nlmclnt_lock_ops = {
+static const struct file_lock_operations nlmclnt_lock_ops = {
 	.fl_copy_lock = nlmclnt_locks_copy_lock,
 	.fl_release_private = nlmclnt_locks_release_private,
 };
@@ -516,11 +519,10 @@ nlmclnt_lock(struct nlm_rqst *req, struct file_lock *fl)
 	unsigned char fl_type;
 	int status = -ENOLCK;
 
-	if (nsm_monitor(host) < 0) {
-		printk(KERN_NOTICE "lockd: failed to monitor %s\n",
-					host->h_name);
+	if (nsm_monitor(host) < 0)
 		goto out;
-	}
+	req->a_args.state = nsm_local_state;
+
 	fl->fl_flags |= FL_ACCESS;
 	status = do_vfs_lock(fl);
 	fl->fl_flags = fl_flags;
@@ -580,7 +582,15 @@ again:
 	}
 	if (status < 0)
 		goto out_unlock;
-	status = nlm_stat_to_errno(resp->status);
+	/*
+	 * EAGAIN doesn't make sense for sleeping locks, and in some
+	 * cases NLM_LCK_DENIED is returned for a permanent error.  So
+	 * turn it into an ENOLCK.
+	 */
+	if (resp->status == nlm_lck_denied && (fl_flags & FL_SLEEP))
+		status = -ENOLCK;
+	else
+		status = nlm_stat_to_errno(resp->status);
 out_unblock:
 	nlmclnt_finish_block(block);
 out:
@@ -710,7 +720,9 @@ static void nlmclnt_unlock_callback(struct rpc_task *task, void *data)
 die:
 	return;
  retry_rebind:
+	lock_kernel();
 	nlm_rebind_host(req->a_host);
+	unlock_kernel();
  retry_unlock:
 	rpc_restart_call(task);
 }
@@ -788,7 +800,9 @@ retry_cancel:
 	/* Don't ever retry more than 3 times */
 	if (req->a_retries++ >= NLMCLNT_MAX_RETRIES)
 		goto die;
+	lock_kernel();
 	nlm_rebind_host(req->a_host);
+	unlock_kernel();
 	rpc_restart_call(task);
 	rpc_delay(task, 30 * HZ);
 }

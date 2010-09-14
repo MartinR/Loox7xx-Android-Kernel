@@ -227,8 +227,14 @@ static ssize_t cxacru_sysfs_showattr_s8(s8 value, char *buf)
 
 static ssize_t cxacru_sysfs_showattr_dB(s16 value, char *buf)
 {
-	return snprintf(buf, PAGE_SIZE, "%d.%02u\n",
-					value / 100, abs(value) % 100);
+	if (likely(value >= 0)) {
+		return snprintf(buf, PAGE_SIZE, "%u.%02u\n",
+					value / 100, value % 100);
+	} else {
+		value = -value;
+		return snprintf(buf, PAGE_SIZE, "-%u.%02u\n",
+					value / 100, value % 100);
+	}
 }
 
 static ssize_t cxacru_sysfs_showattr_bool(u32 value, char *buf)
@@ -286,9 +292,7 @@ static ssize_t cxacru_sysfs_show_mac_address(struct device *dev,
 	struct usbatm_data *usbatm_instance = usb_get_intfdata(intf);
 	struct atm_dev *atm_dev = usbatm_instance->atm_dev;
 
-	return snprintf(buf, PAGE_SIZE, "%02x:%02x:%02x:%02x:%02x:%02x\n",
-			atm_dev->esi[0], atm_dev->esi[1], atm_dev->esi[2],
-			atm_dev->esi[3], atm_dev->esi[4], atm_dev->esi[5]);
+	return snprintf(buf, PAGE_SIZE, "%pM\n", atm_dev->esi);
 }
 
 static ssize_t cxacru_sysfs_show_adsl_state(struct device *dev,
@@ -487,7 +491,7 @@ static int cxacru_cm(struct cxacru_data *instance, enum cxacru_cm_request cm,
 			usb_err(instance->usbatm, "requested transfer size too large (%d, %d)\n",
 				wbuflen, rbuflen);
 		ret = -ENOMEM;
-		goto fail;
+		goto err;
 	}
 
 	mutex_lock(&instance->cm_serialize);
@@ -567,6 +571,7 @@ static int cxacru_cm(struct cxacru_data *instance, enum cxacru_cm_request cm,
 	dbg("cm %#x", cm);
 fail:
 	mutex_unlock(&instance->cm_serialize);
+err:
 	return ret;
 }
 
@@ -602,7 +607,7 @@ static int cxacru_cm_get_array(struct cxacru_data *instance, enum cxacru_cm_requ
 			offd = le32_to_cpu(buf[offb++]);
 			if (offd >= size) {
 				if (printk_ratelimit())
-					usb_err(instance->usbatm, "wrong index #%x in response to cm #%x\n",
+					usb_err(instance->usbatm, "wrong index %#x in response to cm %#x\n",
 						offd, cm);
 				ret = -EIO;
 				goto cleanup;
@@ -820,7 +825,7 @@ reschedule:
 }
 
 static int cxacru_fw(struct usb_device *usb_dev, enum cxacru_fw_request fw,
-		     u8 code1, u8 code2, u32 addr, u8 *data, int size)
+		     u8 code1, u8 code2, u32 addr, const u8 *data, int size)
 {
 	int ret;
 	u8 *buf;
@@ -1052,7 +1057,6 @@ static int cxacru_bind(struct usbatm_data *usbatm_instance,
 
 	instance->usbatm = usbatm_instance;
 	instance->modem_type = (struct cxacru_modem_type *) id->driver_info;
-	memset(instance->card_info, 0, sizeof(instance->card_info));
 
 	mutex_init(&instance->poll_state_serialize);
 	instance->poll_state = CXPOLL_STOPPED;

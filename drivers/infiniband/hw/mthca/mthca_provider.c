@@ -32,8 +32,6 @@
  * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- *
- * $Id: mthca_provider.c 4859 2006-01-09 21:55:10Z roland $
  */
 
 #include <rdma/ib_smi.h>
@@ -335,6 +333,9 @@ static struct ib_ucontext *mthca_alloc_ucontext(struct ib_device *ibdev,
 	struct mthca_alloc_ucontext_resp uresp;
 	struct mthca_ucontext           *context;
 	int                              err;
+
+	if (!(to_mdev(ibdev)->active))
+		return ERR_PTR(-EAGAIN);
 
 	memset(&uresp, 0, sizeof uresp);
 

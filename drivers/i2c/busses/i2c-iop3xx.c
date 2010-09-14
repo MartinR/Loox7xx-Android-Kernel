@@ -480,16 +480,15 @@ iop3xx_i2c_probe(struct platform_device *pdev)
 	}
 
 	memcpy(new_adapter->name, pdev->name, strlen(pdev->name));
-	new_adapter->id = I2C_HW_IOP3XX;
 	new_adapter->owner = THIS_MODULE;
-	new_adapter->class = I2C_CLASS_HWMON;
+	new_adapter->class = I2C_CLASS_HWMON | I2C_CLASS_SPD;
 	new_adapter->dev.parent = &pdev->dev;
 	new_adapter->nr = pdev->id;
 
 	/*
 	 * Default values...should these come in from board code?
 	 */
-	new_adapter->timeout = 100;	
+	new_adapter->timeout = HZ;
 	new_adapter->algo = &iop3xx_i2c_algo;
 
 	init_waitqueue_head(&adapter_data->waitq);

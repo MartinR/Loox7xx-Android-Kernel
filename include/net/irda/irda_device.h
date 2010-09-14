@@ -135,9 +135,11 @@ struct dongle_reg {
 
 /* 
  * Per-packet information we need to hide inside sk_buff 
- * (must not exceed 48 bytes, check with struct sk_buff) 
+ * (must not exceed 48 bytes, check with struct sk_buff)
+ * The default_qdisc_pad field is a temporary hack.
  */
 struct irda_skb_cb {
+	unsigned int default_qdisc_pad;
 	magic_t magic;       /* Be sure that we can trust the information */
 	__u32   next_speed;  /* The Speed to be set *after* this frame */
 	__u16   mtt;         /* Minimum turn around time */
@@ -223,7 +225,7 @@ int  irda_device_is_receiving(struct net_device *dev);
 /* Interface for internal use */
 static inline int irda_device_txqueue_empty(const struct net_device *dev)
 {
-	return skb_queue_empty(&dev->qdisc->q);
+	return qdisc_all_tx_empty(dev);
 }
 int  irda_device_set_raw_mode(struct net_device* self, int status);
 struct net_device *alloc_irdadev(int sizeof_priv);

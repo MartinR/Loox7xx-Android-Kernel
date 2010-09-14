@@ -182,12 +182,13 @@ struct tcm825x_platform_data {
 	int (*needs_reset)(struct v4l2_int_device *s, void *buf,
 			   struct v4l2_pix_format *fmt);
 	int (*ifparm)(struct v4l2_ifparm *p);
+	int (*is_upside_down)(void);
 };
 
 /* Array of image sizes supported by TCM825X.  These must be ordered from
  * smallest image size to largest.
  */
-const static struct capture_size tcm825x_sizes[] = {
+static const struct capture_size tcm825x_sizes[] = {
 	{ 128,  96 }, /* subQCIF */
 	{ 160, 120 }, /* QQVGA */
 	{ 176, 144 }, /* QCIF */

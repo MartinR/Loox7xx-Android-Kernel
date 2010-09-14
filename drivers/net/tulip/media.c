@@ -1,7 +1,6 @@
 /*
 	drivers/net/tulip/media.c
 
-	Maintained by Valerie Henson <val_henson@linux.intel.com>
 	Copyright 2000,2001  The Linux Kernel Team
 	Written/copyright 1994-2001 by Donald Becker.
 
@@ -9,9 +8,9 @@
 	of the GNU General Public License, incorporated herein by reference.
 
 	Please refer to Documentation/DocBook/tulip-user.{pdf,ps,html}
-	for more information on this driver, or visit the project
-	Web page at http://sourceforge.net/projects/tulip/
+	for more information on this driver.
 
+	Please submit bugs to http://bugzilla.kernel.org/ .
 */
 
 #include <linux/kernel.h>
@@ -70,11 +69,10 @@ int tulip_mdio_read(struct net_device *dev, int phy_id, int location)
 
 	spin_lock_irqsave(&tp->mii_lock, flags);
 	if (tp->chip_id == LC82C168) {
-		int i = 1000;
 		iowrite32(0x60020000 + (phy_id<<23) + (location<<18), ioaddr + 0xA0);
 		ioread32(ioaddr + 0xA0);
 		ioread32(ioaddr + 0xA0);
-		while (--i > 0) {
+		for (i = 1000; i >= 0; --i) {
 			barrier();
 			if ( ! ((retval = ioread32(ioaddr + 0xA0)) & 0x80000000))
 				break;
@@ -132,13 +130,12 @@ void tulip_mdio_write(struct net_device *dev, int phy_id, int location, int val)
 
 	spin_lock_irqsave(&tp->mii_lock, flags);
 	if (tp->chip_id == LC82C168) {
-		int i = 1000;
 		iowrite32(cmd, ioaddr + 0xA0);
-		do {
+		for (i = 1000; i >= 0; --i) {
 			barrier();
 			if ( ! (ioread32(ioaddr + 0xA0) & 0x80000000))
 				break;
-		} while (--i > 0);
+		}
 		spin_unlock_irqrestore(&tp->mii_lock, flags);
 		return;
 	}

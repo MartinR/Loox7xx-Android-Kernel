@@ -33,8 +33,10 @@
 #include <linux/kobject.h>
 #include <asm/uaccess.h>
 #include <linux/moduleparam.h>
+#include <linux/pci.h>
 
 #include "acpiphp.h"
+#include "../pci.h"
 
 #define DRIVER_VERSION	"1.0.1"
 #define DRIVER_AUTHOR	"Irene Zubarev <zubarev@us.ibm.com>, Vernon Mauery <vernux@us.ibm.com>"
@@ -181,7 +183,7 @@ static int ibm_set_attention_status(struct hotplug_slot *slot, u8 status)
 	union acpi_object args[2]; 
 	struct acpi_object_list params = { .pointer = args, .count = 2 };
 	acpi_status stat; 
-	unsigned long rc;
+	unsigned long long rc;
 	union apci_descriptor *ibm_slot;
 
 	ibm_slot = ibm_slot_from_id(hpslot_to_sun(slot));
@@ -202,7 +204,7 @@ static int ibm_set_attention_status(struct hotplug_slot *slot, u8 status)
 		err("APLS evaluation failed:  0x%08x\n", stat);
 		return -ENODEV;
 	} else if (!rc) {
-		err("APLS method failed:  0x%08lx\n", rc);
+		err("APLS method failed:  0x%08llx\n", rc);
 		return -ERANGE;
 	}
 	return 0;
@@ -269,7 +271,7 @@ static void ibm_handle_events(acpi_handle handle, u32 event, void *context)
 		dbg("%s: generationg bus event\n", __func__);
 		acpi_bus_generate_proc_event(note->device, note->event, detail);
 		acpi_bus_generate_netlink_event(note->device->pnp.device_class,
-						  note->device->dev.bus_id,
+						  dev_name(&note->device->dev),
 						  note->event, detail);
 	} else
 		note->event = event;
@@ -396,23 +398,20 @@ static acpi_status __init ibm_find_acpi_device(acpi_handle handle,
 	acpi_handle *phandle = (acpi_handle *)context;
 	acpi_status status; 
 	struct acpi_device_info *info;
-	struct acpi_buffer info_buffer = { ACPI_ALLOCATE_BUFFER, NULL };
 	int retval = 0;
 
-	status = acpi_get_object_info(handle, &info_buffer);
+	status = acpi_get_object_info(handle, &info);
 	if (ACPI_FAILURE(status)) {
 		err("%s:  Failed to get device information status=0x%x\n",
 			__func__, status);
 		return retval;
 	}
-	info = info_buffer.pointer;
-	info->hardware_id.value[sizeof(info->hardware_id.value) - 1] = '\0';
 
 	if (info->current_status && (info->valid & ACPI_VALID_HID) &&
-			(!strcmp(info->hardware_id.value, IBM_HARDWARE_ID1) ||
-			 !strcmp(info->hardware_id.value, IBM_HARDWARE_ID2))) {
+			(!strcmp(info->hardware_id.string, IBM_HARDWARE_ID1) ||
+			 !strcmp(info->hardware_id.string, IBM_HARDWARE_ID2))) {
 		dbg("found hardware: %s, handle: %p\n",
-			info->hardware_id.value, handle);
+			info->hardware_id.string, handle);
 		*phandle = handle;
 		/* returning non-zero causes the search to stop
 		 * and returns this value to the caller of 
@@ -430,7 +429,7 @@ static int __init ibm_acpiphp_init(void)
 	int retval = 0;
 	acpi_status status;
 	struct acpi_device *device;
-	struct kobject *sysdir = &pci_hotplug_slots_kset->kobj;
+	struct kobject *sysdir = &pci_slots_kset->kobj;
 
 	dbg("%s\n", __func__);
 
@@ -477,7 +476,7 @@ init_return:
 static void __exit ibm_acpiphp_exit(void)
 {
 	acpi_status status;
-	struct kobject *sysdir = &pci_hotplug_slots_kset->kobj;
+	struct kobject *sysdir = &pci_slots_kset->kobj;
 
 	dbg("%s\n", __func__);
 

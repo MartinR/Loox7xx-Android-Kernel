@@ -1,7 +1,7 @@
 /*
  * m8xx_pcmcia.c - Linux PCMCIA socket driver for the mpc8xx series.
  *
- * (C) 1999-2000 Magnus Damm <damm@bitsmart.com>
+ * (C) 1999-2000 Magnus Damm <damm@opensource.se>
  * (C) 2001-2002 Montavista Software, Inc.
  *     <mlocke@mvista.com>
  *
@@ -49,6 +49,8 @@
 #include <linux/interrupt.h>
 #include <linux/fsl_devices.h>
 #include <linux/bitops.h>
+#include <linux/of_device.h>
+#include <linux/of_platform.h>
 
 #include <asm/io.h>
 #include <asm/system.h>
@@ -57,16 +59,13 @@
 #include <asm/8xx_immap.h>
 #include <asm/irq.h>
 #include <asm/fs_pd.h>
-#include <asm/of_device.h>
-#include <asm/of_platform.h>
 
-#include <pcmcia/version.h>
 #include <pcmcia/cs_types.h>
 #include <pcmcia/cs.h>
 #include <pcmcia/ss.h>
 
-#ifdef PCMCIA_DEBUG
-static int pc_debug = PCMCIA_DEBUG;
+#ifdef CONFIG_PCMCIA_DEBUG
+static int pc_debug;
 module_param(pc_debug, int, 0);
 #define dprintk(args...) printk(KERN_DEBUG "m8xx_pcmcia: " args);
 #else
@@ -976,8 +975,9 @@ static int m8xx_set_io_map(struct pcmcia_socket *sock, struct pccard_io_map *io)
 #define M8XX_BASE (PCMCIA_IO_WIN_BASE + io->start)
 
 	dprintk("SetIOMap(%d, %d, %#2.2x, %d ns, "
-		"%#4.4x-%#4.4x)\n", lsock, io->map, io->flags,
-		io->speed, io->start, io->stop);
+		"%#4.4llx-%#4.4llx)\n", lsock, io->map, io->flags,
+		io->speed, (unsigned long long)io->start,
+		(unsigned long long)io->stop);
 
 	if ((io->map >= PCMCIA_IO_WIN_NO) || (io->start > 0xffff)
 	    || (io->stop > 0xffff) || (io->stop < io->start))
@@ -1056,8 +1056,9 @@ static int m8xx_set_mem_map(struct pcmcia_socket *sock,
 	pcmconf8xx_t *pcmcia = s->pcmcia;
 
 	dprintk("SetMemMap(%d, %d, %#2.2x, %d ns, "
-		"%#5.5lx, %#5.5x)\n", lsock, mem->map, mem->flags,
-		mem->speed, mem->static_start, mem->card_start);
+		"%#5.5llx, %#5.5x)\n", lsock, mem->map, mem->flags,
+		mem->speed, (unsigned long long)mem->static_start,
+		mem->card_start);
 
 	if ((mem->map >= PCMCIA_MEM_WIN_NO)
 //          || ((mem->s) >= PCMCIA_MEM_WIN_SIZE)
@@ -1108,8 +1109,9 @@ static int m8xx_set_mem_map(struct pcmcia_socket *sock,
 	}
 
 	dprintk("SetMemMap(%d, %d, %#2.2x, %d ns, "
-		"%#5.5lx, %#5.5x)\n", lsock, mem->map, mem->flags,
-		mem->speed, mem->static_start, mem->card_start);
+		"%#5.5llx, %#5.5x)\n", lsock, mem->map, mem->flags,
+		mem->speed, (unsigned long long)mem->static_start,
+		mem->card_start);
 
 	/* copy the struct and modify the copy */
 
@@ -1297,7 +1299,7 @@ static int m8xx_remove(struct of_device *ofdev)
 #ifdef CONFIG_PM
 static int m8xx_suspend(struct platform_device *pdev, pm_message_t state)
 {
-	return pcmcia_socket_dev_suspend(&pdev->dev, state);
+	return pcmcia_socket_dev_suspend(&pdev->dev);
 }
 
 static int m8xx_resume(struct platform_device *pdev)

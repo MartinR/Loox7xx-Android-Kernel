@@ -24,8 +24,8 @@
 #include <linux/err.h>
 #include <linux/io.h>
 
-#include <asm/arch/board.h>
-#include <asm/arch/smc.h>
+#include <mach/board.h>
+#include <mach/smc.h>
 
 #define DRV_NAME "pata_at32"
 #define DRV_VERSION "0.0.3"
@@ -67,7 +67,9 @@
  *
  * Alter PIO_MASK below according to table to set maximal PIO mode.
  */
-#define PIO_MASK (0x1f)
+enum {
+  PIO_MASK = ATA_PIO4,
+};
 
 /*
  * Struct containing private information about device.

@@ -8,7 +8,7 @@ not) in a system. This feature will allow you to implement a lock-down
 of USB devices, fully controlled by user space.
 
 As of now, when a USB device is connected it is configured and
-it's interfaces inmediately made available to the users. With this
+its interfaces are immediately made available to the users.  With this
 modification, only if root authorizes the device to be configured will
 then it be possible to use it.
 
@@ -16,20 +16,20 @@ Usage:
 
 Authorize a device to connect:
 
-$ echo 1 > /sys/usb/devices/DEVICE/authorized
+$ echo 1 > /sys/bus/usb/devices/DEVICE/authorized
 
 Deauthorize a device:
 
-$ echo 0 > /sys/usb/devices/DEVICE/authorized
+$ echo 0 > /sys/bus/usb/devices/DEVICE/authorized
 
 Set new devices connected to hostX to be deauthorized by default (ie:
 lock down):
 
-$ echo 0 > /sys/bus/devices/usbX/authorized_default
+$ echo 0 > /sys/bus/usb/devices/usbX/authorized_default
 
 Remove the lock down:
 
-$ echo 1 > /sys/bus/devices/usbX/authorized_default
+$ echo 1 > /sys/bus/usb/devices/usbX/authorized_default
 
 By default, Wired USB devices are authorized by default to
 connect. Wireless USB hosts deauthorize by default all new connected
@@ -47,7 +47,7 @@ USB port):
 boot up
 rc.local ->
 
- for host in /sys/bus/devices/usb*
+ for host in /sys/bus/usb/devices/usb*
  do
     echo 0 > $host/authorized_default
  done

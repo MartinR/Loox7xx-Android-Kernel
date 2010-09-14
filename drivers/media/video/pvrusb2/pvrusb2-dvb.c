@@ -20,6 +20,7 @@
 
 #include <linux/kthread.h>
 #include <linux/freezer.h>
+#include <linux/mm.h>
 #include "dvbdev.h"
 #include "pvrusb2-debug.h"
 #include "pvrusb2-hdw-internal.h"
@@ -320,7 +321,7 @@ static int pvr2_dvb_adapter_exit(struct pvr2_dvb_adapter *adap)
 static int pvr2_dvb_frontend_init(struct pvr2_dvb_adapter *adap)
 {
 	struct pvr2_hdw *hdw = adap->channel.hdw;
-	struct pvr2_dvb_props *dvb_props = hdw->hdw_desc->dvb_props;
+	const struct pvr2_dvb_props *dvb_props = hdw->hdw_desc->dvb_props;
 	int ret = 0;
 
 	if (dvb_props == NULL) {

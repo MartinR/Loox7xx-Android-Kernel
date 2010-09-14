@@ -679,10 +679,7 @@ static int __jffs2_flush_wbuf(struct jffs2_sb_info *c, int pad)
 
 	memset(c->wbuf,0xff,c->wbuf_pagesize);
 	/* adjust write buffer offset, else we get a non contiguous write bug */
-	if (SECTOR_ADDR(c->wbuf_ofs) == SECTOR_ADDR(c->wbuf_ofs+c->wbuf_pagesize))
-		c->wbuf_ofs += c->wbuf_pagesize;
-	else
-		c->wbuf_ofs = 0xffffffff;
+	c->wbuf_ofs += c->wbuf_pagesize;
 	c->wbuf_len = 0;
 	return 0;
 }
@@ -1271,10 +1268,20 @@ int jffs2_nor_wbuf_flash_setup(struct jffs2_sb_info *c) {
 	if (!c->wbuf)
 		return -ENOMEM;
 
+#ifdef CONFIG_JFFS2_FS_WBUF_VERIFY
+	c->wbuf_verify = kmalloc(c->wbuf_pagesize, GFP_KERNEL);
+	if (!c->wbuf_verify) {
+		kfree(c->wbuf);
+		return -ENOMEM;
+	}
+#endif
 	return 0;
 }
 
 void jffs2_nor_wbuf_flash_cleanup(struct jffs2_sb_info *c) {
+#ifdef CONFIG_JFFS2_FS_WBUF_VERIFY
+	kfree(c->wbuf_verify);
+#endif
 	kfree(c->wbuf);
 }
 

@@ -34,7 +34,6 @@
 #include <linux/module.h>
 
 #include <asm/io.h>
-#include <asm/gdb-stub.h>
 #include <int.h>
 #include <uart.h>
 
@@ -173,7 +172,7 @@ static struct irqaction gic_action = {
 
 static struct irqaction timer_action = {
 	.handler =	no_action,
-	.flags =	IRQF_DISABLED,
+	.flags =	IRQF_DISABLED | IRQF_TIMER,
 	.name =		"Timer",
 };
 

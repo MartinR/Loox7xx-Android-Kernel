@@ -307,15 +307,18 @@ xfs_mru_cache_init(void)
 	xfs_mru_elem_zone = kmem_zone_init(sizeof(xfs_mru_cache_elem_t),
 	                                 "xfs_mru_cache_elem");
 	if (!xfs_mru_elem_zone)
-		return ENOMEM;
+		goto out;
 
 	xfs_mru_reap_wq = create_singlethread_workqueue("xfs_mru_cache");
-	if (!xfs_mru_reap_wq) {
-		kmem_zone_destroy(xfs_mru_elem_zone);
-		return ENOMEM;
-	}
+	if (!xfs_mru_reap_wq)
+		goto out_destroy_mru_elem_zone;
 
 	return 0;
+
+ out_destroy_mru_elem_zone:
+	kmem_zone_destroy(xfs_mru_elem_zone);
+ out:
+	return -ENOMEM;
 }
 
 void
@@ -382,9 +385,9 @@ xfs_mru_cache_create(
 
 exit:
 	if (err && mru && mru->lists)
-		kmem_free(mru->lists, mru->grp_count * sizeof(*mru->lists));
+		kmem_free(mru->lists);
 	if (err && mru)
-		kmem_free(mru, sizeof(*mru));
+		kmem_free(mru);
 
 	return err;
 }
@@ -424,8 +427,8 @@ xfs_mru_cache_destroy(
 
 	xfs_mru_cache_flush(mru);
 
-	kmem_free(mru->lists, mru->grp_count * sizeof(*mru->lists));
-	kmem_free(mru, sizeof(*mru));
+	kmem_free(mru->lists);
+	kmem_free(mru);
 }
 
 /*
@@ -556,35 +559,6 @@ xfs_mru_cache_lookup(
 		__release(mru_lock); /* help sparse not be stupid */
 	} else
 		spin_unlock(&mru->lock);
-
-	return elem ? elem->value : NULL;
-}
-
-/*
- * To look up an element using its key, but leave its location in the internal
- * lists alone, call xfs_mru_cache_peek().  If the element isn't found, this
- * function returns NULL.
- *
- * See the comments above the declaration of the xfs_mru_cache_lookup() function
- * for important locking information pertaining to this call.
- */
-void *
-xfs_mru_cache_peek(
-	xfs_mru_cache_t	*mru,
-	unsigned long	key)
-{
-	xfs_mru_cache_elem_t *elem;
-
-	ASSERT(mru && mru->lists);
-	if (!mru || !mru->lists)
-		return NULL;
-
-	spin_lock(&mru->lock);
-	elem = radix_tree_lookup(&mru->store, key);
-	if (!elem)
-		spin_unlock(&mru->lock);
-	else
-		__release(mru_lock); /* help sparse not be stupid */
 
 	return elem ? elem->value : NULL;
 }

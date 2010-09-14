@@ -8,6 +8,8 @@
 #ifndef _ASM_GENERIC_INT_LL64_H
 #define _ASM_GENERIC_INT_LL64_H
 
+#include <asm/bitsperlong.h>
+
 #ifndef __ASSEMBLY__
 /*
  * __xx is ok: it doesn't pollute the POSIX namespace. Use these in the
@@ -26,7 +28,7 @@ typedef unsigned int __u32;
 #ifdef __GNUC__
 __extension__ typedef __signed__ long long __s64;
 __extension__ typedef unsigned long long __u64;
-#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 199901L
+#else
 typedef __signed__ long long __s64;
 typedef unsigned long long __u64;
 #endif

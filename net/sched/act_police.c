@@ -116,7 +116,7 @@ static void tcf_police_destroy(struct tcf_police *p)
 			return;
 		}
 	}
-	BUG_TRAP(0);
+	WARN_ON(1);
 }
 
 static const struct nla_policy police_policy[TCA_POLICE_MAX + 1] = {
@@ -182,17 +182,31 @@ override:
 		R_tab = qdisc_get_rtab(&parm->rate, tb[TCA_POLICE_RATE]);
 		if (R_tab == NULL)
 			goto failure;
+
 		if (parm->peakrate.rate) {
 			P_tab = qdisc_get_rtab(&parm->peakrate,
 					       tb[TCA_POLICE_PEAKRATE]);
-			if (P_tab == NULL) {
-				qdisc_put_rtab(R_tab);
+			if (P_tab == NULL)
 				goto failure;
-			}
 		}
 	}
-	/* No failure allowed after this point */
+
 	spin_lock_bh(&police->tcf_lock);
+	if (est) {
+		err = gen_replace_estimator(&police->tcf_bstats,
+					    &police->tcf_rate_est,
+					    &police->tcf_lock, est);
+		if (err)
+			goto failure_unlock;
+	} else if (tb[TCA_POLICE_AVRATE] &&
+		   (ret == ACT_P_CREATED ||
+		    !gen_estimator_active(&police->tcf_bstats,
+					  &police->tcf_rate_est))) {
+		err = -EINVAL;
+		goto failure_unlock;
+	}
+
+	/* No failure allowed after this point */
 	if (R_tab != NULL) {
 		qdisc_put_rtab(police->tcfp_R_tab);
 		police->tcfp_R_tab = R_tab;
@@ -217,10 +231,6 @@ override:
 
 	if (tb[TCA_POLICE_AVRATE])
 		police->tcfp_ewma_rate = nla_get_u32(tb[TCA_POLICE_AVRATE]);
-	if (est)
-		gen_replace_estimator(&police->tcf_bstats,
-				      &police->tcf_rate_est,
-				      &police->tcf_lock, est);
 
 	spin_unlock_bh(&police->tcf_lock);
 	if (ret != ACT_P_CREATED)
@@ -238,7 +248,13 @@ override:
 	a->priv = police;
 	return ret;
 
+failure_unlock:
+	spin_unlock_bh(&police->tcf_lock);
 failure:
+	if (P_tab)
+		qdisc_put_rtab(P_tab);
+	if (R_tab)
+		qdisc_put_rtab(R_tab);
 	if (ret == ACT_P_CREATED)
 		kfree(police);
 	return err;
@@ -272,17 +288,19 @@ static int tcf_act_police(struct sk_buff *skb, struct tc_action *a,
 
 	spin_lock(&police->tcf_lock);
 
-	police->tcf_bstats.bytes += skb->len;
+	police->tcf_bstats.bytes += qdisc_pkt_len(skb);
 	police->tcf_bstats.packets++;
 
 	if (police->tcfp_ewma_rate &&
 	    police->tcf_rate_est.bps >= police->tcfp_ewma_rate) {
 		police->tcf_qstats.overlimits++;
+		if (police->tcf_action == TC_ACT_SHOT)
+			police->tcf_qstats.drops++;
 		spin_unlock(&police->tcf_lock);
 		return police->tcf_action;
 	}
 
-	if (skb->len <= police->tcfp_mtu) {
+	if (qdisc_pkt_len(skb) <= police->tcfp_mtu) {
 		if (police->tcfp_R_tab == NULL) {
 			spin_unlock(&police->tcf_lock);
 			return police->tcfp_result;
@@ -295,12 +313,12 @@ static int tcf_act_police(struct sk_buff *skb, struct tc_action *a,
 			ptoks = toks + police->tcfp_ptoks;
 			if (ptoks > (long)L2T_P(police, police->tcfp_mtu))
 				ptoks = (long)L2T_P(police, police->tcfp_mtu);
-			ptoks -= L2T_P(police, skb->len);
+			ptoks -= L2T_P(police, qdisc_pkt_len(skb));
 		}
 		toks += police->tcfp_toks;
 		if (toks > (long)police->tcfp_burst)
 			toks = police->tcfp_burst;
-		toks -= L2T(police, skb->len);
+		toks -= L2T(police, qdisc_pkt_len(skb));
 		if ((toks|ptoks) >= 0) {
 			police->tcfp_t_c = now;
 			police->tcfp_toks = toks;
@@ -311,6 +329,8 @@ static int tcf_act_police(struct sk_buff *skb, struct tc_action *a,
 	}
 
 	police->tcf_qstats.overlimits++;
+	if (police->tcf_action == TC_ACT_SHOT)
+		police->tcf_qstats.drops++;
 	spin_unlock(&police->tcf_lock);
 	return police->tcf_action;
 }

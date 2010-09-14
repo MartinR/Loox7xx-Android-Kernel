@@ -46,8 +46,6 @@
  * 2000-07-05: Ashley Montanaro <ashley@compsoc.man.ac.uk>
  *   Converted file reading routine to dump to buffer once
  *   per device, not per bus
- *
- * $Id: devices.c,v 1.5 2000/01/11 13:58:21 tom Exp $
  */
 
 #include <linux/fs.h>
@@ -62,8 +60,6 @@
 
 #include "usb.h"
 #include "hcd.h"
-
-#define MAX_TOPO_LEVEL		6
 
 /* Define ALLOW_SERIAL_NUMBER if you want to see the serial number of devices */
 #define ALLOW_SERIAL_NUMBER
@@ -140,17 +136,19 @@ static const struct class_info clas_info[] =
 	{USB_CLASS_AUDIO,		"audio"},
 	{USB_CLASS_COMM,		"comm."},
 	{USB_CLASS_HID,			"HID"},
-	{USB_CLASS_HUB,			"hub"},
 	{USB_CLASS_PHYSICAL,		"PID"},
+	{USB_CLASS_STILL_IMAGE,		"still"},
 	{USB_CLASS_PRINTER,		"print"},
 	{USB_CLASS_MASS_STORAGE,	"stor."},
+	{USB_CLASS_HUB,			"hub"},
 	{USB_CLASS_CDC_DATA,		"data"},
-	{USB_CLASS_APP_SPEC,		"app."},
-	{USB_CLASS_VENDOR_SPEC,		"vend."},
-	{USB_CLASS_STILL_IMAGE,		"still"},
 	{USB_CLASS_CSCID,		"scard"},
 	{USB_CLASS_CONTENT_SEC,		"c-sec"},
 	{USB_CLASS_VIDEO,		"video"},
+	{USB_CLASS_WIRELESS_CONTROLLER,	"wlcon"},
+	{USB_CLASS_MISC,		"misc"},
+	{USB_CLASS_APP_SPEC,		"app."},
+	{USB_CLASS_VENDOR_SPEC,		"vend."},
 	{-1,				"unk."}		/* leave as last */
 };
 
@@ -191,7 +189,7 @@ static char *usb_dump_endpoint_descriptor(int speed, char *start, char *end,
 	}
 
 	/* this isn't checking for illegal values */
-	switch (desc->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) {
+	switch (usb_endpoint_type(desc)) {
 	case USB_ENDPOINT_XFER_CONTROL:
 		type = "Ctrl";
 		if (speed == USB_SPEED_HIGH) 	/* uframes per NAK */

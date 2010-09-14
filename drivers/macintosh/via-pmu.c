@@ -18,6 +18,7 @@
  *
  */
 #include <stdarg.h>
+#include <linux/smp_lock.h>
 #include <linux/types.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
@@ -404,7 +405,11 @@ static int __init via_pmu_start(void)
 		printk(KERN_ERR "via-pmu: can't map interrupt\n");
 		return -ENODEV;
 	}
-	if (request_irq(irq, via_pmu_interrupt, 0, "VIA-PMU", (void *)0)) {
+	/* We set IRQF_TIMER because we don't want the interrupt to be disabled
+	 * between the 2 passes of driver suspend, we control our own disabling
+	 * for that one
+	 */
+	if (request_irq(irq, via_pmu_interrupt, IRQF_TIMER, "VIA-PMU", (void *)0)) {
 		printk(KERN_ERR "via-pmu: can't request irq %d\n", irq);
 		return -ENODEV;
 	}
@@ -418,7 +423,7 @@ static int __init via_pmu_start(void)
 			gpio_irq = irq_of_parse_and_map(gpio_node, 0);
 
 		if (gpio_irq != NO_IRQ) {
-			if (request_irq(gpio_irq, gpio1_interrupt, 0,
+			if (request_irq(gpio_irq, gpio1_interrupt, IRQF_TIMER,
 					"GPIO1 ADB", (void *)0))
 				printk(KERN_ERR "pmu: can't get irq %d"
 				       " (GPIO1)\n", gpio_irq);
@@ -924,8 +929,7 @@ proc_write_options(struct file *file, const char __user *buffer,
 
 #ifdef CONFIG_ADB
 /* Send an ADB command */
-static int
-pmu_send_request(struct adb_request *req, int sync)
+static int pmu_send_request(struct adb_request *req, int sync)
 {
 	int i, ret;
 
@@ -1004,16 +1008,11 @@ pmu_send_request(struct adb_request *req, int sync)
 }
 
 /* Enable/disable autopolling */
-static int
-pmu_adb_autopoll(int devs)
+static int __pmu_adb_autopoll(int devs)
 {
 	struct adb_request req;
 
-	if ((vias == NULL) || (!pmu_fully_inited) || !pmu_has_adb)
-		return -ENXIO;
-
 	if (devs) {
-		adb_dev_map = devs;
 		pmu_request(&req, NULL, 5, PMU_ADB_CMD, 0, 0x86,
 			    adb_dev_map >> 8, adb_dev_map);
 		pmu_adb_flags = 2;
@@ -1026,9 +1025,17 @@ pmu_adb_autopoll(int devs)
 	return 0;
 }
 
+static int pmu_adb_autopoll(int devs)
+{
+	if ((vias == NULL) || (!pmu_fully_inited) || !pmu_has_adb)
+		return -ENXIO;
+
+	adb_dev_map = devs;
+	return __pmu_adb_autopoll(devs);
+}
+
 /* Reset the ADB bus */
-static int
-pmu_adb_reset_bus(void)
+static int pmu_adb_reset_bus(void)
 {
 	struct adb_request req;
 	int save_autopoll = adb_dev_map;
@@ -1037,13 +1044,13 @@ pmu_adb_reset_bus(void)
 		return -ENXIO;
 
 	/* anyone got a better idea?? */
-	pmu_adb_autopoll(0);
+	__pmu_adb_autopoll(0);
 
-	req.nbytes = 5;
+	req.nbytes = 4;
 	req.done = NULL;
 	req.data[0] = PMU_ADB_CMD;
-	req.data[1] = 0;
-	req.data[2] = ADB_BUSRESET;
+	req.data[1] = ADB_BUSRESET;
+	req.data[2] = 0;
 	req.data[3] = 0;
 	req.data[4] = 0;
 	req.reply_len = 0;
@@ -1055,7 +1062,7 @@ pmu_adb_reset_bus(void)
 	pmu_wait_complete(&req);
 
 	if (save_autopoll != 0)
-		pmu_adb_autopoll(save_autopoll);
+		__pmu_adb_autopoll(save_autopoll);
 
 	return 0;
 }
@@ -1813,7 +1820,7 @@ static int powerbook_sleep_grackle(void)
  		_set_L2CR(save_l2cr);
 	
 	/* Restore userland MMU context */
-	set_context(current->active_mm->context.id, current->active_mm->pgd);
+	switch_mmu_context(NULL, current->active_mm);
 
 	/* Power things up */
 	pmu_unlock();
@@ -1902,7 +1909,7 @@ powerbook_sleep_Core99(void)
  		_set_L3CR(save_l3cr);
 	
 	/* Restore userland MMU context */
-	set_context(current->active_mm->context.id, current->active_mm->pgd);
+	switch_mmu_context(NULL, current->active_mm);
 
 	/* Tell PMU we are ready */
 	pmu_unlock();
@@ -2047,6 +2054,7 @@ pmu_open(struct inode *inode, struct file *file)
 	pp->rb_get = pp->rb_put = 0;
 	spin_lock_init(&pp->lock);
 	init_waitqueue_head(&pp->wait);
+	lock_kernel();
 	spin_lock_irqsave(&all_pvt_lock, flags);
 #if defined(CONFIG_INPUT_ADBHID) && defined(CONFIG_PMAC_BACKLIGHT)
 	pp->backlight_locker = 0;
@@ -2054,6 +2062,7 @@ pmu_open(struct inode *inode, struct file *file)
 	list_add(&pp->list, &all_pmu_pvt);
 	spin_unlock_irqrestore(&all_pvt_lock, flags);
 	file->private_data = pp;
+	unlock_kernel();
 	return 0;
 }
 

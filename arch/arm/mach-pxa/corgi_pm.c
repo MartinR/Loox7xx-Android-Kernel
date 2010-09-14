@@ -20,13 +20,12 @@
 
 #include <asm/irq.h>
 #include <asm/mach-types.h>
-#include <asm/hardware.h>
-#include <asm/hardware/scoop.h>
+#include <mach/hardware.h>
 
-#include <asm/arch/sharpsl.h>
-#include <asm/arch/corgi.h>
-#include <asm/arch/pxa-regs.h>
-#include <asm/arch/pxa2xx-gpio.h>
+#include <mach/sharpsl.h>
+#include <mach/corgi.h>
+#include <mach/pxa2xx-regs.h>
+#include <mach/pxa2xx-gpio.h>
 #include "sharpsl.h"
 
 #define SHARPSL_CHARGE_ON_VOLT         0x99  /* 2.9V */
@@ -42,7 +41,6 @@ static void corgi_charger_init(void)
 	pxa_gpio_mode(CORGI_GPIO_CHRG_ON | GPIO_OUT);
 	pxa_gpio_mode(CORGI_GPIO_CHRG_UKN | GPIO_OUT);
 	pxa_gpio_mode(CORGI_GPIO_KEY_INT | GPIO_IN);
-	sharpsl_pm_pxa_init();
 }
 
 static void corgi_measure_temp(int on)
@@ -192,7 +190,7 @@ unsigned long corgipm_read_devdata(int type)
 
 static struct sharpsl_charger_machinfo corgi_pm_machinfo = {
 	.init            = corgi_charger_init,
-	.exit            = sharpsl_pm_pxa_remove,
+	.exit            = NULL,
 	.gpio_batlock    = CORGI_GPIO_BAT_COVER,
 	.gpio_acin       = CORGI_GPIO_AC_IN,
 	.gpio_batfull    = CORGI_GPIO_CHRG_FULL,
@@ -204,7 +202,11 @@ static struct sharpsl_charger_machinfo corgi_pm_machinfo = {
 	.read_devdata    = corgipm_read_devdata,
 	.charger_wakeup  = corgi_charger_wakeup,
 	.should_wakeup   = corgi_should_wakeup,
+#if defined(CONFIG_LCD_CORGI)
+	.backlight_limit = corgi_lcd_limit_intensity,
+#elif defined(CONFIG_BACKLIGHT_CORGI)
 	.backlight_limit = corgibl_limit_intensity,
+#endif
 	.charge_on_volt	  = SHARPSL_CHARGE_ON_VOLT,
 	.charge_on_temp	  = SHARPSL_CHARGE_ON_TEMP,
 	.charge_acin_high = SHARPSL_CHARGE_ON_ACIN_HIGH,
@@ -225,6 +227,10 @@ static struct platform_device *corgipm_device;
 static int __devinit corgipm_init(void)
 {
 	int ret;
+
+	if (!machine_is_corgi() && !machine_is_shepherd()
+			&& !machine_is_husky())
+		return -ENODEV;
 
 	corgipm_device = platform_device_alloc("sharpsl-pm", -1);
 	if (!corgipm_device)

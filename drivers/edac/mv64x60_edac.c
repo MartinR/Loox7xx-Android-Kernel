@@ -71,6 +71,35 @@ static irqreturn_t mv64x60_pci_isr(int irq, void *dev_id)
 	return IRQ_HANDLED;
 }
 
+/*
+ * Bit 0 of MV64x60_PCIx_ERR_MASK does not exist on the 64360 and because of
+ * errata FEr-#11 and FEr-##16 for the 64460, it should be 0 on that chip as
+ * well.  IOW, don't set bit 0.
+ */
+
+/* Erratum FEr PCI-#16: clear bit 0 of PCI SERRn Mask reg. */
+static int __init mv64x60_pci_fixup(struct platform_device *pdev)
+{
+	struct resource *r;
+	void __iomem *pci_serr;
+
+	r = platform_get_resource(pdev, IORESOURCE_MEM, 1);
+	if (!r) {
+		printk(KERN_ERR "%s: Unable to get resource for "
+		       "PCI err regs\n", __func__);
+		return -ENOENT;
+	}
+
+	pci_serr = ioremap(r->start, resource_size(r));
+	if (!pci_serr)
+		return -ENOMEM;
+
+	out_le32(pci_serr, in_le32(pci_serr) & ~0x1);
+	iounmap(pci_serr);
+
+	return 0;
+}
+
 static int __devinit mv64x60_pci_err_probe(struct platform_device *pdev)
 {
 	struct edac_pci_ctl_info *pci;
@@ -92,7 +121,7 @@ static int __devinit mv64x60_pci_err_probe(struct platform_device *pdev)
 	pdata->irq = NO_IRQ;
 	platform_set_drvdata(pdev, pci);
 	pci->dev = &pdev->dev;
-	pci->dev_name = pdev->dev.bus_id;
+	pci->dev_name = dev_name(&pdev->dev);
 	pci->mod_name = EDAC_MOD_STR;
 	pci->ctl_name = pdata->name;
 
@@ -111,7 +140,7 @@ static int __devinit mv64x60_pci_err_probe(struct platform_device *pdev)
 
 	if (!devm_request_mem_region(&pdev->dev,
 				     r->start,
-				     r->end - r->start + 1,
+				     resource_size(r),
 				     pdata->name)) {
 		printk(KERN_ERR "%s: Error while requesting mem region\n",
 		       __func__);
@@ -121,10 +150,16 @@ static int __devinit mv64x60_pci_err_probe(struct platform_device *pdev)
 
 	pdata->pci_vbase = devm_ioremap(&pdev->dev,
 					r->start,
-					r->end - r->start + 1);
+					resource_size(r));
 	if (!pdata->pci_vbase) {
 		printk(KERN_ERR "%s: Unable to setup PCI err regs\n", __func__);
 		res = -ENOMEM;
+		goto err;
+	}
+
+	res = mv64x60_pci_fixup(pdev);
+	if (res < 0) {
+		printk(KERN_ERR "%s: PCI fixup failed\n", __func__);
 		goto err;
 	}
 
@@ -259,7 +294,7 @@ static int __devinit mv64x60_sram_err_probe(struct platform_device *pdev)
 	pdata->irq = NO_IRQ;
 	edac_dev->dev = &pdev->dev;
 	platform_set_drvdata(pdev, edac_dev);
-	edac_dev->dev_name = pdev->dev.bus_id;
+	edac_dev->dev_name = dev_name(&pdev->dev);
 
 	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!r) {
@@ -271,7 +306,7 @@ static int __devinit mv64x60_sram_err_probe(struct platform_device *pdev)
 
 	if (!devm_request_mem_region(&pdev->dev,
 				     r->start,
-				     r->end - r->start + 1,
+				     resource_size(r),
 				     pdata->name)) {
 		printk(KERN_ERR "%s: Error while request mem region\n",
 		       __func__);
@@ -281,7 +316,7 @@ static int __devinit mv64x60_sram_err_probe(struct platform_device *pdev)
 
 	pdata->sram_vbase = devm_ioremap(&pdev->dev,
 					 r->start,
-					 r->end - r->start + 1);
+					 resource_size(r));
 	if (!pdata->sram_vbase) {
 		printk(KERN_ERR "%s: Unable to setup SRAM err regs\n",
 		       __func__);
@@ -427,7 +462,7 @@ static int __devinit mv64x60_cpu_err_probe(struct platform_device *pdev)
 	pdata->irq = NO_IRQ;
 	edac_dev->dev = &pdev->dev;
 	platform_set_drvdata(pdev, edac_dev);
-	edac_dev->dev_name = pdev->dev.bus_id;
+	edac_dev->dev_name = dev_name(&pdev->dev);
 
 	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	if (!r) {
@@ -439,7 +474,7 @@ static int __devinit mv64x60_cpu_err_probe(struct platform_device *pdev)
 
 	if (!devm_request_mem_region(&pdev->dev,
 				     r->start,
-				     r->end - r->start + 1,
+				     resource_size(r),
 				     pdata->name)) {
 		printk(KERN_ERR "%s: Error while requesting mem region\n",
 		       __func__);
@@ -449,7 +484,7 @@ static int __devinit mv64x60_cpu_err_probe(struct platform_device *pdev)
 
 	pdata->cpu_vbase[0] = devm_ioremap(&pdev->dev,
 					   r->start,
-					   r->end - r->start + 1);
+					   resource_size(r));
 	if (!pdata->cpu_vbase[0]) {
 		printk(KERN_ERR "%s: Unable to setup CPU err regs\n", __func__);
 		res = -ENOMEM;
@@ -466,7 +501,7 @@ static int __devinit mv64x60_cpu_err_probe(struct platform_device *pdev)
 
 	if (!devm_request_mem_region(&pdev->dev,
 				     r->start,
-				     r->end - r->start + 1,
+				     resource_size(r),
 				     pdata->name)) {
 		printk(KERN_ERR "%s: Error while requesting mem region\n",
 		       __func__);
@@ -476,7 +511,7 @@ static int __devinit mv64x60_cpu_err_probe(struct platform_device *pdev)
 
 	pdata->cpu_vbase[1] = devm_ioremap(&pdev->dev,
 					   r->start,
-					   r->end - r->start + 1);
+					   resource_size(r));
 	if (!pdata->cpu_vbase[1]) {
 		printk(KERN_ERR "%s: Unable to setup CPU err regs\n", __func__);
 		res = -ENOMEM;
@@ -612,7 +647,7 @@ static void get_total_mem(struct mv64x60_mc_pdata *pdata)
 	if (!np)
 		return;
 
-	reg = get_property(np, "reg", NULL);
+	reg = of_get_property(np, "reg", NULL);
 
 	pdata->total_mem = reg[1];
 }
@@ -678,7 +713,7 @@ static int __devinit mv64x60_mc_err_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, mci);
 	pdata->name = "mv64x60_mc_err";
 	pdata->irq = NO_IRQ;
-	mci->dev_name = pdev->dev.bus_id;
+	mci->dev_name = dev_name(&pdev->dev);
 	pdata->edac_idx = edac_mc_idx++;
 
 	r = platform_get_resource(pdev, IORESOURCE_MEM, 0);
@@ -691,7 +726,7 @@ static int __devinit mv64x60_mc_err_probe(struct platform_device *pdev)
 
 	if (!devm_request_mem_region(&pdev->dev,
 				     r->start,
-				     r->end - r->start + 1,
+				     resource_size(r),
 				     pdata->name)) {
 		printk(KERN_ERR "%s: Error while requesting mem region\n",
 		       __func__);
@@ -701,7 +736,7 @@ static int __devinit mv64x60_mc_err_probe(struct platform_device *pdev)
 
 	pdata->mc_vbase = devm_ioremap(&pdev->dev,
 				       r->start,
-				       r->end - r->start + 1);
+				       resource_size(r));
 	if (!pdata->mc_vbase) {
 		printk(KERN_ERR "%s: Unable to setup MC err regs\n", __func__);
 		res = -ENOMEM;

@@ -15,6 +15,7 @@
 #include <linux/poll.h>
 #include <linux/compat.h>
 #include <linux/mm.h>
+#include <linux/smp_lock.h>
 
 #include <asm/uaccess.h>
 
@@ -36,9 +37,13 @@
 #define MON_IOCX_GET   _IOW(MON_IOC_MAGIC, 6, struct mon_bin_get)
 #define MON_IOCX_MFETCH _IOWR(MON_IOC_MAGIC, 7, struct mon_bin_mfetch)
 #define MON_IOCH_MFLUSH _IO(MON_IOC_MAGIC, 8)
+/* #9 was MON_IOCT_SETAPI */
+#define MON_IOCX_GETX   _IOW(MON_IOC_MAGIC, 10, struct mon_bin_get)
+
 #ifdef CONFIG_COMPAT
 #define MON_IOCX_GET32 _IOW(MON_IOC_MAGIC, 6, struct mon_bin_get32)
 #define MON_IOCX_MFETCH32 _IOWR(MON_IOC_MAGIC, 7, struct mon_bin_mfetch32)
+#define MON_IOCX_GETX32   _IOW(MON_IOC_MAGIC, 10, struct mon_bin_get32)
 #endif
 
 /*
@@ -90,7 +95,29 @@ struct mon_bin_hdr {
 	int status;
 	unsigned int len_urb;	/* Length of data (submitted or actual) */
 	unsigned int len_cap;	/* Delivered length */
-	unsigned char setup[SETUP_LEN];	/* Only for Control S-type */
+	union {
+		unsigned char setup[SETUP_LEN];	/* Only for Control S-type */
+		struct iso_rec {
+			int error_count;
+			int numdesc;
+		} iso;
+	} s;
+	int interval;
+	int start_frame;
+	unsigned int xfer_flags;
+	unsigned int ndesc;	/* Actual number of ISO descriptors */
+};
+
+/*
+ * ISO vector, packed into the head of data stream.
+ * This has to take 16 bytes to make sure that the end of buffer
+ * wrap is not happening in the middle of a descriptor.
+ */
+struct mon_bin_isodesc {
+	int          iso_status;
+	unsigned int iso_off;
+	unsigned int iso_len;
+	u32 _pad;
 };
 
 /* per file statistic */
@@ -100,7 +127,7 @@ struct mon_bin_stats {
 };
 
 struct mon_bin_get {
-	struct mon_bin_hdr __user *hdr;	/* Only 48 bytes, not 64. */
+	struct mon_bin_hdr __user *hdr;	/* Can be 48 bytes or 64. */
 	void __user *data;
 	size_t alloc;		/* Length of data (can be zero) */
 };
@@ -128,6 +155,11 @@ struct mon_bin_mfetch32 {
 /* Having these two values same prevents wrapping of the mon_bin_hdr */
 #define PKT_ALIGN   64
 #define PKT_SIZE    64
+
+#define PKT_SZ_API0 48	/* API 0 (2.6.20) size */
+#define PKT_SZ_API1 64	/* API 1 size: extra fields */
+
+#define ISODESC_MAX   128	/* Same number as usbfs allows, 2048 bytes. */
 
 /* max number of USB bus supported */
 #define MON_BIN_MAX_MINOR 128
@@ -188,9 +220,8 @@ static void mon_free_buff(struct mon_pgmap *map, int npages);
 
 /*
  * This is a "chunked memcpy". It does not manipulate any counters.
- * But it returns the new offset for repeated application.
  */
-unsigned int mon_copy_to_buff(const struct mon_reader_bin *this,
+static void mon_copy_to_buff(const struct mon_reader_bin *this,
     unsigned int off, const unsigned char *from, unsigned int length)
 {
 	unsigned int step_len;
@@ -215,7 +246,6 @@ unsigned int mon_copy_to_buff(const struct mon_reader_bin *this,
 		from += step_len;
 		length -= step_len;
 	}
-	return off;
 }
 
 /*
@@ -318,12 +348,12 @@ static unsigned int mon_buff_area_alloc_contiguous(struct mon_reader_bin *rp,
 
 /*
  * Return a few (kilo-)bytes to the head of the buffer.
- * This is used if a DMA fetch fails.
+ * This is used if a data fetch fails.
  */
 static void mon_buff_area_shrink(struct mon_reader_bin *rp, unsigned int size)
 {
 
-	size = (size + PKT_ALIGN-1) & ~(PKT_ALIGN-1);
+	/* size &= ~(PKT_ALIGN-1);  -- we're called with aligned size */
 	rp->b_cnt -= size;
 	if (rp->b_in < size)
 		rp->b_in += rp->b_size;
@@ -358,12 +388,8 @@ static inline char mon_bin_get_setup(unsigned char *setupb,
     const struct urb *urb, char ev_type)
 {
 
-	if (!usb_endpoint_xfer_control(&urb->ep->desc) || ev_type != 'S')
-		return '-';
-
 	if (urb->setup_packet == NULL)
 		return 'Z';
-
 	memcpy(setupb, urb->setup_packet, SETUP_LEN);
 	return 0;
 }
@@ -372,17 +398,30 @@ static char mon_bin_get_data(const struct mon_reader_bin *rp,
     unsigned int offset, struct urb *urb, unsigned int length)
 {
 
-	if (urb->dev->bus->uses_dma &&
-	    (urb->transfer_flags & URB_NO_TRANSFER_DMA_MAP)) {
-		mon_dmapeek_vec(rp, offset, urb->transfer_dma, length);
-		return 0;
-	}
-
 	if (urb->transfer_buffer == NULL)
 		return 'Z';
-
 	mon_copy_to_buff(rp, offset, urb->transfer_buffer, length);
 	return 0;
+}
+
+static void mon_bin_get_isodesc(const struct mon_reader_bin *rp,
+    unsigned int offset, struct urb *urb, char ev_type, unsigned int ndesc)
+{
+	struct mon_bin_isodesc *dp;
+	struct usb_iso_packet_descriptor *fp;
+
+	fp = urb->iso_frame_desc;
+	while (ndesc-- != 0) {
+		dp = (struct mon_bin_isodesc *)
+		    (rp->b_vec[offset / CHUNK_SIZE].ptr + offset % CHUNK_SIZE);
+		dp->iso_status = fp->status;
+		dp->iso_off = fp->offset;
+		dp->iso_len = (ev_type == 'S') ? fp->length : fp->actual_length;
+		dp->_pad = 0;
+		if ((offset += sizeof(struct mon_bin_isodesc)) >= rp->b_size)
+			offset = 0;
+		fp++;
+	}
 }
 
 static void mon_bin_event(struct mon_reader_bin *rp, struct urb *urb,
@@ -394,6 +433,8 @@ static void mon_bin_event(struct mon_reader_bin *rp, struct urb *urb,
 	unsigned int urb_length;
 	unsigned int offset;
 	unsigned int length;
+	unsigned int delta;
+	unsigned int ndesc, lendesc;
 	unsigned char dir;
 	struct mon_bin_hdr *ep;
 	char data_tag = 0;
@@ -405,6 +446,19 @@ static void mon_bin_event(struct mon_reader_bin *rp, struct urb *urb,
 	/*
 	 * Find the maximum allowable length, then allocate space.
 	 */
+	if (usb_endpoint_xfer_isoc(epd)) {
+		if (urb->number_of_packets < 0) {
+			ndesc = 0;
+		} else if (urb->number_of_packets >= ISODESC_MAX) {
+			ndesc = ISODESC_MAX;
+		} else {
+			ndesc = urb->number_of_packets;
+		}
+	} else {
+		ndesc = 0;
+	}
+	lendesc = ndesc*sizeof(struct mon_bin_isodesc);
+
 	urb_length = (ev_type == 'S') ?
 	    urb->transfer_buffer_length : urb->actual_length;
 	length = urb_length;
@@ -427,10 +481,12 @@ static void mon_bin_event(struct mon_reader_bin *rp, struct urb *urb,
 		dir = 0;
 	}
 
-	if (rp->mmap_active)
-		offset = mon_buff_area_alloc_contiguous(rp, length + PKT_SIZE);
-	else
-		offset = mon_buff_area_alloc(rp, length + PKT_SIZE);
+	if (rp->mmap_active) {
+		offset = mon_buff_area_alloc_contiguous(rp,
+						 length + PKT_SIZE + lendesc);
+	} else {
+		offset = mon_buff_area_alloc(rp, length + PKT_SIZE + lendesc);
+	}
 	if (offset == ~0) {
 		rp->cnt_lost++;
 		spin_unlock_irqrestore(&rp->b_lock, flags);
@@ -454,14 +510,38 @@ static void mon_bin_event(struct mon_reader_bin *rp, struct urb *urb,
 	ep->ts_usec = ts.tv_usec;
 	ep->status = status;
 	ep->len_urb = urb_length;
-	ep->len_cap = length;
+	ep->len_cap = length + lendesc;
+	ep->xfer_flags = urb->transfer_flags;
 
-	ep->flag_setup = mon_bin_get_setup(ep->setup, urb, ev_type);
+	if (usb_endpoint_xfer_int(epd)) {
+		ep->interval = urb->interval;
+	} else if (usb_endpoint_xfer_isoc(epd)) {
+		ep->interval = urb->interval;
+		ep->start_frame = urb->start_frame;
+		ep->s.iso.error_count = urb->error_count;
+		ep->s.iso.numdesc = urb->number_of_packets;
+	}
+
+	if (usb_endpoint_xfer_control(epd) && ev_type == 'S') {
+		ep->flag_setup = mon_bin_get_setup(ep->s.setup, urb, ev_type);
+	} else {
+		ep->flag_setup = '-';
+	}
+
+	if (ndesc != 0) {
+		ep->ndesc = ndesc;
+		mon_bin_get_isodesc(rp, offset, urb, ev_type, ndesc);
+		if ((offset += lendesc) >= rp->b_size)
+			offset -= rp->b_size;
+	}
+
 	if (length != 0) {
 		ep->flag_data = mon_bin_get_data(rp, offset, urb, length);
 		if (ep->flag_data != 0) {	/* Yes, it's 0x00, not '0' */
-			ep->len_cap = 0;
-			mon_buff_area_shrink(rp, length);
+			delta = (ep->len_cap + PKT_ALIGN-1) & ~(PKT_ALIGN-1);
+			ep->len_cap -= length;
+			delta -= (ep->len_cap + PKT_ALIGN-1) & ~(PKT_ALIGN-1);
+			mon_buff_area_shrink(rp, delta);
 		}
 	} else {
 		ep->flag_data = data_tag;
@@ -527,14 +607,17 @@ static int mon_bin_open(struct inode *inode, struct file *file)
 	size_t size;
 	int rc;
 
+	lock_kernel();
 	mutex_lock(&mon_lock);
 	if ((mbus = mon_bus_lookup(iminor(inode))) == NULL) {
 		mutex_unlock(&mon_lock);
+		unlock_kernel();
 		return -ENODEV;
 	}
 	if (mbus != &mon_bus0 && mbus->u_bus == NULL) {
 		printk(KERN_ERR TAG ": consistency error on open\n");
 		mutex_unlock(&mon_lock);
+		unlock_kernel();
 		return -ENODEV;
 	}
 
@@ -546,7 +629,6 @@ static int mon_bin_open(struct inode *inode, struct file *file)
 	spin_lock_init(&rp->b_lock);
 	init_waitqueue_head(&rp->b_wait);
 	mutex_init(&rp->fetch_lock);
-
 	rp->b_size = BUFF_DFL;
 
 	size = sizeof(struct mon_pgmap) * (rp->b_size/CHUNK_SIZE);
@@ -568,6 +650,7 @@ static int mon_bin_open(struct inode *inode, struct file *file)
 
 	file->private_data = rp;
 	mutex_unlock(&mon_lock);
+	unlock_kernel();
 	return 0;
 
 err_allocbuff:
@@ -576,6 +659,7 @@ err_allocvec:
 	kfree(rp);
 err_alloc:
 	mutex_unlock(&mon_lock);
+	unlock_kernel();
 	return rc;
 }
 
@@ -585,7 +669,8 @@ err_alloc:
  * Returns zero or error.
  */
 static int mon_bin_get_event(struct file *file, struct mon_reader_bin *rp,
-    struct mon_bin_hdr __user *hdr, void __user *data, unsigned int nbytes)
+    struct mon_bin_hdr __user *hdr, unsigned int hdrbytes,
+    void __user *data, unsigned int nbytes)
 {
 	unsigned long flags;
 	struct mon_bin_hdr *ep;
@@ -602,7 +687,7 @@ static int mon_bin_get_event(struct file *file, struct mon_reader_bin *rp,
 
 	ep = MON_OFF2HDR(rp, rp->b_out);
 
-	if (copy_to_user(hdr, ep, sizeof(struct mon_bin_hdr))) {
+	if (copy_to_user(hdr, ep, hdrbytes)) {
 		mutex_unlock(&rp->fetch_lock);
 		return -EFAULT;
 	}
@@ -650,6 +735,7 @@ static ssize_t mon_bin_read(struct file *file, char __user *buf,
     size_t nbytes, loff_t *ppos)
 {
 	struct mon_reader_bin *rp = file->private_data;
+	unsigned int hdrbytes = PKT_SZ_API0;
 	unsigned long flags;
 	struct mon_bin_hdr *ep;
 	unsigned int offset;
@@ -667,8 +753,8 @@ static ssize_t mon_bin_read(struct file *file, char __user *buf,
 
 	ep = MON_OFF2HDR(rp, rp->b_out);
 
-	if (rp->b_read < sizeof(struct mon_bin_hdr)) {
-		step_len = min(nbytes, sizeof(struct mon_bin_hdr) - rp->b_read);
+	if (rp->b_read < hdrbytes) {
+		step_len = min(nbytes, (size_t)(hdrbytes - rp->b_read));
 		ptr = ((char *)ep) + rp->b_read;
 		if (step_len && copy_to_user(buf, ptr, step_len)) {
 			mutex_unlock(&rp->fetch_lock);
@@ -680,10 +766,13 @@ static ssize_t mon_bin_read(struct file *file, char __user *buf,
 		done += step_len;
 	}
 
-	if (rp->b_read >= sizeof(struct mon_bin_hdr)) {
-		step_len = min(nbytes, (size_t)ep->len_cap);
+	if (rp->b_read >= hdrbytes) {
+		step_len = ep->len_cap;
+		step_len -= rp->b_read - hdrbytes;
+		if (step_len > nbytes)
+			step_len = nbytes;
 		offset = rp->b_out + PKT_SIZE;
-		offset += rp->b_read - sizeof(struct mon_bin_hdr);
+		offset += rp->b_read - hdrbytes;
 		if (offset >= rp->b_size)
 			offset -= rp->b_size;
 		if (copy_from_buf(rp, offset, buf, step_len)) {
@@ -699,7 +788,7 @@ static ssize_t mon_bin_read(struct file *file, char __user *buf,
 	/*
 	 * Check if whole packet was read, and if so, jump to the next one.
 	 */
-	if (rp->b_read >= sizeof(struct mon_bin_hdr) + ep->len_cap) {
+	if (rp->b_read >= hdrbytes + ep->len_cap) {
 		spin_lock_irqsave(&rp->b_lock, flags);
 		mon_buff_area_free(rp, PKT_SIZE + ep->len_cap);
 		spin_unlock_irqrestore(&rp->b_lock, flags);
@@ -898,6 +987,7 @@ static int mon_bin_ioctl(struct inode *inode, struct file *file,
 		break;
 
 	case MON_IOCX_GET:
+	case MON_IOCX_GETX:
 		{
 		struct mon_bin_get getb;
 
@@ -907,25 +997,11 @@ static int mon_bin_ioctl(struct inode *inode, struct file *file,
 
 		if (getb.alloc > 0x10000000)	/* Want to cast to u32 */
 			return -EINVAL;
-		ret = mon_bin_get_event(file, rp,
-			  getb.hdr, getb.data, (unsigned int)getb.alloc);
+		ret = mon_bin_get_event(file, rp, getb.hdr,
+		    (cmd == MON_IOCX_GET)? PKT_SZ_API0: PKT_SZ_API1,
+		    getb.data, (unsigned int)getb.alloc);
 		}
 		break;
-
-#ifdef CONFIG_COMPAT
-	case MON_IOCX_GET32: {
-		struct mon_bin_get32 getb;
-
-		if (copy_from_user(&getb, (void __user *)arg,
-					    sizeof(struct mon_bin_get32)))
-			return -EFAULT;
-
-		ret = mon_bin_get_event(file, rp,
-		    compat_ptr(getb.hdr32), compat_ptr(getb.data32),
-		    getb.alloc32);
-		}
-		break;
-#endif
 
 	case MON_IOCX_MFETCH:
 		{
@@ -953,35 +1029,6 @@ static int mon_bin_ioctl(struct inode *inode, struct file *file,
 		}
 		break;
 
-#ifdef CONFIG_COMPAT
-	case MON_IOCX_MFETCH32:
-		{
-		struct mon_bin_mfetch32 mfetch;
-		struct mon_bin_mfetch32 __user *uptr;
-
-		uptr = (struct mon_bin_mfetch32 __user *) compat_ptr(arg);
-
-		if (copy_from_user(&mfetch, uptr, sizeof(mfetch)))
-			return -EFAULT;
-
-		if (mfetch.nflush32) {
-			ret = mon_bin_flush(rp, mfetch.nflush32);
-			if (ret < 0)
-				return ret;
-			if (put_user(ret, &uptr->nflush32))
-				return -EFAULT;
-		}
-		ret = mon_bin_fetch(file, rp, compat_ptr(mfetch.offvec32),
-		    mfetch.nfetch32);
-		if (ret < 0)
-			return ret;
-		if (put_user(ret, &uptr->nfetch32))
-			return -EFAULT;
-		ret = 0;
-		}
-		break;
-#endif
-
 	case MON_IOCG_STATS: {
 		struct mon_bin_stats __user *sp;
 		unsigned int nevents;
@@ -1008,6 +1055,75 @@ static int mon_bin_ioctl(struct inode *inode, struct file *file,
 
 	return ret;
 }
+
+#ifdef CONFIG_COMPAT
+static long mon_bin_compat_ioctl(struct file *file,
+    unsigned int cmd, unsigned long arg)
+{
+	struct mon_reader_bin *rp = file->private_data;
+	int ret;
+
+	switch (cmd) {
+
+	case MON_IOCX_GET32:
+	case MON_IOCX_GETX32:
+		{
+		struct mon_bin_get32 getb;
+
+		if (copy_from_user(&getb, (void __user *)arg,
+					    sizeof(struct mon_bin_get32)))
+			return -EFAULT;
+
+		ret = mon_bin_get_event(file, rp, compat_ptr(getb.hdr32),
+		    (cmd == MON_IOCX_GET32)? PKT_SZ_API0: PKT_SZ_API1,
+		    compat_ptr(getb.data32), getb.alloc32);
+		if (ret < 0)
+			return ret;
+		}
+		return 0;
+
+	case MON_IOCX_MFETCH32:
+		{
+		struct mon_bin_mfetch32 mfetch;
+		struct mon_bin_mfetch32 __user *uptr;
+
+		uptr = (struct mon_bin_mfetch32 __user *) compat_ptr(arg);
+
+		if (copy_from_user(&mfetch, uptr, sizeof(mfetch)))
+			return -EFAULT;
+
+		if (mfetch.nflush32) {
+			ret = mon_bin_flush(rp, mfetch.nflush32);
+			if (ret < 0)
+				return ret;
+			if (put_user(ret, &uptr->nflush32))
+				return -EFAULT;
+		}
+		ret = mon_bin_fetch(file, rp, compat_ptr(mfetch.offvec32),
+		    mfetch.nfetch32);
+		if (ret < 0)
+			return ret;
+		if (put_user(ret, &uptr->nfetch32))
+			return -EFAULT;
+		}
+		return 0;
+
+	case MON_IOCG_STATS:
+		return mon_bin_ioctl(NULL, file, cmd,
+					    (unsigned long) compat_ptr(arg));
+
+	case MON_IOCQ_URB_LEN:
+	case MON_IOCQ_RING_SIZE:
+	case MON_IOCT_RING_SIZE:
+	case MON_IOCH_MFLUSH:
+		return mon_bin_ioctl(NULL, file, cmd, arg);
+
+	default:
+		;
+	}
+	return -ENOTTY;
+}
+#endif /* CONFIG_COMPAT */
 
 static unsigned int
 mon_bin_poll(struct file *file, struct poll_table_struct *wait)
@@ -1061,7 +1177,7 @@ static int mon_bin_vma_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 	return 0;
 }
 
-static struct vm_operations_struct mon_bin_vm_ops = {
+static const struct vm_operations_struct mon_bin_vm_ops = {
 	.open =     mon_bin_vma_open,
 	.close =    mon_bin_vma_close,
 	.fault =    mon_bin_vma_fault,
@@ -1085,6 +1201,9 @@ static const struct file_operations mon_fops_binary = {
 	/* .write =	mon_text_write, */
 	.poll =		mon_bin_poll,
 	.ioctl =	mon_bin_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl =	mon_bin_compat_ioctl,
+#endif
 	.release =	mon_bin_release,
 	.mmap =		mon_bin_mmap,
 };
@@ -1135,7 +1254,7 @@ static int mon_alloc_buff(struct mon_pgmap *map, int npages)
 			return -ENOMEM;
 		}
 		map[n].ptr = (unsigned char *) vaddr;
-		map[n].pg = virt_to_page(vaddr);
+		map[n].pg = virt_to_page((void *) vaddr);
 	}
 	return 0;
 }
@@ -1156,8 +1275,9 @@ int mon_bin_add(struct mon_bus *mbus, const struct usb_bus *ubus)
 	if (minor >= MON_BIN_MAX_MINOR)
 		return 0;
 
-	dev = device_create(mon_bin_class, ubus? ubus->controller: NULL,
-			MKDEV(MAJOR(mon_bin_dev0), minor), "usbmon%d", minor);
+	dev = device_create(mon_bin_class, ubus ? ubus->controller : NULL,
+			    MKDEV(MAJOR(mon_bin_dev0), minor), NULL,
+			    "usbmon%d", minor);
 	if (IS_ERR(dev))
 		return 0;
 

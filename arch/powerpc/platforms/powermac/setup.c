@@ -33,7 +33,6 @@
 #include <linux/ptrace.h>
 #include <linux/slab.h>
 #include <linux/user.h>
-#include <linux/a.out.h>
 #include <linux/tty.h>
 #include <linux/string.h>
 #include <linux/delay.h>
@@ -61,7 +60,6 @@
 #include <asm/system.h>
 #include <asm/pgtable.h>
 #include <asm/io.h>
-#include <asm/kexec.h>
 #include <asm/pci-bridge.h>
 #include <asm/ohare.h>
 #include <asm/mediabay.h>
@@ -97,8 +95,6 @@ extern struct machdep_calls pmac_md;
 int sccdbg;
 #endif
 
-extern void zs_kgdb_hook(int tty_num);
-
 sys_ctrler_t sys_ctrler = SYS_CTRLER_UNKNOWN;
 EXPORT_SYMBOL(sys_ctrler);
 
@@ -106,11 +102,6 @@ EXPORT_SYMBOL(sys_ctrler);
 unsigned long smu_cmdbuf_abs;
 EXPORT_SYMBOL(smu_cmdbuf_abs);
 #endif
-
-#ifdef CONFIG_SMP
-extern struct smp_ops_t psurge_smp_ops;
-extern struct smp_ops_t core99_smp_ops;
-#endif /* CONFIG_SMP */
 
 static void pmac_show_cpuinfo(struct seq_file *m)
 {
@@ -313,9 +304,7 @@ static void __init pmac_setup_arch(void)
 	}
 
 	/* See if newworld or oldworld */
-	for (ic = NULL; (ic = of_find_all_nodes(ic)) != NULL; )
-		if (of_get_property(ic, "interrupt-controller", NULL))
-			break;
+	ic = of_find_node_with_property(NULL, "interrupt-controller");
 	if (ic) {
 		pmac_newworld = 1;
 		of_node_put(ic);
@@ -328,10 +317,6 @@ static void __init pmac_setup_arch(void)
 	ohare_init();
 	l2cr_init();
 #endif /* CONFIG_PPC32 */
-
-#ifdef CONFIG_KGDB
-	zs_kgdb_hook(0);
-#endif
 
 	find_via_cuda();
 	find_via_pmu();
@@ -350,34 +335,6 @@ static void __init pmac_setup_arch(void)
 #endif
 		ROOT_DEV = DEFAULT_ROOT_DEVICE;
 #endif
-
-#ifdef CONFIG_SMP
-	/* Check for Core99 */
-	ic = of_find_node_by_name(NULL, "uni-n");
-	if (!ic)
-		ic = of_find_node_by_name(NULL, "u3");
-	if (!ic)
-		ic = of_find_node_by_name(NULL, "u4");
-	if (ic) {
-		of_node_put(ic);
-		smp_ops = &core99_smp_ops;
-	}
-#ifdef CONFIG_PPC32
-	else {
-		/*
-		 * We have to set bits in cpu_possible_map here since the
-		 * secondary CPU(s) aren't in the device tree, and
-		 * setup_per_cpu_areas only allocates per-cpu data for
-		 * CPUs in the cpu_possible_map.
-		 */
-		int cpu;
-
-		for (cpu = 1; cpu < 4 && cpu < NR_CPUS; ++cpu)
-			cpu_set(cpu, cpu_possible_map);
-		smp_ops = &psurge_smp_ops;
-	}
-#endif
-#endif /* CONFIG_SMP */
 
 #ifdef CONFIG_ADB
 	if (strstr(cmd_line, "adb_sync")) {
@@ -522,6 +479,14 @@ static void __init pmac_init_early(void)
 #ifdef CONFIG_PPC64
 	iommu_init_early_dart();
 #endif
+
+	/* SMP Init has to be done early as we need to patch up
+	 * cpu_possible_map before interrupt stacks are allocated
+	 * or kaboom...
+	 */
+#ifdef CONFIG_SMP
+	pmac_setup_smp();
+#endif
 }
 
 static int __init pmac_declare_of_platform_devices(void)
@@ -546,6 +511,78 @@ static int __init pmac_declare_of_platform_devices(void)
 	return 0;
 }
 machine_device_initcall(powermac, pmac_declare_of_platform_devices);
+
+#ifdef CONFIG_SERIAL_PMACZILOG_CONSOLE
+/*
+ * This is called very early, as part of console_init() (typically just after
+ * time_init()). This function is respondible for trying to find a good
+ * default console on serial ports. It tries to match the open firmware
+ * default output with one of the available serial console drivers.
+ */
+static int __init check_pmac_serial_console(void)
+{
+	struct device_node *prom_stdout = NULL;
+	int offset = 0;
+	const char *name;
+#ifdef CONFIG_SERIAL_PMACZILOG_TTYS
+	char *devname = "ttyS";
+#else
+	char *devname = "ttyPZ";
+#endif
+
+	pr_debug(" -> check_pmac_serial_console()\n");
+
+	/* The user has requested a console so this is already set up. */
+	if (strstr(boot_command_line, "console=")) {
+		pr_debug(" console was specified !\n");
+		return -EBUSY;
+	}
+
+	if (!of_chosen) {
+		pr_debug(" of_chosen is NULL !\n");
+		return -ENODEV;
+	}
+
+	/* We are getting a weird phandle from OF ... */
+	/* ... So use the full path instead */
+	name = of_get_property(of_chosen, "linux,stdout-path", NULL);
+	if (name == NULL) {
+		pr_debug(" no linux,stdout-path !\n");
+		return -ENODEV;
+	}
+	prom_stdout = of_find_node_by_path(name);
+	if (!prom_stdout) {
+		pr_debug(" can't find stdout package %s !\n", name);
+		return -ENODEV;
+	}
+	pr_debug("stdout is %s\n", prom_stdout->full_name);
+
+	name = of_get_property(prom_stdout, "name", NULL);
+	if (!name) {
+		pr_debug(" stdout package has no name !\n");
+		goto not_found;
+	}
+
+	if (strcmp(name, "ch-a") == 0)
+		offset = 0;
+	else if (strcmp(name, "ch-b") == 0)
+		offset = 1;
+	else
+		goto not_found;
+	of_node_put(prom_stdout);
+
+	pr_debug("Found serial console at %s%d\n", devname, offset);
+
+	return add_preferred_console(devname, offset, NULL);
+
+ not_found:
+	pr_debug("No preferred console found !\n");
+	of_node_put(prom_stdout);
+	return -ENODEV;
+}
+console_initcall(check_pmac_serial_console);
+
+#endif /* CONFIG_SERIAL_PMACZILOG_CONSOLE */
 
 /*
  * Called very early, MMU is off, device-tree isn't unflattened
@@ -593,7 +630,7 @@ static int __init pmac_probe(void)
 /* Move that to pci.c */
 static int pmac_pci_probe_mode(struct pci_bus *bus)
 {
-	struct device_node *node = bus->sysdata;
+	struct device_node *node = pci_bus_to_OF_node(bus);
 
 	/* We need to use normal PCI probing for the AGP bus,
 	 * since the device for the AGP bridge isn't in the tree.
@@ -675,11 +712,6 @@ define_machine(powermac) {
 	.pci_probe_mode		= pmac_pci_probe_mode,
 	.power_save		= power4_idle,
 	.enable_pmcs		= power4_enable_pmcs,
-#ifdef CONFIG_KEXEC
-	.machine_kexec		= default_machine_kexec,
-	.machine_kexec_prepare	= default_machine_kexec_prepare,
-	.machine_crash_shutdown	= default_machine_crash_shutdown,
-#endif
 #endif /* CONFIG_PPC64 */
 #ifdef CONFIG_PPC32
 	.pcibios_enable_device_hook = pmac_pci_enable_device_hook,
@@ -688,5 +720,8 @@ define_machine(powermac) {
 #endif
 #if defined(CONFIG_HOTPLUG_CPU) && defined(CONFIG_PPC64)
 	.cpu_die		= pmac_cpu_die,
+#endif
+#if defined(CONFIG_HOTPLUG_CPU) && defined(CONFIG_PPC32)
+	.cpu_die		= generic_mach_cpu_die,
 #endif
 };

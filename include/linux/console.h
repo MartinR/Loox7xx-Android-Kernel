@@ -108,6 +108,8 @@ struct console {
 	struct	 console *next;
 };
 
+extern int console_set_on_cmdline;
+
 extern int add_preferred_console(char *name, int idx, char *options);
 extern int update_console_cmdline(char *name, int idx, char *name_new, int idx_new, char *options);
 extern void register_console(struct console *);
@@ -135,8 +137,8 @@ extern void resume_console(void);
 int mda_console_init(void);
 void prom_con_init(void);
 
-void vcs_make_sysfs(struct tty_struct *tty);
-void vcs_remove_sysfs(struct tty_struct *tty);
+void vcs_make_sysfs(int index);
+void vcs_remove_sysfs(int index);
 
 /* Some debug stub to catch some of the obvious races in the VT code */
 #if 1
@@ -150,5 +152,9 @@ void vcs_remove_sysfs(struct tty_struct *tty);
 #define VESA_VSYNC_SUSPEND      1
 #define VESA_HSYNC_SUSPEND      2
 #define VESA_POWERDOWN          3
+
+#ifdef CONFIG_VGA_CONSOLE
+extern bool vgacon_text_force(void);
+#endif
 
 #endif /* _LINUX_CONSOLE_H */

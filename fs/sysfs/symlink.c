@@ -16,16 +16,12 @@
 #include <linux/kobject.h>
 #include <linux/namei.h>
 #include <linux/mutex.h>
+#include <linux/security.h>
 
 #include "sysfs.h"
 
-/**
- *	sysfs_create_link - create symlink between two objects.
- *	@kobj:	object whose directory we're creating the link in.
- *	@target:	object we're pointing to.
- *	@name:		name of the symlink.
- */
-int sysfs_create_link(struct kobject * kobj, struct kobject * target, const char * name)
+static int sysfs_do_create_link(struct kobject *kobj, struct kobject *target,
+				const char *name, int warn)
 {
 	struct sysfs_dirent *parent_sd = NULL;
 	struct sysfs_dirent *target_sd = NULL;
@@ -65,7 +61,10 @@ int sysfs_create_link(struct kobject * kobj, struct kobject * target, const char
 	target_sd = NULL;	/* reference is now owned by the symlink */
 
 	sysfs_addrm_start(&acxt, parent_sd);
-	error = sysfs_add_one(&acxt, sd);
+	if (warn)
+		error = sysfs_add_one(&acxt, sd);
+	else
+		error = __sysfs_add_one(&acxt, sd);
 	sysfs_addrm_finish(&acxt);
 
 	if (error)
@@ -77,6 +76,33 @@ int sysfs_create_link(struct kobject * kobj, struct kobject * target, const char
 	sysfs_put(target_sd);
 	sysfs_put(sd);
 	return error;
+}
+
+/**
+ *	sysfs_create_link - create symlink between two objects.
+ *	@kobj:	object whose directory we're creating the link in.
+ *	@target:	object we're pointing to.
+ *	@name:		name of the symlink.
+ */
+int sysfs_create_link(struct kobject *kobj, struct kobject *target,
+		      const char *name)
+{
+	return sysfs_do_create_link(kobj, target, name, 1);
+}
+
+/**
+ *	sysfs_create_link_nowarn - create symlink between two objects.
+ *	@kobj:	object whose directory we're creating the link in.
+ *	@target:	object we're pointing to.
+ *	@name:		name of the symlink.
+ *
+ *	This function does the same as sysf_create_link(), but it
+ *	doesn't warn if the link already exists.
+ */
+int sysfs_create_link_nowarn(struct kobject *kobj, struct kobject *target,
+			     const char *name)
+{
+	return sysfs_do_create_link(kobj, target, name, 0);
 }
 
 /**
@@ -167,8 +193,11 @@ static void *sysfs_follow_link(struct dentry *dentry, struct nameidata *nd)
 {
 	int error = -ENOMEM;
 	unsigned long page = get_zeroed_page(GFP_KERNEL);
-	if (page)
+	if (page) {
 		error = sysfs_getlink(dentry, (char *) page); 
+		if (error < 0)
+			free_page((unsigned long)page);
+	}
 	nd_set_link(nd, error ? ERR_PTR(error) : (char *)page);
 	return NULL;
 }
@@ -181,6 +210,7 @@ static void sysfs_put_link(struct dentry *dentry, struct nameidata *nd, void *co
 }
 
 const struct inode_operations sysfs_symlink_inode_operations = {
+	.setxattr = sysfs_setxattr,
 	.readlink = generic_readlink,
 	.follow_link = sysfs_follow_link,
 	.put_link = sysfs_put_link,

@@ -29,7 +29,6 @@
 #include <linux/types.h>
 #include <linux/compiler.h>
 
-struct file;
 struct completion;
 
 #define CTL_MAXNAME 10		/* how many path components do we allow in a
@@ -490,6 +489,7 @@ enum
 	NET_IPV4_CONF_ARP_IGNORE=19,
 	NET_IPV4_CONF_PROMOTE_SECONDARIES=20,
 	NET_IPV4_CONF_ARP_ACCEPT=21,
+	NET_IPV4_CONF_ARP_NOTIFY=22,
 	__NET_IPV4_CONF_MAX
 };
 
@@ -947,6 +947,22 @@ struct ctl_table;
 struct nsproxy;
 struct ctl_table_root;
 
+struct ctl_table_set {
+	struct list_head list;
+	struct ctl_table_set *parent;
+	int (*is_seen)(struct ctl_table_set *);
+};
+
+extern void setup_sysctl_set(struct ctl_table_set *p,
+	struct ctl_table_set *parent,
+	int (*is_seen)(struct ctl_table_set *));
+
+struct ctl_table_header;
+
+extern void sysctl_head_get(struct ctl_table_header *);
+extern void sysctl_head_put(struct ctl_table_header *);
+extern int sysctl_is_seen(struct ctl_table_header *);
+extern struct ctl_table_header *sysctl_head_grab(struct ctl_table_header *);
 extern struct ctl_table_header *sysctl_head_next(struct ctl_table_header *prev);
 extern struct ctl_table_header *__sysctl_head_next(struct nsproxy *namespaces,
 						struct ctl_table_header *prev);
@@ -956,29 +972,29 @@ extern int sysctl_perm(struct ctl_table_root *root,
 
 typedef struct ctl_table ctl_table;
 
-typedef int ctl_handler (struct ctl_table *table, int __user *name, int nlen,
+typedef int ctl_handler (struct ctl_table *table,
 			 void __user *oldval, size_t __user *oldlenp,
 			 void __user *newval, size_t newlen);
 
-typedef int proc_handler (struct ctl_table *ctl, int write, struct file * filp,
+typedef int proc_handler (struct ctl_table *ctl, int write,
 			  void __user *buffer, size_t *lenp, loff_t *ppos);
 
-extern int proc_dostring(struct ctl_table *, int, struct file *,
+extern int proc_dostring(struct ctl_table *, int,
 			 void __user *, size_t *, loff_t *);
-extern int proc_dointvec(struct ctl_table *, int, struct file *,
+extern int proc_dointvec(struct ctl_table *, int,
 			 void __user *, size_t *, loff_t *);
-extern int proc_dointvec_minmax(struct ctl_table *, int, struct file *,
+extern int proc_dointvec_minmax(struct ctl_table *, int,
 				void __user *, size_t *, loff_t *);
-extern int proc_dointvec_jiffies(struct ctl_table *, int, struct file *,
+extern int proc_dointvec_jiffies(struct ctl_table *, int,
 				 void __user *, size_t *, loff_t *);
-extern int proc_dointvec_userhz_jiffies(struct ctl_table *, int, struct file *,
+extern int proc_dointvec_userhz_jiffies(struct ctl_table *, int,
 					void __user *, size_t *, loff_t *);
-extern int proc_dointvec_ms_jiffies(struct ctl_table *, int, struct file *,
+extern int proc_dointvec_ms_jiffies(struct ctl_table *, int,
 				    void __user *, size_t *, loff_t *);
-extern int proc_doulongvec_minmax(struct ctl_table *, int, struct file *,
+extern int proc_doulongvec_minmax(struct ctl_table *, int,
 				  void __user *, size_t *, loff_t *);
 extern int proc_doulongvec_ms_jiffies_minmax(struct ctl_table *table, int,
-				      struct file *, void __user *, size_t *, loff_t *);
+				      void __user *, size_t *, loff_t *);
 
 extern int do_sysctl (int __user *name, int nlen,
 		      void __user *oldval, size_t __user *oldlenp,
@@ -1049,8 +1065,8 @@ struct ctl_table
 
 struct ctl_table_root {
 	struct list_head root_list;
-	struct list_head header_list;
-	struct list_head *(*lookup)(struct ctl_table_root *root,
+	struct ctl_table_set default_set;
+	struct ctl_table_set *(*lookup)(struct ctl_table_root *root,
 					   struct nsproxy *namespaces);
 	int (*permissions)(struct ctl_table_root *root,
 			struct nsproxy *namespaces, struct ctl_table *table);
@@ -1063,9 +1079,14 @@ struct ctl_table_header
 	struct ctl_table *ctl_table;
 	struct list_head ctl_entry;
 	int used;
+	int count;
 	struct completion *unregistering;
 	struct ctl_table *ctl_table_arg;
 	struct ctl_table_root *root;
+	struct ctl_table_set *set;
+	struct ctl_table *attached_by;
+	struct ctl_table *attached_to;
+	struct ctl_table_header *parent;
 };
 
 /* struct ctl_path describes where in the hierarchy a table is added */

@@ -4,7 +4,7 @@
  *  (C) Copyright 1994 Linus Torvalds
  *  (C) Copyright 2002 Christoph Hellwig
  *
- *  Address space accounting code	<alan@redhat.com>
+ *  Address space accounting code	<alan@lxorguk.ukuu.org.uk>
  *  (C) Copyright 2002 Red Hat Inc, All Rights Reserved
  */
 
@@ -21,6 +21,9 @@
 #include <linux/syscalls.h>
 #include <linux/swap.h>
 #include <linux/swapops.h>
+#include <linux/mmu_notifier.h>
+#include <linux/migrate.h>
+#include <linux/perf_event.h>
 #include <asm/uaccess.h>
 #include <asm/pgtable.h>
 #include <asm/cacheflush.h>
@@ -47,21 +50,18 @@ static void change_pte_range(struct mm_struct *mm, pmd_t *pmd,
 		if (pte_present(oldpte)) {
 			pte_t ptent;
 
-			/* Avoid an SMP race with hardware updated dirty/clean
-			 * bits by wiping the pte and then setting the new pte
-			 * into place.
-			 */
-			ptent = ptep_get_and_clear(mm, addr, pte);
+			ptent = ptep_modify_prot_start(mm, addr, pte);
 			ptent = pte_modify(ptent, newprot);
+
 			/*
 			 * Avoid taking write faults for pages we know to be
 			 * dirty.
 			 */
 			if (dirty_accountable && pte_dirty(ptent))
 				ptent = pte_mkwrite(ptent);
-			set_pte_at(mm, addr, pte, ptent);
-#ifdef CONFIG_MIGRATION
-		} else if (!pte_file(oldpte)) {
+
+			ptep_modify_prot_commit(mm, addr, pte, ptent);
+		} else if (PAGE_MIGRATION && !pte_file(oldpte)) {
 			swp_entry_t entry = pte_to_swp_entry(oldpte);
 
 			if (is_write_migration_entry(entry)) {
@@ -73,9 +73,7 @@ static void change_pte_range(struct mm_struct *mm, pmd_t *pmd,
 				set_pte_at(mm, addr, pte,
 					swp_entry_to_pte(entry));
 			}
-#endif
 		}
-
 	} while (pte++, addr += PAGE_SIZE, addr != end);
 	arch_leave_lazy_mmu_mode();
 	pte_unmap_unlock(pte - 1, ptl);
@@ -154,13 +152,12 @@ mprotect_fixup(struct vm_area_struct *vma, struct vm_area_struct **pprev,
 	/*
 	 * If we make a private mapping writable we increase our commit;
 	 * but (without finer accounting) cannot reduce our commit if we
-	 * make it unwritable again.
-	 *
-	 * FIXME? We haven't defined a VM_NORESERVE flag, so mprotecting
-	 * a MAP_NORESERVE private mapping to writable will now reserve.
+	 * make it unwritable again. hugetlb mapping were accounted for
+	 * even if read-only so there is no need to account for them here
 	 */
 	if (newflags & VM_WRITE) {
-		if (!(oldflags & (VM_ACCOUNT|VM_WRITE|VM_SHARED))) {
+		if (!(oldflags & (VM_ACCOUNT|VM_WRITE|VM_HUGETLB|
+						VM_SHARED|VM_NORESERVE))) {
 			charged = nrpages;
 			if (security_vm_enough_memory(charged))
 				return -ENOMEM;
@@ -207,10 +204,12 @@ success:
 		dirty_accountable = 1;
 	}
 
+	mmu_notifier_invalidate_range_start(mm, start, end);
 	if (is_vm_hugetlb_page(vma))
 		hugetlb_change_protection(vma, start, end, vma->vm_page_prot);
 	else
 		change_protection(vma, start, end, vma->vm_page_prot, dirty_accountable);
+	mmu_notifier_invalidate_range_end(mm, start, end);
 	vm_stat_account(mm, oldflags, vma->vm_file, -nrpages);
 	vm_stat_account(mm, newflags, vma->vm_file, nrpages);
 	return 0;
@@ -220,8 +219,8 @@ fail:
 	return error;
 }
 
-asmlinkage long
-sys_mprotect(unsigned long start, size_t len, unsigned long prot)
+SYSCALL_DEFINE3(mprotect, unsigned long, start, size_t, len,
+		unsigned long, prot)
 {
 	unsigned long vm_flags, nstart, end, tmp, reqprot;
 	struct vm_area_struct *vma, *prev;
@@ -239,7 +238,7 @@ sys_mprotect(unsigned long start, size_t len, unsigned long prot)
 	end = start + len;
 	if (end <= start)
 		return -ENOMEM;
-	if (prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC | PROT_SEM))
+	if (!arch_validate_prot(prot))
 		return -EINVAL;
 
 	reqprot = prot;
@@ -301,6 +300,7 @@ sys_mprotect(unsigned long start, size_t len, unsigned long prot)
 		error = mprotect_fixup(vma, &prev, nstart, tmp, newflags);
 		if (error)
 			goto out;
+		perf_event_mmap(vma);
 		nstart = tmp;
 
 		if (nstart < prev->vm_end)

@@ -27,6 +27,14 @@ config I2C_BOARDINFO
 	boolean
 	default y
 
+config I2C_COMPAT
+	boolean "Enable compatibility bits for old user-space"
+	default y
+	help
+	  Say Y here if you intend to run lm-sensors 3.1.1 or older, or any
+	  other user-space package which expects i2c adapters to be class
+	  devices. If you don't know, say Y.
+
 config I2C_CHARDEV
 	tristate "I2C device interface"
 	help
@@ -37,6 +45,20 @@ config I2C_CHARDEV
 
 	  This support is also available as a module.  If so, the module 
 	  will be called i2c-dev.
+
+config I2C_HELPER_AUTO
+	bool "Autoselect pertinent helper modules"
+	default y
+	help
+	  Some I2C bus drivers require so-called "I2C algorithm" modules
+	  to work. These are basically software-only abstractions of generic
+	  I2C interfaces. This option will autoselect them so that you don't
+	  have to care.
+
+	  Unselect this only if you need to enable additional helper
+	  modules, for example for use with external I2C bus drivers.
+
+	  In doubt, say Y.
 
 source drivers/i2c/algos/Kconfig
 source drivers/i2c/busses/Kconfig

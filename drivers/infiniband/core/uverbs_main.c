@@ -32,8 +32,6 @@
  * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- *
- * $Id: uverbs_main.c 2733 2005-06-28 19:14:34Z roland $
  */
 
 #include <linux/module.h>
@@ -42,6 +40,7 @@
 #include <linux/err.h>
 #include <linux/fs.h>
 #include <linux/poll.h>
+#include <linux/sched.h>
 #include <linux/file.h>
 #include <linux/mount.h>
 #include <linux/cdev.h>
@@ -75,7 +74,7 @@ DEFINE_IDR(ib_uverbs_cq_idr);
 DEFINE_IDR(ib_uverbs_qp_idr);
 DEFINE_IDR(ib_uverbs_srq_idr);
 
-static spinlock_t map_lock;
+static DEFINE_SPINLOCK(map_lock);
 static struct ib_uverbs_device *dev_table[IB_UVERBS_MAX_DEVICES];
 static DECLARE_BITMAP(dev_map, IB_UVERBS_MAX_DEVICES);
 
@@ -360,8 +359,6 @@ static int ib_uverbs_event_close(struct inode *inode, struct file *filp)
 	}
 	spin_unlock_irq(&file->lock);
 
-	ib_uverbs_event_fasync(-1, filp, 0);
-
 	if (file->is_async) {
 		ib_unregister_event_handler(&file->uverbs_file->event_handler);
 		kref_put(&file->uverbs_file->ref, ib_uverbs_release_file);
@@ -588,13 +585,15 @@ static ssize_t ib_uverbs_write(struct file *filp, const char __user *buf,
 
 	if (hdr.command < 0				||
 	    hdr.command >= ARRAY_SIZE(uverbs_cmd_table) ||
-	    !uverbs_cmd_table[hdr.command]		||
-	    !(file->device->ib_dev->uverbs_cmd_mask & (1ull << hdr.command)))
+	    !uverbs_cmd_table[hdr.command])
 		return -EINVAL;
 
 	if (!file->ucontext &&
 	    hdr.command != IB_USER_VERBS_CMD_GET_CONTEXT)
 		return -EINVAL;
+
+	if (!(file->device->ib_dev->uverbs_cmd_mask & (1ull << hdr.command)))
+		return -ENOSYS;
 
 	return uverbs_cmd_table[hdr.command](file, buf + sizeof hdr,
 					     hdr.in_words * 4, hdr.out_words * 4);
@@ -610,6 +609,18 @@ static int ib_uverbs_mmap(struct file *filp, struct vm_area_struct *vma)
 		return file->device->ib_dev->mmap(file->ucontext, vma);
 }
 
+/*
+ * ib_uverbs_open() does not need the BKL:
+ *
+ *  - dev_table[] accesses are protected by map_lock, the
+ *    ib_uverbs_device structures are properly reference counted, and
+ *    everything else is purely local to the file being created, so
+ *    races against other open calls are not a problem;
+ *  - there is no ioctl method to race against;
+ *  - the device is added to dev_table[] as the last part of module
+ *    initialization, the open method will either immediately run
+ *    -ENXIO, or all required initialization will be done.
+ */
 static int ib_uverbs_open(struct inode *inode, struct file *filp)
 {
 	struct ib_uverbs_device *dev;
@@ -651,7 +662,6 @@ err_module:
 
 err:
 	kref_put(&dev->ref, ib_uverbs_release_dev);
-
 	return ret;
 }
 
@@ -755,12 +765,9 @@ static void ib_uverbs_add_one(struct ib_device *device)
 	if (cdev_add(uverbs_dev->cdev, IB_UVERBS_BASE_DEV + uverbs_dev->devnum, 1))
 		goto err_cdev;
 
-	uverbs_dev->dev = device_create_drvdata(uverbs_class,
-						device->dma_device,
-						uverbs_dev->cdev->dev,
-						uverbs_dev,
-						"uverbs%d",
-						uverbs_dev->devnum);
+	uverbs_dev->dev = device_create(uverbs_class, device->dma_device,
+					uverbs_dev->cdev->dev, uverbs_dev,
+					"uverbs%d", uverbs_dev->devnum);
 	if (IS_ERR(uverbs_dev->dev))
 		goto err_cdev;
 
@@ -831,8 +838,6 @@ static struct file_system_type uverbs_event_fs = {
 static int __init ib_uverbs_init(void)
 {
 	int ret;
-
-	spin_lock_init(&map_lock);
 
 	ret = register_chrdev_region(IB_UVERBS_BASE_DEV, IB_UVERBS_MAX_DEVICES,
 				     "infiniband_verbs");

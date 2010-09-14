@@ -107,10 +107,10 @@ unsigned long bootmap_start;
  * bootmap_start.  This address must be page-aligned.
  */
 static int __init
-find_bootmap_location (unsigned long start, unsigned long end, void *arg)
+find_bootmap_location (u64 start, u64 end, void *arg)
 {
-	unsigned long needed = *(unsigned long *)arg;
-	unsigned long range_start, range_end, free_start;
+	u64 needed = *(unsigned long *)arg;
+	u64 range_start, range_end, free_start;
 	int i;
 
 #if IGNORE_PFN0
@@ -163,8 +163,14 @@ per_cpu_init (void)
 	 * get_zeroed_page().
 	 */
 	if (first_time) {
+		void *cpu0_data = __cpu0_per_cpu;
+
 		first_time=0;
-		for (cpu = 0; cpu < NR_CPUS; cpu++) {
+
+		__per_cpu_offset[0] = (char *) cpu0_data - __per_cpu_start;
+		per_cpu(local_per_cpu_offset, 0) = __per_cpu_offset[0];
+
+		for (cpu = 1; cpu < NR_CPUS; cpu++) {
 			memcpy(cpu_data, __phys_per_cpu_start, __per_cpu_end - __per_cpu_start);
 			__per_cpu_offset[cpu] = (char *) cpu_data - __per_cpu_start;
 			cpu_data += PERCPU_PAGE_SIZE;
@@ -177,7 +183,7 @@ per_cpu_init (void)
 static inline void
 alloc_per_cpu_data(void)
 {
-	cpu_data = __alloc_bootmem(PERCPU_PAGE_SIZE * NR_CPUS,
+	cpu_data = __alloc_bootmem(PERCPU_PAGE_SIZE * NR_CPUS-1,
 				   PERCPU_PAGE_SIZE, __pa(MAX_DMA_ADDRESS));
 }
 #else
@@ -223,8 +229,7 @@ find_memory (void)
 	alloc_per_cpu_data();
 }
 
-static int
-count_pages (u64 start, u64 end, void *arg)
+static int count_pages(u64 start, u64 end, void *arg)
 {
 	unsigned long *count = arg;
 

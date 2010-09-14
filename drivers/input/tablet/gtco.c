@@ -2,7 +2,7 @@
 
 GTCO digitizer USB driver
 
-Use the err(), dbg() and info() macros from usb.h for system logging
+Use the err() and dbg() macros from usb.h for system logging
 
 TO CHECK:  Is pressure done right on report 5?
 
@@ -64,7 +64,6 @@ Scott Hill shill@gtcocalcomp.com
 #include <asm/byteorder.h>
 
 
-#include <linux/version.h>
 #include <linux/usb/input.h>
 
 /* Version with a Major number of 2 is for kernel inclusion only. */
@@ -863,7 +862,7 @@ static int gtco_probe(struct usb_interface *usbinterface,
 	gtco->urbinfo = usb_alloc_urb(0, GFP_KERNEL);
 	if (!gtco->urbinfo) {
 		err("Failed to allocate URB");
-		return -ENOMEM;
+		error = -ENOMEM;
 		goto err_free_buf;
 	}
 
@@ -878,7 +877,7 @@ static int gtco_probe(struct usb_interface *usbinterface,
 	dbg("num endpoints:     %d", usbinterface->cur_altsetting->desc.bNumEndpoints);
 	dbg("interface class:   %d", usbinterface->cur_altsetting->desc.bInterfaceClass);
 	dbg("endpoint: attribute:0x%x type:0x%x", endpoint->bmAttributes, endpoint->bDescriptorType);
-	if ((endpoint->bmAttributes & USB_ENDPOINT_XFERTYPE_MASK) == USB_ENDPOINT_XFER_INT)
+	if (usb_endpoint_xfer_int(endpoint))
 		dbg("endpoint: we have interrupt endpoint\n");
 
 	dbg("endpoint extra len:%d ", usbinterface->altsetting[0].extralen);
@@ -1011,7 +1010,7 @@ static void gtco_disconnect(struct usb_interface *interface)
 		kfree(gtco);
 	}
 
-	info("gtco driver disconnected");
+	dev_info(&interface->dev, "gtco driver disconnected\n");
 }
 
 /*   STANDARD MODULE LOAD ROUTINES  */
@@ -1051,4 +1050,5 @@ static void __exit gtco_exit(void)
 module_init(gtco_init);
 module_exit(gtco_exit);
 
+MODULE_DESCRIPTION("GTCO digitizer USB driver");
 MODULE_LICENSE("GPL");

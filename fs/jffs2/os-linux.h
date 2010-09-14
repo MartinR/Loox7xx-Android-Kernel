@@ -56,10 +56,6 @@ static inline void jffs2_init_inode_info(struct jffs2_inode_info *f)
 	f->target = NULL;
 	f->flags = 0;
 	f->usercompr = 0;
-#ifdef CONFIG_JFFS2_FS_POSIX_ACL
-	f->i_acl_access = JFFS2_ACL_NOT_CACHED;
-	f->i_acl_default = JFFS2_ACL_NOT_CACHED;
-#endif
 }
 
 
@@ -167,7 +163,7 @@ int jffs2_fsync(struct file *, struct dentry *, int);
 int jffs2_do_readpage_unlock (struct inode *inode, struct page *pg);
 
 /* ioctl.c */
-int jffs2_ioctl(struct inode *, struct file *, unsigned int, unsigned long);
+long jffs2_ioctl(struct file *, unsigned int, unsigned long);
 
 /* symlink.c */
 extern const struct inode_operations jffs2_symlink_inode_operations;
@@ -181,7 +177,6 @@ void jffs2_dirty_inode(struct inode *inode);
 struct inode *jffs2_new_inode (struct inode *dir_i, int mode,
 			       struct jffs2_raw_inode *ri);
 int jffs2_statfs (struct dentry *, struct kstatfs *);
-void jffs2_write_super (struct super_block *);
 int jffs2_remount_fs (struct super_block *, int *, char *);
 int jffs2_do_fill_super(struct super_block *sb, void *data, int silent);
 void jffs2_gc_release_inode(struct jffs2_sb_info *c,

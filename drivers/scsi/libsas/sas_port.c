@@ -50,13 +50,13 @@ static void sas_form_port(struct asd_sas_phy *phy)
 			sas_deform_port(phy);
 		else {
 			SAS_DPRINTK("%s: phy%d belongs to port%d already(%d)!\n",
-				    __FUNCTION__, phy->id, phy->port->id,
+				    __func__, phy->id, phy->port->id,
 				    phy->port->num_phys);
 			return;
 		}
 	}
 
-	/* find a port */
+	/* see if the phy should be part of a wide port */
 	spin_lock_irqsave(&sas_ha->phy_port_lock, flags);
 	for (i = 0; i < sas_ha->num_phys; i++) {
 		port = sas_ha->sas_port[i];
@@ -69,16 +69,27 @@ static void sas_form_port(struct asd_sas_phy *phy)
 			SAS_DPRINTK("phy%d matched wide port%d\n", phy->id,
 				    port->id);
 			break;
-		} else if (*(u64 *) port->sas_addr == 0 && port->num_phys==0) {
-			memcpy(port->sas_addr, phy->sas_addr, SAS_ADDR_SIZE);
-			break;
 		}
 		spin_unlock(&port->phy_list_lock);
+	}
+	/* The phy does not match any existing port, create a new one */
+	if (i == sas_ha->num_phys) {
+		for (i = 0; i < sas_ha->num_phys; i++) {
+			port = sas_ha->sas_port[i];
+			spin_lock(&port->phy_list_lock);
+			if (*(u64 *)port->sas_addr == 0
+				&& port->num_phys == 0) {
+				memcpy(port->sas_addr, phy->sas_addr,
+					SAS_ADDR_SIZE);
+				break;
+			}
+			spin_unlock(&port->phy_list_lock);
+		}
 	}
 
 	if (i >= sas_ha->num_phys) {
 		printk(KERN_NOTICE "%s: couldn't find a free port, bug?\n",
-		       __FUNCTION__);
+		       __func__);
 		spin_unlock_irqrestore(&sas_ha->phy_port_lock, flags);
 		return;
 	}
@@ -113,7 +124,7 @@ static void sas_form_port(struct asd_sas_phy *phy)
 	sas_port_add_phy(port->port, phy->phy);
 
 	SAS_DPRINTK("%s added to %s, phy_mask:0x%x (%16llx)\n",
-		    phy->phy->dev.bus_id,port->port->dev.bus_id,
+		    dev_name(&phy->phy->dev), dev_name(&port->port->dev),
 		    port->phy_mask,
 		    SAS_ADDR(port->attached_sas_addr));
 

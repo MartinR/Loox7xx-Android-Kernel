@@ -5,11 +5,11 @@
  *
  * O_DIRECT
  *
- * 04Jul2002	akpm@zip.com.au
+ * 04Jul2002	Andrew Morton
  *		Initial version
  * 11Sep2002	janetinc@us.ibm.com
  * 		added readv/writev support.
- * 29Oct2002	akpm@zip.com.au
+ * 29Oct2002	Andrew Morton
  *		rewrote bio_add_page() support.
  * 30Oct2002	pbadari@us.ibm.com
  *		added support for non-aligned IO.
@@ -150,17 +150,11 @@ static int dio_refill_pages(struct dio *dio)
 	int nr_pages;
 
 	nr_pages = min(dio->total_pages - dio->curr_page, DIO_PAGES);
-	down_read(&current->mm->mmap_sem);
-	ret = get_user_pages(
-		current,			/* Task for fault acounting */
-		current->mm,			/* whose pages? */
+	ret = get_user_pages_fast(
 		dio->curr_user_address,		/* Where from? */
 		nr_pages,			/* How many pages? */
 		dio->rw == READ,		/* Write to memory? */
-		0,				/* force (?) */
-		&dio->pages[0],
-		NULL);				/* vmas */
-	up_read(&current->mm->mmap_sem);
+		&dio->pages[0]);		/* Put results here */
 
 	if (ret < 0 && dio->blocks_available && (dio->rw & WRITE)) {
 		struct page *page = ZERO_PAGE(0);
@@ -313,8 +307,6 @@ dio_bio_alloc(struct dio *dio, struct block_device *bdev,
 	struct bio *bio;
 
 	bio = bio_alloc(GFP_KERNEL, nr_vecs);
-	if (bio == NULL)
-		return -ENOMEM;
 
 	bio->bi_bdev = bdev;
 	bio->bi_sector = first_sector;
@@ -1132,10 +1124,10 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 	int acquire_i_mutex = 0;
 
 	if (rw & WRITE)
-		rw = WRITE_SYNC;
+		rw = WRITE_ODIRECT;
 
 	if (bdev)
-		bdev_blkbits = blksize_bits(bdev_hardsect_size(bdev));
+		bdev_blkbits = blksize_bits(bdev_logical_block_size(bdev));
 
 	if (offset & blocksize_mask) {
 		if (bdev)
@@ -1214,6 +1206,19 @@ __blockdev_direct_IO(int rw, struct kiocb *iocb, struct inode *inode,
 
 	retval = direct_io_worker(rw, iocb, inode, iov, offset,
 				nr_segs, blkbits, get_block, end_io, dio);
+
+	/*
+	 * In case of error extending write may have instantiated a few
+	 * blocks outside i_size. Trim these off again for DIO_LOCKING.
+	 * NOTE: DIO_NO_LOCK/DIO_OWN_LOCK callers have to handle this by
+	 * it's own meaner.
+	 */
+	if (unlikely(retval < 0 && (rw & WRITE))) {
+		loff_t isize = i_size_read(inode);
+
+		if (end > isize && dio_lock_type == DIO_LOCKING)
+			vmtruncate(inode, isize);
+	}
 
 	if (rw == READ && dio_lock_type == DIO_LOCKING)
 		release_i_mutex = 0;

@@ -63,8 +63,50 @@ xattr_permission(struct inode *inode, const char *name, int mask)
 			return -EPERM;
 	}
 
-	return permission(inode, mask, NULL);
+	return inode_permission(inode, mask);
 }
+
+/**
+ *  __vfs_setxattr_noperm - perform setxattr operation without performing
+ *  permission checks.
+ *
+ *  @dentry - object to perform setxattr on
+ *  @name - xattr name to set
+ *  @value - value to set @name to
+ *  @size - size of @value
+ *  @flags - flags to pass into filesystem operations
+ *
+ *  returns the result of the internal setxattr or setsecurity operations.
+ *
+ *  This function requires the caller to lock the inode's i_mutex before it
+ *  is executed. It also assumes that the caller will make the appropriate
+ *  permission checks.
+ */
+int __vfs_setxattr_noperm(struct dentry *dentry, const char *name,
+		const void *value, size_t size, int flags)
+{
+	struct inode *inode = dentry->d_inode;
+	int error = -EOPNOTSUPP;
+
+	if (inode->i_op->setxattr) {
+		error = inode->i_op->setxattr(dentry, name, value, size, flags);
+		if (!error) {
+			fsnotify_xattr(dentry);
+			security_inode_post_setxattr(dentry, name, value,
+						     size, flags);
+		}
+	} else if (!strncmp(name, XATTR_SECURITY_PREFIX,
+				XATTR_SECURITY_PREFIX_LEN)) {
+		const char *suffix = name + XATTR_SECURITY_PREFIX_LEN;
+		error = security_inode_setsecurity(inode, suffix, value,
+						   size, flags);
+		if (!error)
+			fsnotify_xattr(dentry);
+	}
+
+	return error;
+}
+
 
 int
 vfs_setxattr(struct dentry *dentry, const char *name, const void *value,
@@ -81,22 +123,9 @@ vfs_setxattr(struct dentry *dentry, const char *name, const void *value,
 	error = security_inode_setxattr(dentry, name, value, size, flags);
 	if (error)
 		goto out;
-	error = -EOPNOTSUPP;
-	if (inode->i_op->setxattr) {
-		error = inode->i_op->setxattr(dentry, name, value, size, flags);
-		if (!error) {
-			fsnotify_xattr(dentry);
-			security_inode_post_setxattr(dentry, name, value,
-						     size, flags);
-		}
-	} else if (!strncmp(name, XATTR_SECURITY_PREFIX,
-				XATTR_SECURITY_PREFIX_LEN)) {
-		const char *suffix = name + XATTR_SECURITY_PREFIX_LEN;
-		error = security_inode_setsecurity(inode, suffix, value,
-						   size, flags);
-		if (!error)
-			fsnotify_xattr(dentry);
-	}
+
+	error = __vfs_setxattr_noperm(dentry, name, value, size, flags);
+
 out:
 	mutex_unlock(&inode->i_mutex);
 	return error;
@@ -175,7 +204,7 @@ vfs_listxattr(struct dentry *d, char *list, size_t size)
 	if (error)
 		return error;
 	error = -EOPNOTSUPP;
-	if (d->d_inode->i_op && d->d_inode->i_op->listxattr) {
+	if (d->d_inode->i_op->listxattr) {
 		error = d->d_inode->i_op->listxattr(d, list, size);
 	} else {
 		error = security_inode_listsecurity(d->d_inode, list, size);
@@ -237,13 +266,9 @@ setxattr(struct dentry *d, const char __user *name, const void __user *value,
 	if (size) {
 		if (size > XATTR_SIZE_MAX)
 			return -E2BIG;
-		kvalue = kmalloc(size, GFP_KERNEL);
-		if (!kvalue)
-			return -ENOMEM;
-		if (copy_from_user(kvalue, value, size)) {
-			kfree(kvalue);
-			return -EFAULT;
-		}
+		kvalue = memdup_user(value, size);
+		if (IS_ERR(kvalue))
+			return PTR_ERR(kvalue);
 	}
 
 	error = vfs_setxattr(d, kname, kvalue, size, flags);
@@ -251,47 +276,46 @@ setxattr(struct dentry *d, const char __user *name, const void __user *value,
 	return error;
 }
 
-asmlinkage long
-sys_setxattr(const char __user *path, const char __user *name,
-	     const void __user *value, size_t size, int flags)
+SYSCALL_DEFINE5(setxattr, const char __user *, pathname,
+		const char __user *, name, const void __user *, value,
+		size_t, size, int, flags)
 {
-	struct nameidata nd;
+	struct path path;
 	int error;
 
-	error = user_path_walk(path, &nd);
+	error = user_path(pathname, &path);
 	if (error)
 		return error;
-	error = mnt_want_write(nd.path.mnt);
+	error = mnt_want_write(path.mnt);
 	if (!error) {
-		error = setxattr(nd.path.dentry, name, value, size, flags);
-		mnt_drop_write(nd.path.mnt);
+		error = setxattr(path.dentry, name, value, size, flags);
+		mnt_drop_write(path.mnt);
 	}
-	path_put(&nd.path);
+	path_put(&path);
 	return error;
 }
 
-asmlinkage long
-sys_lsetxattr(const char __user *path, const char __user *name,
-	      const void __user *value, size_t size, int flags)
+SYSCALL_DEFINE5(lsetxattr, const char __user *, pathname,
+		const char __user *, name, const void __user *, value,
+		size_t, size, int, flags)
 {
-	struct nameidata nd;
+	struct path path;
 	int error;
 
-	error = user_path_walk_link(path, &nd);
+	error = user_lpath(pathname, &path);
 	if (error)
 		return error;
-	error = mnt_want_write(nd.path.mnt);
+	error = mnt_want_write(path.mnt);
 	if (!error) {
-		error = setxattr(nd.path.dentry, name, value, size, flags);
-		mnt_drop_write(nd.path.mnt);
+		error = setxattr(path.dentry, name, value, size, flags);
+		mnt_drop_write(path.mnt);
 	}
-	path_put(&nd.path);
+	path_put(&path);
 	return error;
 }
 
-asmlinkage long
-sys_fsetxattr(int fd, const char __user *name, const void __user *value,
-	      size_t size, int flags)
+SYSCALL_DEFINE5(fsetxattr, int, fd, const char __user *, name,
+		const void __user *,value, size_t, size, int, flags)
 {
 	struct file *f;
 	struct dentry *dentry;
@@ -302,7 +326,7 @@ sys_fsetxattr(int fd, const char __user *name, const void __user *value,
 		return error;
 	dentry = f->f_path.dentry;
 	audit_inode(NULL, dentry);
-	error = mnt_want_write(f->f_path.mnt);
+	error = mnt_want_write_file(f);
 	if (!error) {
 		error = setxattr(dentry, name, value, size, flags);
 		mnt_drop_write(f->f_path.mnt);
@@ -349,38 +373,36 @@ getxattr(struct dentry *d, const char __user *name, void __user *value,
 	return error;
 }
 
-asmlinkage ssize_t
-sys_getxattr(const char __user *path, const char __user *name,
-	     void __user *value, size_t size)
+SYSCALL_DEFINE4(getxattr, const char __user *, pathname,
+		const char __user *, name, void __user *, value, size_t, size)
 {
-	struct nameidata nd;
+	struct path path;
 	ssize_t error;
 
-	error = user_path_walk(path, &nd);
+	error = user_path(pathname, &path);
 	if (error)
 		return error;
-	error = getxattr(nd.path.dentry, name, value, size);
-	path_put(&nd.path);
+	error = getxattr(path.dentry, name, value, size);
+	path_put(&path);
 	return error;
 }
 
-asmlinkage ssize_t
-sys_lgetxattr(const char __user *path, const char __user *name, void __user *value,
-	      size_t size)
+SYSCALL_DEFINE4(lgetxattr, const char __user *, pathname,
+		const char __user *, name, void __user *, value, size_t, size)
 {
-	struct nameidata nd;
+	struct path path;
 	ssize_t error;
 
-	error = user_path_walk_link(path, &nd);
+	error = user_lpath(pathname, &path);
 	if (error)
 		return error;
-	error = getxattr(nd.path.dentry, name, value, size);
-	path_put(&nd.path);
+	error = getxattr(path.dentry, name, value, size);
+	path_put(&path);
 	return error;
 }
 
-asmlinkage ssize_t
-sys_fgetxattr(int fd, const char __user *name, void __user *value, size_t size)
+SYSCALL_DEFINE4(fgetxattr, int, fd, const char __user *, name,
+		void __user *, value, size_t, size)
 {
 	struct file *f;
 	ssize_t error = -EBADF;
@@ -424,36 +446,35 @@ listxattr(struct dentry *d, char __user *list, size_t size)
 	return error;
 }
 
-asmlinkage ssize_t
-sys_listxattr(const char __user *path, char __user *list, size_t size)
+SYSCALL_DEFINE3(listxattr, const char __user *, pathname, char __user *, list,
+		size_t, size)
 {
-	struct nameidata nd;
+	struct path path;
 	ssize_t error;
 
-	error = user_path_walk(path, &nd);
+	error = user_path(pathname, &path);
 	if (error)
 		return error;
-	error = listxattr(nd.path.dentry, list, size);
-	path_put(&nd.path);
+	error = listxattr(path.dentry, list, size);
+	path_put(&path);
 	return error;
 }
 
-asmlinkage ssize_t
-sys_llistxattr(const char __user *path, char __user *list, size_t size)
+SYSCALL_DEFINE3(llistxattr, const char __user *, pathname, char __user *, list,
+		size_t, size)
 {
-	struct nameidata nd;
+	struct path path;
 	ssize_t error;
 
-	error = user_path_walk_link(path, &nd);
+	error = user_lpath(pathname, &path);
 	if (error)
 		return error;
-	error = listxattr(nd.path.dentry, list, size);
-	path_put(&nd.path);
+	error = listxattr(path.dentry, list, size);
+	path_put(&path);
 	return error;
 }
 
-asmlinkage ssize_t
-sys_flistxattr(int fd, char __user *list, size_t size)
+SYSCALL_DEFINE3(flistxattr, int, fd, char __user *, list, size_t, size)
 {
 	struct file *f;
 	ssize_t error = -EBADF;
@@ -485,44 +506,43 @@ removexattr(struct dentry *d, const char __user *name)
 	return vfs_removexattr(d, kname);
 }
 
-asmlinkage long
-sys_removexattr(const char __user *path, const char __user *name)
+SYSCALL_DEFINE2(removexattr, const char __user *, pathname,
+		const char __user *, name)
 {
-	struct nameidata nd;
+	struct path path;
 	int error;
 
-	error = user_path_walk(path, &nd);
+	error = user_path(pathname, &path);
 	if (error)
 		return error;
-	error = mnt_want_write(nd.path.mnt);
+	error = mnt_want_write(path.mnt);
 	if (!error) {
-		error = removexattr(nd.path.dentry, name);
-		mnt_drop_write(nd.path.mnt);
+		error = removexattr(path.dentry, name);
+		mnt_drop_write(path.mnt);
 	}
-	path_put(&nd.path);
+	path_put(&path);
 	return error;
 }
 
-asmlinkage long
-sys_lremovexattr(const char __user *path, const char __user *name)
+SYSCALL_DEFINE2(lremovexattr, const char __user *, pathname,
+		const char __user *, name)
 {
-	struct nameidata nd;
+	struct path path;
 	int error;
 
-	error = user_path_walk_link(path, &nd);
+	error = user_lpath(pathname, &path);
 	if (error)
 		return error;
-	error = mnt_want_write(nd.path.mnt);
+	error = mnt_want_write(path.mnt);
 	if (!error) {
-		error = removexattr(nd.path.dentry, name);
-		mnt_drop_write(nd.path.mnt);
+		error = removexattr(path.dentry, name);
+		mnt_drop_write(path.mnt);
 	}
-	path_put(&nd.path);
+	path_put(&path);
 	return error;
 }
 
-asmlinkage long
-sys_fremovexattr(int fd, const char __user *name)
+SYSCALL_DEFINE2(fremovexattr, int, fd, const char __user *, name)
 {
 	struct file *f;
 	struct dentry *dentry;
@@ -533,7 +553,7 @@ sys_fremovexattr(int fd, const char __user *name)
 		return error;
 	dentry = f->f_path.dentry;
 	audit_inode(NULL, dentry);
-	error = mnt_want_write(f->f_path.mnt);
+	error = mnt_want_write_file(f);
 	if (!error) {
 		error = removexattr(dentry, name);
 		mnt_drop_write(f->f_path.mnt);

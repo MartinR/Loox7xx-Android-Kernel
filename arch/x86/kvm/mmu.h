@@ -15,7 +15,8 @@
 #define PT_USER_MASK (1ULL << 2)
 #define PT_PWT_MASK (1ULL << 3)
 #define PT_PCD_MASK (1ULL << 4)
-#define PT_ACCESSED_MASK (1ULL << 5)
+#define PT_ACCESSED_SHIFT 5
+#define PT_ACCESSED_MASK (1ULL << PT_ACCESSED_SHIFT)
 #define PT_DIRTY_MASK (1ULL << 6)
 #define PT_PAGE_SIZE_MASK (1ULL << 7)
 #define PT_PAT_MASK (1ULL << 7)
@@ -36,6 +37,8 @@
 #define PT32_ROOT_LEVEL 2
 #define PT32E_ROOT_LEVEL 3
 
+int kvm_mmu_get_spte_hierarchy(struct kvm_vcpu *vcpu, u64 addr, u64 sptes[4]);
+
 static inline void kvm_mmu_free_some_pages(struct kvm_vcpu *vcpu)
 {
 	if (unlikely(vcpu->kvm->arch.n_free_mmu_pages < KVM_MIN_FREE_MMU_PAGES))
@@ -53,7 +56,7 @@ static inline int kvm_mmu_reload(struct kvm_vcpu *vcpu)
 static inline int is_long_mode(struct kvm_vcpu *vcpu)
 {
 #ifdef CONFIG_X86_64
-	return vcpu->arch.shadow_efer & EFER_LME;
+	return vcpu->arch.shadow_efer & EFER_LMA;
 #else
 	return 0;
 #endif
@@ -72,6 +75,11 @@ static inline int is_pse(struct kvm_vcpu *vcpu)
 static inline int is_paging(struct kvm_vcpu *vcpu)
 {
 	return vcpu->arch.cr0 & X86_CR0_PG;
+}
+
+static inline int is_present_gpte(unsigned long pte)
+{
+	return pte & PT_PRESENT_MASK;
 }
 
 #endif

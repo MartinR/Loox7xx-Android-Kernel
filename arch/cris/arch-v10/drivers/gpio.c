@@ -16,17 +16,18 @@
 #include <linux/errno.h>
 #include <linux/kernel.h>
 #include <linux/fs.h>
+#include <linux/smp_lock.h>
 #include <linux/string.h>
 #include <linux/poll.h>
 #include <linux/init.h>
 #include <linux/interrupt.h>
 
 #include <asm/etraxgpio.h>
-#include <asm/arch/svinto.h>
+#include <arch/svinto.h>
 #include <asm/io.h>
 #include <asm/system.h>
 #include <asm/irq.h>
-#include <asm/arch/io_interface_mux.h>
+#include <arch/io_interface_mux.h>
 
 #define GPIO_MAJOR 120  /* experimental MAJOR number */
 
@@ -323,6 +324,7 @@ gpio_open(struct inode *inode, struct file *filp)
 	if (!priv)
 		return -ENOMEM;
 
+	lock_kernel();
 	priv->minor = p;
 
 	/* initialize the io/alarm struct */
@@ -357,6 +359,7 @@ gpio_open(struct inode *inode, struct file *filp)
 	alarmlist = priv;
 	spin_unlock_irqrestore(&gpio_lock, flags);
 
+	unlock_kernel();
 	return 0;
 }
 

@@ -30,6 +30,7 @@
 #include <linux/errno.h>
 #include <linux/mutex.h>
 #include <linux/slab.h>
+#include <linux/smp_lock.h>
 
 #include <linux/spi/spi.h>
 #include <linux/spi/spidev.h>
@@ -57,15 +58,20 @@ static unsigned long	minors[N_SPI_MINORS / BITS_PER_LONG];
 
 
 /* Bit masks for spi_device.mode management.  Note that incorrect
- * settings for CS_HIGH and 3WIRE can cause *lots* of trouble for other
- * devices on a shared bus:  CS_HIGH, because this device will be
- * active when it shouldn't be;  3WIRE, because when active it won't
- * behave as it should.
+ * settings for some settings can cause *lots* of trouble for other
+ * devices on a shared bus:
  *
- * REVISIT should changing those two modes be privileged?
+ *  - CS_HIGH ... this device will be active when it shouldn't be
+ *  - 3WIRE ... when active, it won't behave as it should
+ *  - NO_CS ... there will be no explicit message boundaries; this
+ *	is completely incompatible with the shared bus model
+ *  - READY ... transfers may proceed when they shouldn't.
+ *
+ * REVISIT should changing those flags be privileged?
  */
 #define SPI_MODE_MASK		(SPI_CPHA | SPI_CPOL | SPI_CS_HIGH \
-				| SPI_LSB_FIRST | SPI_3WIRE | SPI_LOOP)
+				| SPI_LSB_FIRST | SPI_3WIRE | SPI_LOOP \
+				| SPI_NO_CS | SPI_READY)
 
 struct spidev_data {
 	dev_t			devt;
@@ -227,7 +233,6 @@ static int spidev_message(struct spidev_data *spidev,
 	 * We walk the array of user-provided transfers, using each one
 	 * to initialize a kernel version of the same transfer.
 	 */
-	mutex_lock(&spidev->buf_lock);
 	buf = spidev->buffer;
 	total = 0;
 	for (n = n_xfers, k_tmp = k_xfers, u_tmp = u_xfers;
@@ -295,14 +300,12 @@ static int spidev_message(struct spidev_data *spidev,
 	status = total;
 
 done:
-	mutex_unlock(&spidev->buf_lock);
 	kfree(k_xfers);
 	return status;
 }
 
-static int
-spidev_ioctl(struct inode *inode, struct file *filp,
-		unsigned int cmd, unsigned long arg)
+static long
+spidev_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
 {
 	int			err = 0;
 	int			retval = 0;
@@ -339,6 +342,14 @@ spidev_ioctl(struct inode *inode, struct file *filp,
 
 	if (spi == NULL)
 		return -ESHUTDOWN;
+
+	/* use the buffer lock here for triple duty:
+	 *  - prevent I/O (from us) so calling spi_setup() is safe;
+	 *  - prevent concurrent SPI_IOC_WR_* from morphing
+	 *    data fields while SPI_IOC_RD_* reads them;
+	 *  - SPI_IOC_MESSAGE needs the buffer locked "normally".
+	 */
+	mutex_lock(&spidev->buf_lock);
 
 	switch (cmd) {
 	/* read requests */
@@ -455,6 +466,8 @@ spidev_ioctl(struct inode *inode, struct file *filp,
 		kfree(ioc);
 		break;
 	}
+
+	mutex_unlock(&spidev->buf_lock);
 	spi_dev_put(spi);
 	return retval;
 }
@@ -464,6 +477,7 @@ static int spidev_open(struct inode *inode, struct file *filp)
 	struct spidev_data	*spidev;
 	int			status = -ENXIO;
 
+	lock_kernel();
 	mutex_lock(&device_list_lock);
 
 	list_for_each_entry(spidev, &device_list, device_entry) {
@@ -489,6 +503,7 @@ static int spidev_open(struct inode *inode, struct file *filp)
 		pr_debug("spidev: nothing for minor %d\n", iminor(inode));
 
 	mutex_unlock(&device_list_lock);
+	unlock_kernel();
 	return status;
 }
 
@@ -522,7 +537,7 @@ static int spidev_release(struct inode *inode, struct file *filp)
 	return status;
 }
 
-static struct file_operations spidev_fops = {
+static const struct file_operations spidev_fops = {
 	.owner =	THIS_MODULE,
 	/* REVISIT switch to aio primitives, so that userspace
 	 * gets more complete API coverage.  It'll simplify things
@@ -530,7 +545,7 @@ static struct file_operations spidev_fops = {
 	 */
 	.write =	spidev_write,
 	.read =		spidev_read,
-	.ioctl =	spidev_ioctl,
+	.unlocked_ioctl = spidev_ioctl,
 	.open =		spidev_open,
 	.release =	spidev_release,
 };
@@ -574,8 +589,8 @@ static int spidev_probe(struct spi_device *spi)
 
 		spidev->devt = MKDEV(SPIDEV_MAJOR, minor);
 		dev = device_create(spidev_class, &spi->dev, spidev->devt,
-				"spidev%d.%d",
-				spi->master->bus_num, spi->chip_select);
+				    spidev, "spidev%d.%d",
+				    spi->master->bus_num, spi->chip_select);
 		status = IS_ERR(dev) ? PTR_ERR(dev) : 0;
 	} else {
 		dev_dbg(&spi->dev, "no minor number available!\n");
@@ -583,12 +598,13 @@ static int spidev_probe(struct spi_device *spi)
 	}
 	if (status == 0) {
 		set_bit(minor, minors);
-		spi_set_drvdata(spi, spidev);
 		list_add(&spidev->device_entry, &device_list);
 	}
 	mutex_unlock(&device_list_lock);
 
-	if (status != 0)
+	if (status == 0)
+		spi_set_drvdata(spi, spidev);
+	else
 		kfree(spidev);
 
 	return status;
@@ -672,3 +688,4 @@ module_exit(spidev_exit);
 MODULE_AUTHOR("Andrea Paterniani, <a.paterniani@swapp-eng.it>");
 MODULE_DESCRIPTION("User mode SPI device interface");
 MODULE_LICENSE("GPL");
+MODULE_ALIAS("spi:spidev");

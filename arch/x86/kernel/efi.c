@@ -42,6 +42,7 @@
 #include <asm/time.h>
 #include <asm/cacheflush.h>
 #include <asm/tlbflush.h>
+#include <asm/x86_init.h>
 
 #define EFI_DEBUG	1
 #define PFX 		"EFI: "
@@ -63,6 +64,17 @@ static int __init setup_noefi(char *arg)
 	return 0;
 }
 early_param("noefi", setup_noefi);
+
+int add_efi_memmap;
+EXPORT_SYMBOL(add_efi_memmap);
+
+static int __init setup_add_efi_memmap(char *arg)
+{
+	add_efi_memmap = 1;
+	return 0;
+}
+early_param("add_efi_memmap", setup_add_efi_memmap);
+
 
 static efi_status_t virt_efi_get_time(efi_time_t *tm, efi_time_cap_t *tc)
 {
@@ -213,6 +225,75 @@ unsigned long efi_get_time(void)
 		      eft.minute, eft.second);
 }
 
+/*
+ * Tell the kernel about the EFI memory map.  This might include
+ * more than the max 128 entries that can fit in the e820 legacy
+ * (zeropage) memory map.
+ */
+
+static void __init do_add_efi_memmap(void)
+{
+	void *p;
+
+	for (p = memmap.map; p < memmap.map_end; p += memmap.desc_size) {
+		efi_memory_desc_t *md = p;
+		unsigned long long start = md->phys_addr;
+		unsigned long long size = md->num_pages << EFI_PAGE_SHIFT;
+		int e820_type;
+
+		switch (md->type) {
+		case EFI_LOADER_CODE:
+		case EFI_LOADER_DATA:
+		case EFI_BOOT_SERVICES_CODE:
+		case EFI_BOOT_SERVICES_DATA:
+		case EFI_CONVENTIONAL_MEMORY:
+			if (md->attribute & EFI_MEMORY_WB)
+				e820_type = E820_RAM;
+			else
+				e820_type = E820_RESERVED;
+			break;
+		case EFI_ACPI_RECLAIM_MEMORY:
+			e820_type = E820_ACPI;
+			break;
+		case EFI_ACPI_MEMORY_NVS:
+			e820_type = E820_NVS;
+			break;
+		case EFI_UNUSABLE_MEMORY:
+			e820_type = E820_UNUSABLE;
+			break;
+		default:
+			/*
+			 * EFI_RESERVED_TYPE EFI_RUNTIME_SERVICES_CODE
+			 * EFI_RUNTIME_SERVICES_DATA EFI_MEMORY_MAPPED_IO
+			 * EFI_MEMORY_MAPPED_IO_PORT_SPACE EFI_PAL_CODE
+			 */
+			e820_type = E820_RESERVED;
+			break;
+		}
+		e820_add_region(start, size, e820_type);
+	}
+	sanitize_e820_map(e820.map, ARRAY_SIZE(e820.map), &e820.nr_map);
+}
+
+void __init efi_reserve_early(void)
+{
+	unsigned long pmap;
+
+#ifdef CONFIG_X86_32
+	pmap = boot_params.efi_info.efi_memmap;
+#else
+	pmap = (boot_params.efi_info.efi_memmap |
+		((__u64)boot_params.efi_info.efi_memmap_hi<<32));
+#endif
+	memmap.phys_map = (void *)pmap;
+	memmap.nr_map = boot_params.efi_info.efi_memmap_size /
+		boot_params.efi_info.efi_memdesc_size;
+	memmap.desc_version = boot_params.efi_info.efi_memdesc_version;
+	memmap.desc_size = boot_params.efi_info.efi_memdesc_size;
+	reserve_early(pmap, pmap + memmap.nr_map * memmap.desc_size,
+		      "EFI memmap");
+}
+
 #if EFI_DEBUG
 static void __init print_efi_memmap(void)
 {
@@ -244,19 +325,11 @@ void __init efi_init(void)
 
 #ifdef CONFIG_X86_32
 	efi_phys.systab = (efi_system_table_t *)boot_params.efi_info.efi_systab;
-	memmap.phys_map = (void *)boot_params.efi_info.efi_memmap;
 #else
 	efi_phys.systab = (efi_system_table_t *)
 		(boot_params.efi_info.efi_systab |
 		 ((__u64)boot_params.efi_info.efi_systab_hi<<32));
-	memmap.phys_map = (void *)
-		(boot_params.efi_info.efi_memmap |
-		 ((__u64)boot_params.efi_info.efi_memmap_hi<<32));
 #endif
-	memmap.nr_map = boot_params.efi_info.efi_memmap_size /
-		boot_params.efi_info.efi_memdesc_size;
-	memmap.desc_version = boot_params.efi_info.efi_memdesc_version;
-	memmap.desc_size = boot_params.efi_info.efi_memdesc_size;
 
 	efi.systab = early_ioremap((unsigned long)efi_phys.systab,
 				   sizeof(efi_system_table_t));
@@ -282,7 +355,7 @@ void __init efi_init(void)
 	 */
 	c16 = tmp = early_ioremap(efi.systab->fw_vendor, 2);
 	if (c16) {
-		for (i = 0; i < sizeof(vendor) && *c16; ++i)
+		for (i = 0; i < sizeof(vendor) - 1 && *c16; ++i)
 			vendor[i] = *c16++;
 		vendor[i] = '\0';
 	} else
@@ -319,6 +392,12 @@ void __init efi_init(void)
 					SMBIOS_TABLE_GUID)) {
 			efi.smbios = config_tables[i].table;
 			printk(" SMBIOS=0x%lx ", config_tables[i].table);
+#ifdef CONFIG_X86_UV
+		} else if (!efi_guidcmp(config_tables[i].guid,
+					UV_SYSTEM_TABLE_GUID)) {
+			efi.uv_systab = config_tables[i].table;
+			printk(" UVsystab=0x%lx ", config_tables[i].table);
+#endif
 		} else if (!efi_guidcmp(config_tables[i].guid,
 					HCDP_TABLE_GUID)) {
 			efi.hcdp = config_tables[i].table;
@@ -367,9 +446,18 @@ void __init efi_init(void)
 	if (memmap.map == NULL)
 		printk(KERN_ERR "Could not map the EFI memory map!\n");
 	memmap.map_end = memmap.map + (memmap.nr_map * memmap.desc_size);
+
 	if (memmap.desc_size != sizeof(efi_memory_desc_t))
-		printk(KERN_WARNING "Kernel-defined memdesc"
-		       "doesn't match the one from EFI!\n");
+		printk(KERN_WARNING
+		  "Kernel-defined memdesc doesn't match the one from EFI!\n");
+
+	if (add_efi_memmap)
+		do_add_efi_memmap();
+
+#ifdef CONFIG_X86_32
+	x86_platform.get_wallclock = efi_get_time;
+	x86_platform.set_wallclock = efi_set_rtc_mmss;
+#endif
 
 	/* Setup for EFI runtime service */
 	reboot_type = BOOT_EFI;
@@ -412,7 +500,7 @@ void __init efi_enter_virtual_mode(void)
 	efi_memory_desc_t *md;
 	efi_status_t status;
 	unsigned long size;
-	u64 end, systab, addr, npages;
+	u64 end, systab, addr, npages, end_pfn;
 	void *p, *va;
 
 	efi.systab = NULL;
@@ -424,10 +512,13 @@ void __init efi_enter_virtual_mode(void)
 		size = md->num_pages << EFI_PAGE_SHIFT;
 		end = md->phys_addr + size;
 
-		if (PFN_UP(end) <= max_pfn_mapped)
+		end_pfn = PFN_UP(end);
+		if (end_pfn <= max_low_pfn_mapped
+		    || (end_pfn > (1UL << (32 - PAGE_SHIFT))
+			&& end_pfn <= max_pfn_mapped))
 			va = __va(md->phys_addr);
 		else
-			va = efi_ioremap(md->phys_addr, size);
+			va = efi_ioremap(md->phys_addr, size, md->type);
 
 		md->virt_addr = (u64) (unsigned long) va;
 

@@ -43,6 +43,7 @@
 #include "xfs_quota.h"
 #include "xfs_trans_priv.h"
 #include "xfs_trans_space.h"
+#include "xfs_inode_item.h"
 
 
 STATIC void	xfs_trans_apply_sb_deltas(xfs_trans_t *);
@@ -253,7 +254,7 @@ _xfs_trans_alloc(
 	tp->t_mountp = mp;
 	tp->t_items_free = XFS_LIC_NUM_SLOTS;
 	tp->t_busy_free = XFS_LBC_NUM_SLOTS;
-	XFS_LIC_INIT(&(tp->t_items));
+	xfs_lic_init(&(tp->t_items));
 	XFS_LBC_INIT(&(tp->t_busy));
 	return tp;
 }
@@ -282,21 +283,21 @@ xfs_trans_dup(
 	ntp->t_mountp = tp->t_mountp;
 	ntp->t_items_free = XFS_LIC_NUM_SLOTS;
 	ntp->t_busy_free = XFS_LBC_NUM_SLOTS;
-	XFS_LIC_INIT(&(ntp->t_items));
+	xfs_lic_init(&(ntp->t_items));
 	XFS_LBC_INIT(&(ntp->t_busy));
 
 	ASSERT(tp->t_flags & XFS_TRANS_PERM_LOG_RES);
 	ASSERT(tp->t_ticket != NULL);
 
 	ntp->t_flags = XFS_TRANS_PERM_LOG_RES | (tp->t_flags & XFS_TRANS_RESERVE);
-	ntp->t_ticket = tp->t_ticket;
+	ntp->t_ticket = xfs_log_ticket_get(tp->t_ticket);
 	ntp->t_blk_res = tp->t_blk_res - tp->t_blk_res_used;
 	tp->t_blk_res = tp->t_blk_res_used;
 	ntp->t_rtx_res = tp->t_rtx_res - tp->t_rtx_res_used;
 	tp->t_rtx_res = tp->t_rtx_res_used;
 	ntp->t_pflags = tp->t_pflags;
 
-	XFS_TRANS_DUP_DQINFO(tp->t_mountp, tp, ntp);
+	xfs_trans_dup_dqinfo(tp, ntp);
 
 	atomic_inc(&tp->t_mountp->m_active_trans);
 	return ntp;
@@ -627,8 +628,6 @@ xfs_trans_apply_sb_deltas(
 		xfs_trans_log_buf(tp, bp, offsetof(xfs_dsb_t, sb_icount),
 				  offsetof(xfs_dsb_t, sb_frextents) +
 				  sizeof(sbp->sb_frextents) - 1);
-
-	tp->t_mountp->m_super->s_dirt = 1;
 }
 
 /*
@@ -830,7 +829,7 @@ shut_us_down:
 		 * means is that we have some (non-persistent) quota
 		 * reservations that need to be unreserved.
 		 */
-		XFS_TRANS_UNRESERVE_AND_MOD_DQUOTS(mp, tp);
+		xfs_trans_unreserve_and_mod_dquots(tp);
 		if (tp->t_ticket) {
 			commit_lsn = xfs_log_done(mp, tp->t_ticket,
 							NULL, log_flags);
@@ -849,10 +848,9 @@ shut_us_down:
 	/*
 	 * If we need to update the superblock, then do it now.
 	 */
-	if (tp->t_flags & XFS_TRANS_SB_DIRTY) {
+	if (tp->t_flags & XFS_TRANS_SB_DIRTY)
 		xfs_trans_apply_sb_deltas(tp);
-	}
-	XFS_TRANS_APPLY_DQUOT_DELTAS(mp, tp);
+	xfs_trans_apply_dquot_deltas(tp);
 
 	/*
 	 * Ask each log item how many log_vector entries it will
@@ -889,7 +887,7 @@ shut_us_down:
 
 	tp->t_commit_lsn = commit_lsn;
 	if (nvec > XFS_TRANS_LOGVEC_COUNT) {
-		kmem_free(log_vector, nvec * sizeof(xfs_log_iovec_t));
+		kmem_free(log_vector);
 	}
 
 	/*
@@ -1057,7 +1055,7 @@ xfs_trans_uncommit(
 	}
 
 	xfs_trans_unreserve_and_mod_sb(tp);
-	XFS_TRANS_UNRESERVE_AND_MOD_DQUOTS(tp->t_mountp, tp);
+	xfs_trans_unreserve_and_mod_dquots(tp);
 
 	xfs_trans_free_items(tp, flags);
 	xfs_trans_free_busy(tp);
@@ -1169,7 +1167,7 @@ xfs_trans_cancel(
 		while (licp != NULL) {
 			lidp = licp->lic_descs;
 			for (i = 0; i < licp->lic_unused; i++, lidp++) {
-				if (XFS_LIC_ISFREE(licp, i)) {
+				if (xfs_lic_isfree(licp, i)) {
 					continue;
 				}
 
@@ -1182,7 +1180,7 @@ xfs_trans_cancel(
 	}
 #endif
 	xfs_trans_unreserve_and_mod_sb(tp);
-	XFS_TRANS_UNRESERVE_AND_MOD_DQUOTS(mp, tp);
+	xfs_trans_unreserve_and_mod_dquots(tp);
 
 	if (tp->t_ticket) {
 		if (flags & XFS_TRANS_RELEASE_LOG_RES) {
@@ -1212,10 +1210,79 @@ xfs_trans_free(
 	xfs_trans_t	*tp)
 {
 	atomic_dec(&tp->t_mountp->m_active_trans);
-	XFS_TRANS_FREE_DQINFO(tp->t_mountp, tp);
+	xfs_trans_free_dqinfo(tp);
 	kmem_zone_free(xfs_trans_zone, tp);
 }
 
+/*
+ * Roll from one trans in the sequence of PERMANENT transactions to
+ * the next: permanent transactions are only flushed out when
+ * committed with XFS_TRANS_RELEASE_LOG_RES, but we still want as soon
+ * as possible to let chunks of it go to the log. So we commit the
+ * chunk we've been working on and get a new transaction to continue.
+ */
+int
+xfs_trans_roll(
+	struct xfs_trans	**tpp,
+	struct xfs_inode	*dp)
+{
+	struct xfs_trans	*trans;
+	unsigned int		logres, count;
+	int			error;
+
+	/*
+	 * Ensure that the inode is always logged.
+	 */
+	trans = *tpp;
+	xfs_trans_log_inode(trans, dp, XFS_ILOG_CORE);
+
+	/*
+	 * Copy the critical parameters from one trans to the next.
+	 */
+	logres = trans->t_log_res;
+	count = trans->t_log_count;
+	*tpp = xfs_trans_dup(trans);
+
+	/*
+	 * Commit the current transaction.
+	 * If this commit failed, then it'd just unlock those items that
+	 * are not marked ihold. That also means that a filesystem shutdown
+	 * is in progress. The caller takes the responsibility to cancel
+	 * the duplicate transaction that gets returned.
+	 */
+	error = xfs_trans_commit(trans, 0);
+	if (error)
+		return (error);
+
+	trans = *tpp;
+
+	/*
+	 * transaction commit worked ok so we can drop the extra ticket
+	 * reference that we gained in xfs_trans_dup()
+	 */
+	xfs_log_ticket_put(trans->t_ticket);
+
+
+	/*
+	 * Reserve space in the log for th next transaction.
+	 * This also pushes items in the "AIL", the list of logged items,
+	 * out to disk if they are taking up space at the tail of the log
+	 * that we want to use.  This requires that either nothing be locked
+	 * across this call, or that anything that is locked be logged in
+	 * the prior and the next transactions.
+	 */
+	error = xfs_trans_reserve(trans, 0, logres, 0,
+				  XFS_TRANS_PERM_LOG_RES, count);
+	/*
+	 *  Ensure that the inode is in the new transaction and locked.
+	 */
+	if (error)
+		return error;
+
+	xfs_trans_ijoin(trans, dp, XFS_ILOCK_EXCL);
+	xfs_trans_ihold(trans, dp);
+	return 0;
+}
 
 /*
  * THIS SHOULD BE REWRITTEN TO USE xfs_trans_next_item().
@@ -1253,7 +1320,7 @@ xfs_trans_committed(
 	 * Special case the chunk embedded in the transaction.
 	 */
 	licp = &(tp->t_items);
-	if (!(XFS_LIC_ARE_ALL_FREE(licp))) {
+	if (!(xfs_lic_are_all_free(licp))) {
 		xfs_trans_chunk_committed(licp, tp->t_lsn, abortflag);
 	}
 
@@ -1262,10 +1329,10 @@ xfs_trans_committed(
 	 */
 	licp = licp->lic_next;
 	while (licp != NULL) {
-		ASSERT(!XFS_LIC_ARE_ALL_FREE(licp));
+		ASSERT(!xfs_lic_are_all_free(licp));
 		xfs_trans_chunk_committed(licp, tp->t_lsn, abortflag);
 		next_licp = licp->lic_next;
-		kmem_free(licp, sizeof(xfs_log_item_chunk_t));
+		kmem_free(licp);
 		licp = next_licp;
 	}
 
@@ -1320,12 +1387,13 @@ xfs_trans_chunk_committed(
 	xfs_log_item_desc_t	*lidp;
 	xfs_log_item_t		*lip;
 	xfs_lsn_t		item_lsn;
-	struct xfs_mount	*mp;
 	int			i;
 
 	lidp = licp->lic_descs;
 	for (i = 0; i < licp->lic_unused; i++, lidp++) {
-		if (XFS_LIC_ISFREE(licp, i)) {
+		struct xfs_ail		*ailp;
+
+		if (xfs_lic_isfree(licp, i)) {
 			continue;
 		}
 
@@ -1361,19 +1429,19 @@ xfs_trans_chunk_committed(
 		 * This would cause the earlier transaction to fail
 		 * the test below.
 		 */
-		mp = lip->li_mountp;
-		spin_lock(&mp->m_ail_lock);
+		ailp = lip->li_ailp;
+		spin_lock(&ailp->xa_lock);
 		if (XFS_LSN_CMP(item_lsn, lip->li_lsn) > 0) {
 			/*
 			 * This will set the item's lsn to item_lsn
 			 * and update the position of the item in
 			 * the AIL.
 			 *
-			 * xfs_trans_update_ail() drops the AIL lock.
+			 * xfs_trans_ail_update() drops the AIL lock.
 			 */
-			xfs_trans_update_ail(mp, lip, item_lsn);
+			xfs_trans_ail_update(ailp, lip, item_lsn);
 		} else {
-			spin_unlock(&mp->m_ail_lock);
+			spin_unlock(&ailp->xa_lock);
 		}
 
 		/*

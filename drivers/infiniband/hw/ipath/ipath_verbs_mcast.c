@@ -31,8 +31,8 @@
  * SOFTWARE.
  */
 
-#include <linux/list.h>
-#include <linux/rcupdate.h>
+#include <linux/rculist.h>
+#include <linux/sched.h>
 
 #include "ipath_verbs.h"
 

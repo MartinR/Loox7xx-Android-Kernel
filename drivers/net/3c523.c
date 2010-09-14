@@ -176,14 +176,14 @@ sizeof(nop_cmd) = 8;
     if(!p->scb->cmd) break; \
     DELAY_16(); \
     if(i == 1023) { \
-      printk(KERN_WARNING "%s:%d: scb_cmd timed out .. resetting i82586\n",\
+      pr_warning("%s:%d: scb_cmd timed out .. resetting i82586\n",\
       	dev->name,__LINE__); \
       elmc_id_reset586(); } } }
 
 static irqreturn_t elmc_interrupt(int irq, void *dev_id);
 static int elmc_open(struct net_device *dev);
 static int elmc_close(struct net_device *dev);
-static int elmc_send_packet(struct sk_buff *, struct net_device *);
+static netdev_tx_t elmc_send_packet(struct sk_buff *, struct net_device *);
 static struct net_device_stats *elmc_get_stats(struct net_device *dev);
 static void elmc_timeout(struct net_device *dev);
 #ifdef ELMC_MULTICAST
@@ -202,7 +202,6 @@ static void elmc_xmt_int(struct net_device *dev);
 static void elmc_rnr_int(struct net_device *dev);
 
 struct priv {
-	struct net_device_stats stats;
 	unsigned long base;
 	char *memtop;
 	unsigned long mapped_start;		/* Start of ioremap */
@@ -292,7 +291,7 @@ static int elmc_open(struct net_device *dev)
 	ret = request_irq(dev->irq, &elmc_interrupt, IRQF_SHARED | IRQF_SAMPLE_RANDOM,
 			  dev->name, dev);
 	if (ret) {
-		printk(KERN_ERR "%s: couldn't get irq %d\n", dev->name, dev->irq);
+		pr_err("%s: couldn't get irq %d\n", dev->name, dev->irq);
 		elmc_id_reset586();
 		return ret;
 	}
@@ -309,7 +308,7 @@ static int elmc_open(struct net_device *dev)
 
 static int __init check586(struct net_device *dev, unsigned long where, unsigned size)
 {
-	struct priv *p = (struct priv *) dev->priv;
+	struct priv *p = netdev_priv(dev);
 	char *iscp_addrs[2];
 	int i = 0;
 
@@ -348,9 +347,9 @@ static int __init check586(struct net_device *dev, unsigned long where, unsigned
  * set iscp at the right place, called by elmc_probe and open586.
  */
 
-void alloc586(struct net_device *dev)
+static void alloc586(struct net_device *dev)
 {
-	struct priv *p = (struct priv *) dev->priv;
+	struct priv *p = netdev_priv(dev);
 
 	elmc_id_reset586();
 	DELAY(2);
@@ -372,9 +371,9 @@ void alloc586(struct net_device *dev)
 
 	DELAY(2);
 
-	if (p->iscp->busy) {
-		printk(KERN_ERR "%s: Init-Problems (alloc).\n", dev->name);
-	}
+	if (p->iscp->busy)
+		pr_err("%s: Init-Problems (alloc).\n", dev->name);
+
 	memset((char *) p->scb, 0, sizeof(struct scb_struct));
 }
 
@@ -384,7 +383,6 @@ static int elmc_getinfo(char *buf, int slot, void *d)
 {
 	int len = 0;
 	struct net_device *dev = d;
-	DECLARE_MAC_BUF(mac);
 
 	if (dev == NULL)
 		return len;
@@ -399,11 +397,25 @@ static int elmc_getinfo(char *buf, int slot, void *d)
 	len += sprintf(buf + len, "Transceiver: %s\n", dev->if_port ?
 		       "External" : "Internal");
 	len += sprintf(buf + len, "Device: %s\n", dev->name);
-	len += sprintf(buf + len, "Hardware Address: %s\n",
-		       print_mac(mac, dev->dev_addr));
+	len += sprintf(buf + len, "Hardware Address: %pM\n",
+		       dev->dev_addr);
 
 	return len;
 }				/* elmc_getinfo() */
+
+static const struct net_device_ops netdev_ops = {
+	.ndo_open 		= elmc_open,
+	.ndo_stop		= elmc_close,
+	.ndo_get_stats		= elmc_get_stats,
+	.ndo_start_xmit		= elmc_send_packet,
+	.ndo_tx_timeout		= elmc_timeout,
+#ifdef ELMC_MULTICAST
+	.ndo_set_multicast_list = set_multicast_list,
+#endif
+	.ndo_change_mtu		= eth_change_mtu,
+	.ndo_set_mac_address 	= eth_mac_addr,
+	.ndo_validate_addr	= eth_validate_addr,
+};
 
 /*****************************************************************/
 
@@ -417,8 +429,7 @@ static int __init do_elmc_probe(struct net_device *dev)
 	int i = 0;
 	unsigned int size = 0;
 	int retval;
-	struct priv *pr = dev->priv;
-	DECLARE_MAC_BUF(mac);
+	struct priv *pr = netdev_priv(dev);
 
 	if (MCA_bus == 0) {
 		return -ENODEV;
@@ -459,7 +470,7 @@ static int __init do_elmc_probe(struct net_device *dev)
 	mca_set_adapter_procfn(slot, (MCA_ProcFn) elmc_getinfo, dev);
 
 	/* if we get this far, adapter has been found - carry on */
-	printk(KERN_INFO "%s: 3c523 adapter found in slot %d\n", dev->name, slot + 1);
+	pr_info("%s: 3c523 adapter found in slot %d\n", dev->name, slot + 1);
 
 	/* Now we extract configuration info from the card.
 	   The 3c523 provides information in two of the POS registers, but
@@ -496,7 +507,7 @@ static int __init do_elmc_probe(struct net_device *dev)
 	memset(pr, 0, sizeof(struct priv));
 	pr->slot = slot;
 
-	printk(KERN_INFO "%s: 3Com 3c523 Rev 0x%x at %#lx\n", dev->name, (int) revision,
+	pr_info("%s: 3Com 3c523 Rev 0x%x at %#lx\n", dev->name, (int) revision,
 	       dev->base_addr);
 
 	/* Determine if we're using the on-board transceiver (i.e. coax) or
@@ -518,7 +529,7 @@ static int __init do_elmc_probe(struct net_device *dev)
 
 	size = 0x4000;		/* check for 16K mem */
 	if (!check586(dev, dev->mem_start, size)) {
-		printk(KERN_ERR "%s: memprobe, Can't find memory at 0x%lx!\n", dev->name,
+		pr_err("%s: memprobe, Can't find memory at 0x%lx!\n", dev->name,
 		       dev->mem_start);
 		retval = -ENODEV;
 		goto err_out;
@@ -535,7 +546,7 @@ static int __init do_elmc_probe(struct net_device *dev)
 	pr->num_recv_buffs = NUM_RECV_BUFFS_16;
 
 	/* dump all the assorted information */
-	printk(KERN_INFO "%s: IRQ %d, %sternal xcvr, memory %#lx-%#lx.\n", dev->name,
+	pr_info("%s: IRQ %d, %sternal xcvr, memory %#lx-%#lx.\n", dev->name,
 	       dev->irq, dev->if_port ? "ex" : "in",
 	       dev->mem_start, dev->mem_end - 1);
 
@@ -544,20 +555,11 @@ static int __init do_elmc_probe(struct net_device *dev)
 	for (i = 0; i < 6; i++)
 		dev->dev_addr[i] = inb(dev->base_addr + i);
 
-	printk(KERN_INFO "%s: hardware address %s\n",
-	       dev->name, print_mac(mac, dev->dev_addr));
+	pr_info("%s: hardware address %pM\n",
+	       dev->name, dev->dev_addr);
 
-	dev->open = &elmc_open;
-	dev->stop = &elmc_close;
-	dev->get_stats = &elmc_get_stats;
-	dev->hard_start_xmit = &elmc_send_packet;
-	dev->tx_timeout = &elmc_timeout;
+	dev->netdev_ops = &netdev_ops;
 	dev->watchdog_timeo = HZ;
-#ifdef ELMC_MULTICAST
-	dev->set_multicast_list = &set_multicast_list;
-#else
-	dev->set_multicast_list = NULL;
-#endif
 	dev->ethtool_ops = &netdev_ethtool_ops;
 
 	/* note that we haven't actually requested the IRQ from the kernel.
@@ -579,13 +581,14 @@ err_out:
 	return retval;
 }
 
+#ifdef MODULE
 static void cleanup_card(struct net_device *dev)
 {
-	mca_set_adapter_procfn(((struct priv *) (dev->priv))->slot, NULL, NULL);
+	mca_set_adapter_procfn(((struct priv *)netdev_priv(dev))->slot,
+				NULL, NULL);
 	release_region(dev->base_addr, ELMC_IO_EXTENT);
 }
-
-#ifndef MODULE
+#else
 struct net_device * __init elmc_probe(int unit)
 {
 	struct net_device *dev = alloc_etherdev(sizeof(struct priv));
@@ -617,7 +620,7 @@ static int init586(struct net_device *dev)
 	void *ptr;
 	unsigned long s;
 	int i, result = 0;
-	struct priv *p = (struct priv *) dev->priv;
+	struct priv *p = netdev_priv(dev);
 	volatile struct configure_cmd_struct *cfg_cmd;
 	volatile struct iasetup_cmd_struct *ias_cmd;
 	volatile struct tdr_cmd_struct *tdr_cmd;
@@ -641,10 +644,8 @@ static int init586(struct net_device *dev)
 	cfg_cmd->time_low = 0x00;
 	cfg_cmd->time_high = 0xf2;
 	cfg_cmd->promisc = 0;
-	if (dev->flags & (IFF_ALLMULTI | IFF_PROMISC)) {
+	if (dev->flags & (IFF_ALLMULTI | IFF_PROMISC))
 		cfg_cmd->promisc = 1;
-		dev->flags |= IFF_PROMISC;
-	}
 	cfg_cmd->carr_coll = 0x00;
 
 	p->scb->cbl_offset = make16(cfg_cmd);
@@ -659,7 +660,7 @@ static int init586(struct net_device *dev)
 	}
 
 	if ((cfg_cmd->cmd_status & (STAT_OK | STAT_COMPL)) != (STAT_COMPL | STAT_OK)) {
-		printk(KERN_WARNING "%s (elmc): configure command failed: %x\n", dev->name, cfg_cmd->cmd_status);
+		pr_warning("%s (elmc): configure command failed: %x\n", dev->name, cfg_cmd->cmd_status);
 		return 1;
 	}
 	/*
@@ -685,7 +686,8 @@ static int init586(struct net_device *dev)
 	}
 
 	if ((ias_cmd->cmd_status & (STAT_OK | STAT_COMPL)) != (STAT_OK | STAT_COMPL)) {
-		printk(KERN_WARNING "%s (elmc): individual address setup command failed: %04x\n", dev->name, ias_cmd->cmd_status);
+		pr_warning("%s (elmc): individual address setup command failed: %04x\n",
+			dev->name, ias_cmd->cmd_status);
 		return 1;
 	}
 	/*
@@ -706,7 +708,7 @@ static int init586(struct net_device *dev)
 	s = jiffies;
 	while (!(tdr_cmd->cmd_status & STAT_COMPL)) {
 		if (time_after(jiffies, s + 30*HZ/100)) {
-			printk(KERN_WARNING "%s: %d Problems while running the TDR.\n", dev->name, __LINE__);
+			pr_warning("%s: %d Problems while running the TDR.\n", dev->name, __LINE__);
 			result = 1;
 			break;
 		}
@@ -722,14 +724,14 @@ static int init586(struct net_device *dev)
 		if (result & TDR_LNK_OK) {
 			/* empty */
 		} else if (result & TDR_XCVR_PRB) {
-			printk(KERN_WARNING "%s: TDR: Transceiver problem!\n", dev->name);
+			pr_warning("%s: TDR: Transceiver problem!\n", dev->name);
 		} else if (result & TDR_ET_OPN) {
-			printk(KERN_WARNING "%s: TDR: No correct termination %d clocks away.\n", dev->name, result & TDR_TIMEMASK);
+			pr_warning("%s: TDR: No correct termination %d clocks away.\n", dev->name, result & TDR_TIMEMASK);
 		} else if (result & TDR_ET_SRT) {
 			if (result & TDR_TIMEMASK)	/* time == 0 -> strange :-) */
-				printk(KERN_WARNING "%s: TDR: Detected a short circuit %d clocks away.\n", dev->name, result & TDR_TIMEMASK);
+				pr_warning("%s: TDR: Detected a short circuit %d clocks away.\n", dev->name, result & TDR_TIMEMASK);
 		} else {
-			printk(KERN_WARNING "%s: TDR: Unknown status %04x\n", dev->name, result);
+			pr_warning("%s: TDR: Unknown status %04x\n", dev->name, result);
 		}
 	}
 	/*
@@ -773,11 +775,11 @@ static int init586(struct net_device *dev)
 		/* I don't understand this: do we really need memory after the init? */
 		int len = ((char *) p->iscp - (char *) ptr - 8) / 6;
 		if (len <= 0) {
-			printk(KERN_ERR "%s: Ooooops, no memory for MC-Setup!\n", dev->name);
+			pr_err("%s: Ooooops, no memory for MC-Setup!\n", dev->name);
 		} else {
 			if (len < num_addrs) {
 				num_addrs = len;
-				printk(KERN_WARNING "%s: Sorry, can only apply %d MC-Address(es).\n",
+				pr_warning("%s: Sorry, can only apply %d MC-Address(es).\n",
 				       dev->name, num_addrs);
 			}
 			mc_cmd = (struct mcsetup_cmd_struct *) ptr;
@@ -798,7 +800,7 @@ static int init586(struct net_device *dev)
 					break;
 			}
 			if (!(mc_cmd->cmd_status & STAT_COMPL)) {
-				printk(KERN_WARNING "%s: Can't apply multicast-address-list.\n", dev->name);
+				pr_warning("%s: Can't apply multicast-address-list.\n", dev->name);
 			}
 		}
 	}
@@ -811,7 +813,7 @@ static int init586(struct net_device *dev)
 		p->xmit_buffs[i] = (struct tbd_struct *) ptr;	/* TBD */
 		ptr = (char *) ptr + sizeof(struct tbd_struct);
 		if ((void *) ptr > (void *) p->iscp) {
-			printk(KERN_ERR "%s: not enough shared-mem for your configuration!\n", dev->name);
+			pr_err("%s: not enough shared-mem for your configuration!\n", dev->name);
 			return 1;
 		}
 		memset((char *) (p->xmit_cmds[i]), 0, sizeof(struct transmit_cmd_struct));
@@ -855,7 +857,7 @@ static void *alloc_rfa(struct net_device *dev, void *ptr)
 	volatile struct rfd_struct *rfd = (struct rfd_struct *) ptr;
 	volatile struct rbd_struct *rbd;
 	int i;
-	struct priv *p = (struct priv *) dev->priv;
+	struct priv *p = netdev_priv(dev);
 
 	memset((char *) rfd, 0, sizeof(struct rfd_struct) * p->num_recv_buffs);
 	p->rfd_first = rfd;
@@ -916,7 +918,7 @@ elmc_interrupt(int irq, void *dev_id)
 	}
 	/* reading ELMC_CTRL also clears the INT bit. */
 
-	p = (struct priv *) dev->priv;
+	p = netdev_priv(dev);
 
 	while ((stat = p->scb->status & STAT_MASK))
 	{
@@ -935,7 +937,8 @@ elmc_interrupt(int irq, void *dev_id)
 		if (stat & STAT_CNA) {
 			/* CU went 'not ready' */
 			if (netif_running(dev)) {
-				printk(KERN_WARNING "%s: oops! CU has left active state. stat: %04x/%04x.\n", dev->name, (int) stat, (int) p->scb->status);
+				pr_warning("%s: oops! CU has left active state. stat: %04x/%04x.\n",
+					dev->name, (int) stat, (int) p->scb->status);
 			}
 		}
 #endif
@@ -950,7 +953,8 @@ elmc_interrupt(int irq, void *dev_id)
 				p->scb->cmd = RUC_RESUME;
 				elmc_attn586();
 			} else {
-				printk(KERN_WARNING "%s: Receiver-Unit went 'NOT READY': %04x/%04x.\n", dev->name, (int) stat, (int) p->scb->status);
+				pr_warning("%s: Receiver-Unit went 'NOT READY': %04x/%04x.\n",
+					dev->name, (int) stat, (int) p->scb->status);
 				elmc_rnr_int(dev);
 			}
 		}
@@ -972,7 +976,7 @@ static void elmc_rcv_int(struct net_device *dev)
 	unsigned short totlen;
 	struct sk_buff *skb;
 	struct rbd_struct *rbd;
-	struct priv *p = (struct priv *) dev->priv;
+	struct priv *p = netdev_priv(dev);
 
 	for (; (status = p->rfd_top->status) & STAT_COMPL;) {
 		rbd = (struct rbd_struct *) make32(p->rfd_top->rbd_offset);
@@ -988,19 +992,18 @@ static void elmc_rcv_int(struct net_device *dev)
 					skb_copy_to_linear_data(skb, (char *) p->base+(unsigned long) rbd->buffer,totlen);
 					skb->protocol = eth_type_trans(skb, dev);
 					netif_rx(skb);
-					dev->last_rx = jiffies;
-					p->stats.rx_packets++;
-					p->stats.rx_bytes += totlen;
+					dev->stats.rx_packets++;
+					dev->stats.rx_bytes += totlen;
 				} else {
-					p->stats.rx_dropped++;
+					dev->stats.rx_dropped++;
 				}
 			} else {
-				printk(KERN_WARNING "%s: received oversized frame.\n", dev->name);
-				p->stats.rx_dropped++;
+				pr_warning("%s: received oversized frame.\n", dev->name);
+				dev->stats.rx_dropped++;
 			}
 		} else {	/* frame !(ok), only with 'save-bad-frames' */
-			printk(KERN_WARNING "%s: oops! rfd-error-status: %04x\n", dev->name, status);
-			p->stats.rx_errors++;
+			pr_warning("%s: oops! rfd-error-status: %04x\n", dev->name, status);
+			dev->stats.rx_errors++;
 		}
 		p->rfd_top->status = 0;
 		p->rfd_top->last = RFD_SUSP;
@@ -1016,9 +1019,9 @@ static void elmc_rcv_int(struct net_device *dev)
 
 static void elmc_rnr_int(struct net_device *dev)
 {
-	struct priv *p = (struct priv *) dev->priv;
+	struct priv *p = netdev_priv(dev);
 
-	p->stats.rx_errors++;
+	dev->stats.rx_errors++;
 
 	WAIT_4_SCB_CMD();	/* wait for the last cmd */
 	p->scb->cmd = RUC_ABORT;	/* usually the RU is in the 'no resource'-state .. abort it now. */
@@ -1028,7 +1031,7 @@ static void elmc_rnr_int(struct net_device *dev)
 	alloc_rfa(dev, (char *) p->rfd_first);
 	startrecv586(dev);	/* restart RU */
 
-	printk(KERN_WARNING "%s: Receive-Unit restarted. Status: %04x\n", dev->name, p->scb->status);
+	pr_warning("%s: Receive-Unit restarted. Status: %04x\n", dev->name, p->scb->status);
 
 }
 
@@ -1039,31 +1042,31 @@ static void elmc_rnr_int(struct net_device *dev)
 static void elmc_xmt_int(struct net_device *dev)
 {
 	int status;
-	struct priv *p = (struct priv *) dev->priv;
+	struct priv *p = netdev_priv(dev);
 
 	status = p->xmit_cmds[p->xmit_last]->cmd_status;
 	if (!(status & STAT_COMPL)) {
-		printk(KERN_WARNING "%s: strange .. xmit-int without a 'COMPLETE'\n", dev->name);
+		pr_warning("%s: strange .. xmit-int without a 'COMPLETE'\n", dev->name);
 	}
 	if (status & STAT_OK) {
-		p->stats.tx_packets++;
-		p->stats.collisions += (status & TCMD_MAXCOLLMASK);
+		dev->stats.tx_packets++;
+		dev->stats.collisions += (status & TCMD_MAXCOLLMASK);
 	} else {
-		p->stats.tx_errors++;
+		dev->stats.tx_errors++;
 		if (status & TCMD_LATECOLL) {
-			printk(KERN_WARNING "%s: late collision detected.\n", dev->name);
-			p->stats.collisions++;
+			pr_warning("%s: late collision detected.\n", dev->name);
+			dev->stats.collisions++;
 		} else if (status & TCMD_NOCARRIER) {
-			p->stats.tx_carrier_errors++;
-			printk(KERN_WARNING "%s: no carrier detected.\n", dev->name);
+			dev->stats.tx_carrier_errors++;
+			pr_warning("%s: no carrier detected.\n", dev->name);
 		} else if (status & TCMD_LOSTCTS) {
-			printk(KERN_WARNING "%s: loss of CTS detected.\n", dev->name);
+			pr_warning("%s: loss of CTS detected.\n", dev->name);
 		} else if (status & TCMD_UNDERRUN) {
-			p->stats.tx_fifo_errors++;
-			printk(KERN_WARNING "%s: DMA underrun detected.\n", dev->name);
+			dev->stats.tx_fifo_errors++;
+			pr_warning("%s: DMA underrun detected.\n", dev->name);
 		} else if (status & TCMD_MAXCOLL) {
-			printk(KERN_WARNING "%s: Max. collisions exceeded.\n", dev->name);
-			p->stats.collisions += 16;
+			pr_warning("%s: Max. collisions exceeded.\n", dev->name);
+			dev->stats.collisions += 16;
 		}
 	}
 
@@ -1082,7 +1085,7 @@ static void elmc_xmt_int(struct net_device *dev)
 
 static void startrecv586(struct net_device *dev)
 {
-	struct priv *p = (struct priv *) dev->priv;
+	struct priv *p = netdev_priv(dev);
 
 	p->scb->rfa_offset = make16(p->rfd_first);
 	p->scb->cmd = RUC_START;
@@ -1096,13 +1099,14 @@ static void startrecv586(struct net_device *dev)
 
 static void elmc_timeout(struct net_device *dev)
 {
-	struct priv *p = (struct priv *) dev->priv;
+	struct priv *p = netdev_priv(dev);
 	/* COMMAND-UNIT active? */
 	if (p->scb->status & CU_ACTIVE) {
-#ifdef DEBUG
-		printk("%s: strange ... timeout with CU active?!?\n", dev->name);
-		printk("%s: X0: %04x N0: %04x N1: %04x %d\n", dev->name, (int) p->xmit_cmds[0]->cmd_status, (int) p->nop_cmds[0]->cmd_status, (int) p->nop_cmds[1]->cmd_status, (int) p->nop_point);
-#endif
+		pr_debug("%s: strange ... timeout with CU active?!?\n", dev->name);
+		pr_debug("%s: X0: %04x N0: %04x N1: %04x %d\n", dev->name,
+			(int)p->xmit_cmds[0]->cmd_status,
+			(int)p->nop_cmds[0]->cmd_status,
+			(int)p->nop_cmds[1]->cmd_status, (int)p->nop_point);
 		p->scb->cmd = CUC_ABORT;
 		elmc_attn586();
 		WAIT_4_SCB_CMD();
@@ -1112,10 +1116,10 @@ static void elmc_timeout(struct net_device *dev)
 		WAIT_4_SCB_CMD();
 		netif_wake_queue(dev);
 	} else {
-#ifdef DEBUG
-		printk("%s: xmitter timed out, try to restart! stat: %04x\n", dev->name, p->scb->status);
-		printk("%s: command-stats: %04x %04x\n", dev->name, p->xmit_cmds[0]->cmd_status, p->xmit_cmds[1]->cmd_status);
-#endif
+		pr_debug("%s: xmitter timed out, try to restart! stat: %04x\n",
+			dev->name, p->scb->status);
+		pr_debug("%s: command-stats: %04x %04x\n", dev->name,
+			p->xmit_cmds[0]->cmd_status, p->xmit_cmds[1]->cmd_status);
 		elmc_close(dev);
 		elmc_open(dev);
 	}
@@ -1125,14 +1129,14 @@ static void elmc_timeout(struct net_device *dev)
  * send frame
  */
 
-static int elmc_send_packet(struct sk_buff *skb, struct net_device *dev)
+static netdev_tx_t elmc_send_packet(struct sk_buff *skb, struct net_device *dev)
 {
 	int len;
 	int i;
 #ifndef NO_NOPCOMMANDS
 	int next_nop;
 #endif
-	struct priv *p = (struct priv *) dev->priv;
+	struct priv *p = netdev_priv(dev);
 
 	netif_stop_queue(dev);
 
@@ -1162,7 +1166,7 @@ static int elmc_send_packet(struct sk_buff *skb, struct net_device *dev)
 			break;
 		}
 		if (i == 15) {
-			printk(KERN_WARNING "%s: Can't start transmit-command.\n", dev->name);
+			pr_warning("%s: Can't start transmit-command.\n", dev->name);
 		}
 	}
 #else
@@ -1194,7 +1198,7 @@ static int elmc_send_packet(struct sk_buff *skb, struct net_device *dev)
 		netif_wake_queue(dev);
 	dev_kfree_skb(skb);
 #endif
-	return 0;
+	return NETDEV_TX_OK;
 }
 
 /*******************************************
@@ -1203,7 +1207,7 @@ static int elmc_send_packet(struct sk_buff *skb, struct net_device *dev)
 
 static struct net_device_stats *elmc_get_stats(struct net_device *dev)
 {
-	struct priv *p = (struct priv *) dev->priv;
+	struct priv *p = netdev_priv(dev);
 	unsigned short crc, aln, rsc, ovrn;
 
 	crc = p->scb->crc_errs;	/* get error-statistic from the ni82586 */
@@ -1215,12 +1219,12 @@ static struct net_device_stats *elmc_get_stats(struct net_device *dev)
 	ovrn = p->scb->ovrn_errs;
 	p->scb->ovrn_errs -= ovrn;
 
-	p->stats.rx_crc_errors += crc;
-	p->stats.rx_fifo_errors += ovrn;
-	p->stats.rx_frame_errors += aln;
-	p->stats.rx_dropped += rsc;
+	dev->stats.rx_crc_errors += crc;
+	dev->stats.rx_fifo_errors += ovrn;
+	dev->stats.rx_frame_errors += aln;
+	dev->stats.rx_dropped += rsc;
 
-	return &p->stats;
+	return &dev->stats;
 }
 
 /********************************************************
@@ -1287,11 +1291,12 @@ int __init init_module(void)
 		free_netdev(dev);
 		if (io[this_dev]==0)
 			break;
-		printk(KERN_WARNING "3c523.c: No 3c523 card found at io=%#x\n",io[this_dev]);
+		pr_warning("3c523.c: No 3c523 card found at io=%#x\n",io[this_dev]);
 	}
 
 	if(found==0) {
-		if(io[0]==0) printk(KERN_NOTICE "3c523.c: No 3c523 cards found\n");
+		if (io[0]==0)
+			pr_notice("3c523.c: No 3c523 cards found\n");
 		return -ENXIO;
 	} else return 0;
 }

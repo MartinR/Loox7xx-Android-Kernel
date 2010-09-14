@@ -8,7 +8,7 @@
  *	it under the terms of the GNU General Public License as published by
  *	the Free Software Foundation; either version 2 of the License, or
  *	(at your option) any later version.
- * 
+ *
  */
 
 #ifndef IO_TABLES_H
@@ -90,10 +90,10 @@ static struct usb_device_id id_table_combined [] = {
 	{ USB_DEVICE(USB_VENDOR_ID_AXIOHM, AXIOHM_DEVICE_ID_EPIC_A758) },
 	{ USB_DEVICE(USB_VENDOR_ID_AXIOHM, AXIOHM_DEVICE_ID_EPIC_A794) },
 	{ USB_DEVICE(USB_VENDOR_ID_AXIOHM, AXIOHM_DEVICE_ID_EPIC_A225) },
-	{ }							/* Terminating entry */
+	{ } /* Terminating entry */
 };
 
-MODULE_DEVICE_TABLE (usb, id_table_combined);
+MODULE_DEVICE_TABLE(usb, id_table_combined);
 
 static struct usb_driver io_driver = {
 	.name =		"io_edgeport",
@@ -117,7 +117,8 @@ static struct usb_serial_driver edgeport_2port_device = {
 	.throttle		= edge_throttle,
 	.unthrottle		= edge_unthrottle,
 	.attach			= edge_startup,
-	.shutdown		= edge_shutdown,
+	.disconnect		= edge_disconnect,
+	.release		= edge_release,
 	.ioctl			= edge_ioctl,
 	.set_termios		= edge_set_termios,
 	.tiocmget		= edge_tiocmget,
@@ -145,7 +146,8 @@ static struct usb_serial_driver edgeport_4port_device = {
 	.throttle		= edge_throttle,
 	.unthrottle		= edge_unthrottle,
 	.attach			= edge_startup,
-	.shutdown		= edge_shutdown,
+	.disconnect		= edge_disconnect,
+	.release		= edge_release,
 	.ioctl			= edge_ioctl,
 	.set_termios		= edge_set_termios,
 	.tiocmget		= edge_tiocmget,
@@ -173,7 +175,8 @@ static struct usb_serial_driver edgeport_8port_device = {
 	.throttle		= edge_throttle,
 	.unthrottle		= edge_unthrottle,
 	.attach			= edge_startup,
-	.shutdown		= edge_shutdown,
+	.disconnect		= edge_disconnect,
+	.release		= edge_release,
 	.ioctl			= edge_ioctl,
 	.set_termios		= edge_set_termios,
 	.tiocmget		= edge_tiocmget,
@@ -200,7 +203,8 @@ static struct usb_serial_driver epic_device = {
 	.throttle		= edge_throttle,
 	.unthrottle		= edge_unthrottle,
 	.attach			= edge_startup,
-	.shutdown		= edge_shutdown,
+	.disconnect		= edge_disconnect,
+	.release		= edge_release,
 	.ioctl			= edge_ioctl,
 	.set_termios		= edge_set_termios,
 	.tiocmget		= edge_tiocmget,

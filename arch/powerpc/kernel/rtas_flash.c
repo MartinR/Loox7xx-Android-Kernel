@@ -286,7 +286,7 @@ static ssize_t rtas_flash_read(struct file *file, char __user *buf,
 }
 
 /* constructor for flash_block_cache */
-void rtas_block_ctor(struct kmem_cache *cache, void *ptr)
+void rtas_block_ctor(void *ptr)
 {
 	memset(ptr, 0, RTAS_BLK_SIZE);
 }
@@ -669,7 +669,6 @@ static void remove_flash_pde(struct proc_dir_entry *dp)
 {
 	if (dp) {
 		kfree(dp->data);
-		dp->owner = NULL;
 		remove_proc_entry(dp->name, dp->parent);
 	}
 }
@@ -731,7 +730,7 @@ static const struct file_operations validate_flash_operations = {
 	.release	= validate_flash_release,
 };
 
-int __init rtas_flash_init(void)
+static int __init rtas_flash_init(void)
 {
 	int rc;
 
@@ -817,7 +816,7 @@ cleanup:
 	return rc;
 }
 
-void __exit rtas_flash_cleanup(void)
+static void __exit rtas_flash_cleanup(void)
 {
 	rtas_flash_term_hook = NULL;
 

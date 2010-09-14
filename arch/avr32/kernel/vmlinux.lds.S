@@ -68,14 +68,6 @@ SECTIONS
 		_evba = .;
 		_text = .;
 		*(.ex.text)
-		. = 0x50;
-		*(.tlbx.ex.text)
-		. = 0x60;
-		*(.tlbr.ex.text)
-		. = 0x70;
-		*(.tlbw.ex.text)
-		. = 0x100;
-		*(.scall.text)
 		*(.irq.text)
 		KPROBES_TEXT
 		TEXT_TEXT
@@ -93,8 +85,6 @@ SECTIONS
 		__stop___ex_table = .;
 	}
 
-	BUG_TABLE
-
 	RODATA
 
 	. = ALIGN(THREAD_SIZE);
@@ -106,6 +96,10 @@ SECTIONS
 		 * First, the init task union, aligned to an 8K boundary.
 		 */
 		*(.data.init_task)
+
+		/* Then, the page-aligned data */
+		. = ALIGN(PAGE_SIZE);
+		*(.data.page_aligned)
 
 		/* Then, the cacheline aligned data */
 		. = ALIGN(L1_CACHE_BYTES);
@@ -130,14 +124,11 @@ SECTIONS
 		_end = .;
 	}
 
+	DWARF_DEBUG
+
 	/* When something in the kernel is NOT compiled as a module, the module
 	 * cleanup code and data are put into these segments. Both can then be
 	 * thrown away, as cleanup code is never called unless it's a module.
 	 */
-	/DISCARD/       	: {
-		EXIT_DATA
-		*(.exitcall.exit)
-	}
-
-	DWARF_DEBUG
+	DISCARDS
 }

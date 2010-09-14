@@ -17,6 +17,7 @@
 #include <linux/ssb/ssb_driver_gige.h>
 #include <linux/dma-mapping.h>
 #include <linux/pci.h>
+#include <linux/mmc/sdio_func.h>
 
 #include <pcmcia/cs_types.h>
 #include <pcmcia/cs.h>
@@ -87,6 +88,25 @@ found:
 	return bus;
 }
 #endif /* CONFIG_SSB_PCMCIAHOST */
+
+#ifdef CONFIG_SSB_SDIOHOST
+struct ssb_bus *ssb_sdio_func_to_bus(struct sdio_func *func)
+{
+	struct ssb_bus *bus;
+
+	ssb_buses_lock();
+	list_for_each_entry(bus, &buses, list) {
+		if (bus->bustype == SSB_BUSTYPE_SDIO &&
+		    bus->host_sdio == func)
+			goto found;
+	}
+	bus = NULL;
+found:
+	ssb_buses_unlock();
+
+	return bus;
+}
+#endif /* CONFIG_SSB_SDIOHOST */
 
 int ssb_for_each_bus_call(unsigned long data,
 			  int (*func)(struct ssb_bus *bus, unsigned long data))
@@ -226,7 +246,7 @@ int ssb_devices_freeze(struct ssb_bus *bus)
 		err = drv->suspend(dev, state);
 		if (err) {
 			ssb_printk(KERN_ERR PFX "Failed to freeze device %s\n",
-				   dev->dev->bus_id);
+				   dev_name(dev->dev));
 			goto err_unwind;
 		}
 	}
@@ -269,7 +289,7 @@ int ssb_devices_thaw(struct ssb_bus *bus)
 		err = drv->resume(dev);
 		if (err) {
 			ssb_printk(KERN_ERR PFX "Failed to thaw device %s\n",
-				   dev->dev->bus_id);
+				   dev_name(dev->dev));
 		}
 	}
 
@@ -454,26 +474,29 @@ static int ssb_devices_register(struct ssb_bus *bus)
 
 		dev->release = ssb_release_dev;
 		dev->bus = &ssb_bustype;
-		snprintf(dev->bus_id, sizeof(dev->bus_id),
-			 "ssb%u:%d", bus->busnumber, dev_idx);
+		dev_set_name(dev, "ssb%u:%d", bus->busnumber, dev_idx);
 
 		switch (bus->bustype) {
 		case SSB_BUSTYPE_PCI:
 #ifdef CONFIG_SSB_PCIHOST
 			sdev->irq = bus->host_pci->irq;
 			dev->parent = &bus->host_pci->dev;
-			sdev->dma_dev = &bus->host_pci->dev;
 #endif
 			break;
 		case SSB_BUSTYPE_PCMCIA:
 #ifdef CONFIG_SSB_PCMCIAHOST
 			sdev->irq = bus->host_pcmcia->irq.AssignedIRQ;
 			dev->parent = &bus->host_pcmcia->dev;
-			sdev->dma_dev = &bus->host_pcmcia->dev;
+#endif
+			break;
+		case SSB_BUSTYPE_SDIO:
+#ifdef CONFIG_SSB_SDIO
+			sdev->irq = bus->host_sdio->dev.irq;
+			dev->parent = &bus->host_sdio->dev;
 #endif
 			break;
 		case SSB_BUSTYPE_SSB:
-			sdev->dma_dev = dev;
+			dev->dma_mask = &dev->coherent_dma_mask;
 			break;
 		}
 
@@ -482,7 +505,7 @@ static int ssb_devices_register(struct ssb_bus *bus)
 		if (err) {
 			ssb_printk(KERN_ERR PFX
 				   "Could not register %s\n",
-				   dev->bus_id);
+				   dev_name(dev));
 			/* Set dev to NULL to not unregister
 			 * dev on error unwinding. */
 			sdev->dev = NULL;
@@ -727,12 +750,18 @@ static int ssb_bus_register(struct ssb_bus *bus,
 	err = ssb_pci_xtal(bus, SSB_GPIO_XTAL | SSB_GPIO_PLL, 1);
 	if (err)
 		goto out;
+
+	/* Init SDIO-host device (if any), before the scan */
+	err = ssb_sdio_init(bus);
+	if (err)
+		goto err_disable_xtal;
+
 	ssb_buses_lock();
 	bus->busnumber = next_busnumber;
 	/* Scan for devices (cores) */
 	err = ssb_bus_scan(bus, baseaddr);
 	if (err)
-		goto err_disable_xtal;
+		goto err_sdio_exit;
 
 	/* Init PCI-host device (if any) */
 	err = ssb_pci_init(bus);
@@ -779,6 +808,8 @@ err_pci_exit:
 	ssb_pci_exit(bus);
 err_unmap:
 	ssb_iounmap(bus);
+err_sdio_exit:
+	ssb_sdio_exit(bus);
 err_disable_xtal:
 	ssb_buses_unlock();
 	ssb_pci_xtal(bus, SSB_GPIO_XTAL | SSB_GPIO_PLL, 0);
@@ -798,7 +829,7 @@ int ssb_bus_pcibus_register(struct ssb_bus *bus,
 	err = ssb_bus_register(bus, ssb_pci_get_invariants, 0);
 	if (!err) {
 		ssb_printk(KERN_INFO PFX "Sonics Silicon Backplane found on "
-			   "PCI device %s\n", host_pci->dev.bus_id);
+			   "PCI device %s\n", dev_name(&host_pci->dev));
 	}
 
 	return err;
@@ -826,6 +857,28 @@ int ssb_bus_pcmciabus_register(struct ssb_bus *bus,
 	return err;
 }
 EXPORT_SYMBOL(ssb_bus_pcmciabus_register);
+#endif /* CONFIG_SSB_PCMCIAHOST */
+
+#ifdef CONFIG_SSB_SDIOHOST
+int ssb_bus_sdiobus_register(struct ssb_bus *bus, struct sdio_func *func,
+			     unsigned int quirks)
+{
+	int err;
+
+	bus->bustype = SSB_BUSTYPE_SDIO;
+	bus->host_sdio = func;
+	bus->ops = &ssb_sdio_ops;
+	bus->quirks = quirks;
+
+	err = ssb_bus_register(bus, ssb_sdio_get_invariants, ~0);
+	if (!err) {
+		ssb_printk(KERN_INFO PFX "Sonics Silicon Backplane found on "
+			   "SDIO device %s\n", sdio_func_id(func));
+	}
+
+	return err;
+}
+EXPORT_SYMBOL(ssb_bus_sdiobus_register);
 #endif /* CONFIG_SSB_PCMCIAHOST */
 
 int ssb_bus_ssbbus_register(struct ssb_bus *bus,
@@ -1156,35 +1209,89 @@ u32 ssb_dma_translation(struct ssb_device *dev)
 {
 	switch (dev->bus->bustype) {
 	case SSB_BUSTYPE_SSB:
-	case SSB_BUSTYPE_PCMCIA:
 		return 0;
 	case SSB_BUSTYPE_PCI:
 		return SSB_PCI_DMA;
+	default:
+		__ssb_dma_not_implemented(dev);
 	}
 	return 0;
 }
 EXPORT_SYMBOL(ssb_dma_translation);
 
-int ssb_dma_set_mask(struct ssb_device *ssb_dev, u64 mask)
+int ssb_dma_set_mask(struct ssb_device *dev, u64 mask)
 {
-	struct device *dma_dev = ssb_dev->dma_dev;
-	int err = 0;
-
 #ifdef CONFIG_SSB_PCIHOST
-	if (ssb_dev->bus->bustype == SSB_BUSTYPE_PCI) {
-		err = pci_set_dma_mask(ssb_dev->bus->host_pci, mask);
+	int err;
+#endif
+
+	switch (dev->bus->bustype) {
+	case SSB_BUSTYPE_PCI:
+#ifdef CONFIG_SSB_PCIHOST
+		err = pci_set_dma_mask(dev->bus->host_pci, mask);
 		if (err)
 			return err;
-		err = pci_set_consistent_dma_mask(ssb_dev->bus->host_pci, mask);
+		err = pci_set_consistent_dma_mask(dev->bus->host_pci, mask);
 		return err;
-	}
 #endif
-	dma_dev->coherent_dma_mask = mask;
-	dma_dev->dma_mask = &dma_dev->coherent_dma_mask;
-
-	return err;
+	case SSB_BUSTYPE_SSB:
+		return dma_set_mask(dev->dev, mask);
+	default:
+		__ssb_dma_not_implemented(dev);
+	}
+	return -ENOSYS;
 }
 EXPORT_SYMBOL(ssb_dma_set_mask);
+
+void * ssb_dma_alloc_consistent(struct ssb_device *dev, size_t size,
+				dma_addr_t *dma_handle, gfp_t gfp_flags)
+{
+	switch (dev->bus->bustype) {
+	case SSB_BUSTYPE_PCI:
+#ifdef CONFIG_SSB_PCIHOST
+		if (gfp_flags & GFP_DMA) {
+			/* Workaround: The PCI API does not support passing
+			 * a GFP flag. */
+			return dma_alloc_coherent(&dev->bus->host_pci->dev,
+						  size, dma_handle, gfp_flags);
+		}
+		return pci_alloc_consistent(dev->bus->host_pci, size, dma_handle);
+#endif
+	case SSB_BUSTYPE_SSB:
+		return dma_alloc_coherent(dev->dev, size, dma_handle, gfp_flags);
+	default:
+		__ssb_dma_not_implemented(dev);
+	}
+	return NULL;
+}
+EXPORT_SYMBOL(ssb_dma_alloc_consistent);
+
+void ssb_dma_free_consistent(struct ssb_device *dev, size_t size,
+			     void *vaddr, dma_addr_t dma_handle,
+			     gfp_t gfp_flags)
+{
+	switch (dev->bus->bustype) {
+	case SSB_BUSTYPE_PCI:
+#ifdef CONFIG_SSB_PCIHOST
+		if (gfp_flags & GFP_DMA) {
+			/* Workaround: The PCI API does not support passing
+			 * a GFP flag. */
+			dma_free_coherent(&dev->bus->host_pci->dev,
+					  size, vaddr, dma_handle);
+			return;
+		}
+		pci_free_consistent(dev->bus->host_pci, size,
+				    vaddr, dma_handle);
+		return;
+#endif
+	case SSB_BUSTYPE_SSB:
+		dma_free_coherent(dev->dev, size, vaddr, dma_handle);
+		return;
+	default:
+		__ssb_dma_not_implemented(dev);
+	}
+}
+EXPORT_SYMBOL(ssb_dma_free_consistent);
 
 int ssb_bus_may_powerdown(struct ssb_bus *bus)
 {
@@ -1307,8 +1414,10 @@ static int __init ssb_modinit(void)
 	ssb_buses_lock();
 	err = ssb_attach_queued_buses();
 	ssb_buses_unlock();
-	if (err)
+	if (err) {
 		bus_unregister(&ssb_bustype);
+		goto out;
+	}
 
 	err = b43_pci_ssb_bridge_init();
 	if (err) {
@@ -1324,7 +1433,7 @@ static int __init ssb_modinit(void)
 		/* don't fail SSB init because of this */
 		err = 0;
 	}
-
+out:
 	return err;
 }
 /* ssb must be initialized after PCI but before the ssb drivers.

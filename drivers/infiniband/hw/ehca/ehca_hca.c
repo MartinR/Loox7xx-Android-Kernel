@@ -114,7 +114,9 @@ int ehca_query_device(struct ib_device *ibdev, struct ib_device_attr *props)
 	}
 
 	props->max_pkeys           = 16;
-	props->local_ca_ack_delay  = min_t(u8, rblock->local_ca_ack_delay, 255);
+	/* Some FW versions say 0 here; insert sensible value in that case */
+	props->local_ca_ack_delay  = rblock->local_ca_ack_delay ?
+		min_t(u8, rblock->local_ca_ack_delay, 255) : 12;
 	props->max_raw_ipv6_qp     = limit_uint(rblock->max_raw_ipv6_qp);
 	props->max_raw_ethy_qp     = limit_uint(rblock->max_raw_ethy_qp);
 	props->max_mcast_grp       = limit_uint(rblock->max_mcast_grp);
@@ -317,7 +319,7 @@ int ehca_query_gid(struct ib_device *ibdev, u8 port,
 					      ib_device);
 	struct hipz_query_port *rblock;
 
-	if (index > 255) {
+	if (index < 0 || index > 255) {
 		ehca_err(&shca->ib_device, "Invalid index: %x.", index);
 		return -EINVAL;
 	}
@@ -391,7 +393,7 @@ int ehca_modify_port(struct ib_device *ibdev,
 	hret = hipz_h_modify_port(shca->ipz_hca_handle, port,
 				  cap, props->init_type, port_modify_mask);
 	if (hret != H_SUCCESS) {
-		ehca_err(&shca->ib_device, "Modify port failed  h_ret=%li",
+		ehca_err(&shca->ib_device, "Modify port failed  h_ret=%lli",
 			 hret);
 		ret = -EINVAL;
 	}

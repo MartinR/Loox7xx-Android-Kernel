@@ -10,7 +10,7 @@
 #include <linux/circ_buf.h>
 #include <asm/termios.h>
 #include <asm/dma.h>
-#include <asm/arch/io_interface_mux.h>
+#include <arch/io_interface_mux.h>
 
 /* Software state per channel */
 
@@ -36,8 +36,9 @@ struct etrax_recv_buffer {
 };
 
 struct e100_serial {
+	struct tty_port port;
 	int baud;
-	volatile u8	*port;	/* R_SERIALx_CTRL */
+	volatile u8	*ioport;	/* R_SERIALx_CTRL */
 	u32		irq;	/* bitnr in R_IRQ_MASK2 for dmaX_descr */
 
 	/* Output registers */
@@ -124,7 +125,7 @@ struct e100_serial {
 	int errorcode;
 
 #ifdef CONFIG_ETRAX_RS485
-	struct rs485_control	rs485;  /* RS-485 support */
+	struct serial_rs485	rs485;  /* RS-485 support */
 #endif
 };
 

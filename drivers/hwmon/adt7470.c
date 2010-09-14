@@ -28,6 +28,7 @@
 #include <linux/mutex.h>
 #include <linux/delay.h>
 #include <linux/log2.h>
+#include <linux/kthread.h>
 
 /* Addresses to scan */
 static const unsigned short normal_i2c[] = { 0x2C, 0x2E, 0x2F, I2C_CLIENT_END };
@@ -74,6 +75,7 @@ I2C_CLIENT_INSMOD_1(adt7470);
 #define ADT7470_REG_PWM12_CFG			0x68
 #define		ADT7470_PWM2_AUTO_MASK		0x40
 #define		ADT7470_PWM1_AUTO_MASK		0x80
+#define		ADT7470_PWM_AUTO_MASK		0xC0
 #define ADT7470_REG_PWM34_CFG			0x69
 #define		ADT7470_PWM3_AUTO_MASK		0x40
 #define		ADT7470_PWM4_AUTO_MASK		0x80
@@ -128,8 +130,11 @@ I2C_CLIENT_INSMOD_1(adt7470);
 /* How often do we reread sensor limit values? (In jiffies) */
 #define LIMIT_REFRESH_INTERVAL	(60 * HZ)
 
-/* sleep 1s while gathering temperature data */
-#define TEMP_COLLECTION_TIME	1000
+/* Wait at least 200ms per sensor for 10 sensors */
+#define TEMP_COLLECTION_TIME	2000
+
+/* auto update thing won't fire more than every 2s */
+#define AUTO_UPDATE_INTERVAL	2000
 
 /* datasheet says to divide this number by the fan reading to get fan rpm */
 #define FAN_PERIOD_TO_RPM(x)	((90000 * 60) / (x))
@@ -138,7 +143,6 @@ I2C_CLIENT_INSMOD_1(adt7470);
 #define FAN_DATA_VALID(x)	((x) && (x) != FAN_PERIOD_INVALID)
 
 struct adt7470_data {
-	struct i2c_client	client;
 	struct device		*hwmon_dev;
 	struct attribute_group	attrs;
 	struct mutex		lock;
@@ -146,6 +150,9 @@ struct adt7470_data {
 	char			limits_valid;
 	unsigned long		sensors_last_updated;	/* In jiffies */
 	unsigned long		limits_last_updated;	/* In jiffies */
+
+	int			num_temp_sensors;	/* -1 = probe */
+	int			temperatures_probed;
 
 	s8			temp[ADT7470_TEMP_COUNT];
 	s8			temp_min[ADT7470_TEMP_COUNT];
@@ -162,18 +169,34 @@ struct adt7470_data {
 	u8			pwm_min[ADT7470_PWM_COUNT];
 	s8			pwm_tmin[ADT7470_PWM_COUNT];
 	u8			pwm_auto_temp[ADT7470_PWM_COUNT];
+
+	struct task_struct	*auto_update;
+	struct completion	auto_update_stop;
+	unsigned int		auto_update_interval;
 };
 
-static int adt7470_attach_adapter(struct i2c_adapter *adapter);
-static int adt7470_detect(struct i2c_adapter *adapter, int address, int kind);
-static int adt7470_detach_client(struct i2c_client *client);
+static int adt7470_probe(struct i2c_client *client,
+			 const struct i2c_device_id *id);
+static int adt7470_detect(struct i2c_client *client, int kind,
+			  struct i2c_board_info *info);
+static int adt7470_remove(struct i2c_client *client);
+
+static const struct i2c_device_id adt7470_id[] = {
+	{ "adt7470", adt7470 },
+	{ }
+};
+MODULE_DEVICE_TABLE(i2c, adt7470_id);
 
 static struct i2c_driver adt7470_driver = {
+	.class		= I2C_CLASS_HWMON,
 	.driver = {
 		.name	= "adt7470",
 	},
-	.attach_adapter	= adt7470_attach_adapter,
-	.detach_client	= adt7470_detach_client,
+	.probe		= adt7470_probe,
+	.remove		= adt7470_remove,
+	.id_table	= adt7470_id,
+	.detect		= adt7470_detect,
+	.address_data	= &addr_data,
 };
 
 /*
@@ -207,6 +230,88 @@ static void adt7470_init_client(struct i2c_client *client)
 	}
 }
 
+/* Probe for temperature sensors.  Assumes lock is held */
+static int adt7470_read_temperatures(struct i2c_client *client,
+				     struct adt7470_data *data)
+{
+	unsigned long res;
+	int i;
+	u8 cfg, pwm[4], pwm_cfg[2];
+
+	/* save pwm[1-4] config register */
+	pwm_cfg[0] = i2c_smbus_read_byte_data(client, ADT7470_REG_PWM_CFG(0));
+	pwm_cfg[1] = i2c_smbus_read_byte_data(client, ADT7470_REG_PWM_CFG(2));
+
+	/* set manual pwm to whatever it is set to now */
+	for (i = 0; i < ADT7470_FAN_COUNT; i++)
+		pwm[i] = i2c_smbus_read_byte_data(client, ADT7470_REG_PWM(i));
+
+	/* put pwm in manual mode */
+	i2c_smbus_write_byte_data(client, ADT7470_REG_PWM_CFG(0),
+		pwm_cfg[0] & ~(ADT7470_PWM_AUTO_MASK));
+	i2c_smbus_write_byte_data(client, ADT7470_REG_PWM_CFG(2),
+		pwm_cfg[1] & ~(ADT7470_PWM_AUTO_MASK));
+
+	/* write pwm control to whatever it was */
+	for (i = 0; i < ADT7470_FAN_COUNT; i++)
+		i2c_smbus_write_byte_data(client, ADT7470_REG_PWM(i), pwm[i]);
+
+	/* start reading temperature sensors */
+	cfg = i2c_smbus_read_byte_data(client, ADT7470_REG_CFG);
+	cfg |= 0x80;
+	i2c_smbus_write_byte_data(client, ADT7470_REG_CFG, cfg);
+
+	/* Delay is 200ms * number of temp sensors. */
+	res = msleep_interruptible((data->num_temp_sensors >= 0 ?
+				    data->num_temp_sensors * 200 :
+				    TEMP_COLLECTION_TIME));
+
+	/* done reading temperature sensors */
+	cfg = i2c_smbus_read_byte_data(client, ADT7470_REG_CFG);
+	cfg &= ~0x80;
+	i2c_smbus_write_byte_data(client, ADT7470_REG_CFG, cfg);
+
+	/* restore pwm[1-4] config registers */
+	i2c_smbus_write_byte_data(client, ADT7470_REG_PWM_CFG(0), pwm_cfg[0]);
+	i2c_smbus_write_byte_data(client, ADT7470_REG_PWM_CFG(2), pwm_cfg[1]);
+
+	if (res) {
+		printk(KERN_ERR "ha ha, interrupted");
+		return -EAGAIN;
+	}
+
+	/* Only count fans if we have to */
+	if (data->num_temp_sensors >= 0)
+		return 0;
+
+	for (i = 0; i < ADT7470_TEMP_COUNT; i++) {
+		data->temp[i] = i2c_smbus_read_byte_data(client,
+						ADT7470_TEMP_REG(i));
+		if (data->temp[i])
+			data->num_temp_sensors = i + 1;
+	}
+	data->temperatures_probed = 1;
+	return 0;
+}
+
+static int adt7470_update_thread(void *p)
+{
+	struct i2c_client *client = p;
+	struct adt7470_data *data = i2c_get_clientdata(client);
+
+	while (!kthread_should_stop()) {
+		mutex_lock(&data->lock);
+		adt7470_read_temperatures(client, data);
+		mutex_unlock(&data->lock);
+		if (kthread_should_stop())
+			break;
+		msleep_interruptible(data->auto_update_interval);
+	}
+
+	complete_all(&data->auto_update_stop);
+	return 0;
+}
+
 static struct adt7470_data *adt7470_update_device(struct device *dev)
 {
 	struct i2c_client *client = to_i2c_client(dev);
@@ -214,32 +319,36 @@ static struct adt7470_data *adt7470_update_device(struct device *dev)
 	unsigned long local_jiffies = jiffies;
 	u8 cfg;
 	int i;
-
-	mutex_lock(&data->lock);
-	if (time_before(local_jiffies, data->sensors_last_updated +
-		SENSOR_REFRESH_INTERVAL)
-		&& data->sensors_valid)
-		goto no_sensor_update;
-
-	/* start reading temperature sensors */
-	cfg = i2c_smbus_read_byte_data(client, ADT7470_REG_CFG);
-	cfg |= 0x80;
-	i2c_smbus_write_byte_data(client, ADT7470_REG_CFG, cfg);
+	int need_sensors = 1;
+	int need_limits = 1;
 
 	/*
-	 * Delay is 200ms * number of tmp05 sensors.  Too bad
-	 * there's no way to figure out how many are connected.
-	 * For now, assume 1s will work.
+	 * Figure out if we need to update the shadow registers.
+	 * Lockless means that we may occasionally report out of
+	 * date data.
 	 */
-	msleep(TEMP_COLLECTION_TIME);
+	if (time_before(local_jiffies, data->sensors_last_updated +
+			SENSOR_REFRESH_INTERVAL) &&
+	    data->sensors_valid)
+		need_sensors = 0;
 
-	/* done reading temperature sensors */
-	cfg = i2c_smbus_read_byte_data(client, ADT7470_REG_CFG);
-	cfg &= ~0x80;
-	i2c_smbus_write_byte_data(client, ADT7470_REG_CFG, cfg);
+	if (time_before(local_jiffies, data->limits_last_updated +
+			LIMIT_REFRESH_INTERVAL) &&
+	    data->limits_valid)
+		need_limits = 0;
 
-	for (i = 0; i < ADT7470_TEMP_COUNT; i++)
-		data->temp[i] = i2c_smbus_read_byte_data(client,
+	if (!need_sensors && !need_limits)
+		return data;
+
+	mutex_lock(&data->lock);
+	if (!need_sensors)
+		goto no_sensor_update;
+
+	if (!data->temperatures_probed)
+		adt7470_read_temperatures(client, data);
+	else
+		for (i = 0; i < ADT7470_TEMP_COUNT; i++)
+			data->temp[i] = i2c_smbus_read_byte_data(client,
 						ADT7470_TEMP_REG(i));
 
 	for (i = 0; i < ADT7470_FAN_COUNT; i++)
@@ -289,9 +398,7 @@ static struct adt7470_data *adt7470_update_device(struct device *dev)
 	data->sensors_valid = 1;
 
 no_sensor_update:
-	if (time_before(local_jiffies, data->limits_last_updated +
-		LIMIT_REFRESH_INTERVAL)
-		&& data->limits_valid)
+	if (!need_limits)
 		goto out;
 
 	for (i = 0; i < ADT7470_TEMP_COUNT; i++) {
@@ -325,6 +432,66 @@ out:
 	return data;
 }
 
+static ssize_t show_auto_update_interval(struct device *dev,
+					 struct device_attribute *devattr,
+					 char *buf)
+{
+	struct adt7470_data *data = adt7470_update_device(dev);
+	return sprintf(buf, "%d\n", data->auto_update_interval);
+}
+
+static ssize_t set_auto_update_interval(struct device *dev,
+					struct device_attribute *devattr,
+					const char *buf,
+					size_t count)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct adt7470_data *data = i2c_get_clientdata(client);
+	long temp;
+
+	if (strict_strtol(buf, 10, &temp))
+		return -EINVAL;
+
+	temp = SENSORS_LIMIT(temp, 0, 60000);
+
+	mutex_lock(&data->lock);
+	data->auto_update_interval = temp;
+	mutex_unlock(&data->lock);
+
+	return count;
+}
+
+static ssize_t show_num_temp_sensors(struct device *dev,
+				     struct device_attribute *devattr,
+				     char *buf)
+{
+	struct adt7470_data *data = adt7470_update_device(dev);
+	return sprintf(buf, "%d\n", data->num_temp_sensors);
+}
+
+static ssize_t set_num_temp_sensors(struct device *dev,
+				    struct device_attribute *devattr,
+				    const char *buf,
+				    size_t count)
+{
+	struct i2c_client *client = to_i2c_client(dev);
+	struct adt7470_data *data = i2c_get_clientdata(client);
+	long temp;
+
+	if (strict_strtol(buf, 10, &temp))
+		return -EINVAL;
+
+	temp = SENSORS_LIMIT(temp, -1, 10);
+
+	mutex_lock(&data->lock);
+	data->num_temp_sensors = temp;
+	if (temp < 0)
+		data->temperatures_probed = 0;
+	mutex_unlock(&data->lock);
+
+	return count;
+}
+
 static ssize_t show_temp_min(struct device *dev,
 			     struct device_attribute *devattr,
 			     char *buf)
@@ -342,7 +509,13 @@ static ssize_t set_temp_min(struct device *dev,
 	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
 	struct i2c_client *client = to_i2c_client(dev);
 	struct adt7470_data *data = i2c_get_clientdata(client);
-	int temp = simple_strtol(buf, NULL, 10) / 1000;
+	long temp;
+
+	if (strict_strtol(buf, 10, &temp))
+		return -EINVAL;
+
+	temp = DIV_ROUND_CLOSEST(temp, 1000);
+	temp = SENSORS_LIMIT(temp, 0, 255);
 
 	mutex_lock(&data->lock);
 	data->temp_min[attr->index] = temp;
@@ -370,7 +543,13 @@ static ssize_t set_temp_max(struct device *dev,
 	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
 	struct i2c_client *client = to_i2c_client(dev);
 	struct adt7470_data *data = i2c_get_clientdata(client);
-	int temp = simple_strtol(buf, NULL, 10) / 1000;
+	long temp;
+
+	if (strict_strtol(buf, 10, &temp))
+		return -EINVAL;
+
+	temp = DIV_ROUND_CLOSEST(temp, 1000);
+	temp = SENSORS_LIMIT(temp, 0, 255);
 
 	mutex_lock(&data->lock);
 	data->temp_max[attr->index] = temp;
@@ -419,11 +598,13 @@ static ssize_t set_fan_max(struct device *dev,
 	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
 	struct i2c_client *client = to_i2c_client(dev);
 	struct adt7470_data *data = i2c_get_clientdata(client);
-	int temp = simple_strtol(buf, NULL, 10);
+	long temp;
 
-	if (!temp)
+	if (strict_strtol(buf, 10, &temp) || !temp)
 		return -EINVAL;
+
 	temp = FAN_RPM_TO_PERIOD(temp);
+	temp = SENSORS_LIMIT(temp, 1, 65534);
 
 	mutex_lock(&data->lock);
 	data->fan_max[attr->index] = temp;
@@ -454,11 +635,13 @@ static ssize_t set_fan_min(struct device *dev,
 	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
 	struct i2c_client *client = to_i2c_client(dev);
 	struct adt7470_data *data = i2c_get_clientdata(client);
-	int temp = simple_strtol(buf, NULL, 10);
+	long temp;
 
-	if (!temp)
+	if (strict_strtol(buf, 10, &temp) || !temp)
 		return -EINVAL;
+
 	temp = FAN_RPM_TO_PERIOD(temp);
+	temp = SENSORS_LIMIT(temp, 1, 65534);
 
 	mutex_lock(&data->lock);
 	data->fan_min[attr->index] = temp;
@@ -496,8 +679,11 @@ static ssize_t set_force_pwm_max(struct device *dev,
 {
 	struct i2c_client *client = to_i2c_client(dev);
 	struct adt7470_data *data = i2c_get_clientdata(client);
-	int temp = simple_strtol(buf, NULL, 10);
+	long temp;
 	u8 reg;
+
+	if (strict_strtol(buf, 10, &temp))
+		return -EINVAL;
 
 	mutex_lock(&data->lock);
 	data->force_pwm_max = temp;
@@ -526,7 +712,12 @@ static ssize_t set_pwm(struct device *dev, struct device_attribute *devattr,
 	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
 	struct i2c_client *client = to_i2c_client(dev);
 	struct adt7470_data *data = i2c_get_clientdata(client);
-	int temp = simple_strtol(buf, NULL, 10);
+	long temp;
+
+	if (strict_strtol(buf, 10, &temp))
+		return -EINVAL;
+
+	temp = SENSORS_LIMIT(temp, 0, 255);
 
 	mutex_lock(&data->lock);
 	data->pwm[attr->index] = temp;
@@ -553,7 +744,12 @@ static ssize_t set_pwm_max(struct device *dev,
 	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
 	struct i2c_client *client = to_i2c_client(dev);
 	struct adt7470_data *data = i2c_get_clientdata(client);
-	int temp = simple_strtol(buf, NULL, 10);
+	long temp;
+
+	if (strict_strtol(buf, 10, &temp))
+		return -EINVAL;
+
+	temp = SENSORS_LIMIT(temp, 0, 255);
 
 	mutex_lock(&data->lock);
 	data->pwm_max[attr->index] = temp;
@@ -581,7 +777,12 @@ static ssize_t set_pwm_min(struct device *dev,
 	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
 	struct i2c_client *client = to_i2c_client(dev);
 	struct adt7470_data *data = i2c_get_clientdata(client);
-	int temp = simple_strtol(buf, NULL, 10);
+	long temp;
+
+	if (strict_strtol(buf, 10, &temp))
+		return -EINVAL;
+
+	temp = SENSORS_LIMIT(temp, 0, 255);
 
 	mutex_lock(&data->lock);
 	data->pwm_min[attr->index] = temp;
@@ -619,7 +820,13 @@ static ssize_t set_pwm_tmin(struct device *dev,
 	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
 	struct i2c_client *client = to_i2c_client(dev);
 	struct adt7470_data *data = i2c_get_clientdata(client);
-	int temp = simple_strtol(buf, NULL, 10) / 1000;
+	long temp;
+
+	if (strict_strtol(buf, 10, &temp))
+		return -EINVAL;
+
+	temp = DIV_ROUND_CLOSEST(temp, 1000);
+	temp = SENSORS_LIMIT(temp, 0, 255);
 
 	mutex_lock(&data->lock);
 	data->pwm_tmin[attr->index] = temp;
@@ -647,10 +854,13 @@ static ssize_t set_pwm_auto(struct device *dev,
 	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
 	struct i2c_client *client = to_i2c_client(dev);
 	struct adt7470_data *data = i2c_get_clientdata(client);
-	int temp = simple_strtol(buf, NULL, 10);
 	int pwm_auto_reg = ADT7470_REG_PWM_CFG(attr->index);
 	int pwm_auto_reg_mask;
+	long temp;
 	u8 reg;
+
+	if (strict_strtol(buf, 10, &temp))
+		return -EINVAL;
 
 	if (attr->index % 2)
 		pwm_auto_reg_mask = ADT7470_PWM2_AUTO_MASK;
@@ -705,10 +915,14 @@ static ssize_t set_pwm_auto_temp(struct device *dev,
 	struct sensor_device_attribute *attr = to_sensor_dev_attr(devattr);
 	struct i2c_client *client = to_i2c_client(dev);
 	struct adt7470_data *data = i2c_get_clientdata(client);
-	int temp = cvt_auto_temp(simple_strtol(buf, NULL, 10));
 	int pwm_auto_reg = ADT7470_REG_PWM_AUTO_TEMP(attr->index);
+	long temp;
 	u8 reg;
 
+	if (strict_strtol(buf, 10, &temp))
+		return -EINVAL;
+
+	temp = cvt_auto_temp(temp);
 	if (temp < 0)
 		return temp;
 
@@ -744,6 +958,10 @@ static ssize_t show_alarm(struct device *dev,
 }
 
 static DEVICE_ATTR(alarm_mask, S_IRUGO, show_alarm_mask, NULL);
+static DEVICE_ATTR(num_temp_sensors, S_IWUSR | S_IRUGO, show_num_temp_sensors,
+		   set_num_temp_sensors);
+static DEVICE_ATTR(auto_update_interval, S_IWUSR | S_IRUGO,
+		   show_auto_update_interval, set_auto_update_interval);
 
 static SENSOR_DEVICE_ATTR(temp1_max, S_IWUSR | S_IRUGO, show_temp_max,
 		    set_temp_max, 0);
@@ -916,6 +1134,8 @@ static SENSOR_DEVICE_ATTR(pwm4_auto_channels_temp, S_IWUSR | S_IRUGO,
 static struct attribute *adt7470_attr[] =
 {
 	&dev_attr_alarm_mask.attr,
+	&dev_attr_num_temp_sensors.attr,
+	&dev_attr_auto_update_interval.attr,
 	&sensor_dev_attr_temp1_max.dev_attr.attr,
 	&sensor_dev_attr_temp2_max.dev_attr.attr,
 	&sensor_dev_attr_temp3_max.dev_attr.attr,
@@ -1004,64 +1224,55 @@ static struct attribute *adt7470_attr[] =
 	NULL
 };
 
-static int adt7470_attach_adapter(struct i2c_adapter *adapter)
+/* Return 0 if detection is successful, -ENODEV otherwise */
+static int adt7470_detect(struct i2c_client *client, int kind,
+			  struct i2c_board_info *info)
 {
-	if (!(adapter->class & I2C_CLASS_HWMON))
-		return 0;
-	return i2c_probe(adapter, &addr_data, adt7470_detect);
-}
-
-static int adt7470_detect(struct i2c_adapter *adapter, int address, int kind)
-{
-	struct i2c_client *client;
-	struct adt7470_data *data;
-	int err = 0;
+	struct i2c_adapter *adapter = client->adapter;
 
 	if (!i2c_check_functionality(adapter, I2C_FUNC_SMBUS_BYTE_DATA))
-		goto exit;
-
-	if (!(data = kzalloc(sizeof(struct adt7470_data), GFP_KERNEL))) {
-		err = -ENOMEM;
-		goto exit;
-	}
-
-	client = &data->client;
-	client->addr = address;
-	client->adapter = adapter;
-	client->driver = &adt7470_driver;
-
-	i2c_set_clientdata(client, data);
-
-	mutex_init(&data->lock);
+		return -ENODEV;
 
 	if (kind <= 0) {
 		int vendor, device, revision;
 
 		vendor = i2c_smbus_read_byte_data(client, ADT7470_REG_VENDOR);
-		if (vendor != ADT7470_VENDOR) {
-			err = -ENODEV;
-			goto exit_free;
-		}
+		if (vendor != ADT7470_VENDOR)
+			return -ENODEV;
 
 		device = i2c_smbus_read_byte_data(client, ADT7470_REG_DEVICE);
-		if (device != ADT7470_DEVICE) {
-			err = -ENODEV;
-			goto exit_free;
-		}
+		if (device != ADT7470_DEVICE)
+			return -ENODEV;
 
 		revision = i2c_smbus_read_byte_data(client,
 						    ADT7470_REG_REVISION);
-		if (revision != ADT7470_REVISION) {
-			err = -ENODEV;
-			goto exit_free;
-		}
+		if (revision != ADT7470_REVISION)
+			return -ENODEV;
 	} else
 		dev_dbg(&adapter->dev, "detection forced\n");
 
-	strlcpy(client->name, "adt7470", I2C_NAME_SIZE);
+	strlcpy(info->type, "adt7470", I2C_NAME_SIZE);
 
-	if ((err = i2c_attach_client(client)))
-		goto exit_free;
+	return 0;
+}
+
+static int adt7470_probe(struct i2c_client *client,
+			 const struct i2c_device_id *id)
+{
+	struct adt7470_data *data;
+	int err;
+
+	data = kzalloc(sizeof(struct adt7470_data), GFP_KERNEL);
+	if (!data) {
+		err = -ENOMEM;
+		goto exit;
+	}
+
+	data->num_temp_sensors = -1;
+	data->auto_update_interval = AUTO_UPDATE_INTERVAL;
+
+	i2c_set_clientdata(client, data);
+	mutex_init(&data->lock);
 
 	dev_info(&client->dev, "%s chip found\n", client->name);
 
@@ -1071,7 +1282,7 @@ static int adt7470_detect(struct i2c_adapter *adapter, int address, int kind)
 	/* Register sysfs hooks */
 	data->attrs.attrs = adt7470_attr;
 	if ((err = sysfs_create_group(&client->dev.kobj, &data->attrs)))
-		goto exit_detach;
+		goto exit_free;
 
 	data->hwmon_dev = hwmon_device_register(&client->dev);
 	if (IS_ERR(data->hwmon_dev)) {
@@ -1079,25 +1290,32 @@ static int adt7470_detect(struct i2c_adapter *adapter, int address, int kind)
 		goto exit_remove;
 	}
 
+	init_completion(&data->auto_update_stop);
+	data->auto_update = kthread_run(adt7470_update_thread, client,
+					dev_name(data->hwmon_dev));
+	if (IS_ERR(data->auto_update))
+		goto exit_unregister;
+
 	return 0;
 
+exit_unregister:
+	hwmon_device_unregister(data->hwmon_dev);
 exit_remove:
 	sysfs_remove_group(&client->dev.kobj, &data->attrs);
-exit_detach:
-	i2c_detach_client(client);
 exit_free:
 	kfree(data);
 exit:
 	return err;
 }
 
-static int adt7470_detach_client(struct i2c_client *client)
+static int adt7470_remove(struct i2c_client *client)
 {
 	struct adt7470_data *data = i2c_get_clientdata(client);
 
+	kthread_stop(data->auto_update);
+	wait_for_completion(&data->auto_update_stop);
 	hwmon_device_unregister(data->hwmon_dev);
 	sysfs_remove_group(&client->dev.kobj, &data->attrs);
-	i2c_detach_client(client);
 	kfree(data);
 	return 0;
 }

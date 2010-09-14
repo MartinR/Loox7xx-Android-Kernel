@@ -29,8 +29,6 @@
  * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- *
- * $Id: ucm.c 4311 2005-12-05 18:42:01Z sean.hefty $
  */
 
 #include <linux/completion.h>
@@ -40,6 +38,7 @@
 #include <linux/device.h>
 #include <linux/err.h>
 #include <linux/poll.h>
+#include <linux/sched.h>
 #include <linux/file.h>
 #include <linux/mount.h>
 #include <linux/cdev.h>
@@ -1155,6 +1154,14 @@ static unsigned int ib_ucm_poll(struct file *filp,
 	return mask;
 }
 
+/*
+ * ib_ucm_open() does not need the BKL:
+ *
+ *  - no global state is referred to;
+ *  - there is no ioctl method to race against;
+ *  - no further module initialization is required for open to work
+ *    after the device is registered.
+ */
 static int ib_ucm_open(struct inode *inode, struct file *filp)
 {
 	struct ib_ucm_file *file;
@@ -1260,8 +1267,7 @@ static void ib_ucm_add_one(struct ib_device *device)
 	ucm_dev->dev.parent = device->dma_device;
 	ucm_dev->dev.devt = ucm_dev->cdev.dev;
 	ucm_dev->dev.release = ib_ucm_release_dev;
-	snprintf(ucm_dev->dev.bus_id, BUS_ID_SIZE, "ucm%d",
-		 ucm_dev->devnum);
+	dev_set_name(&ucm_dev->dev, "ucm%d", ucm_dev->devnum);
 	if (device_register(&ucm_dev->dev))
 		goto err_cdev;
 

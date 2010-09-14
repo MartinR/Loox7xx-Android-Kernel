@@ -14,6 +14,11 @@ config MMU
 	bool
 	default n
 
+config NO_DMA
+	bool
+	depends on !COLDFIRE
+	default y
+
 config FPU
 	bool
 	default n
@@ -42,6 +47,10 @@ config GENERIC_FIND_NEXT_BIT
 	bool
 	default y
 
+config GENERIC_GPIO
+	bool
+	default n
+
 config GENERIC_HWEIGHT
 	bool
 	default y
@@ -58,17 +67,24 @@ config GENERIC_TIME
 	bool
 	default y
 
+config GENERIC_CMOS_UPDATE
+	bool
+	default y
+
 config TIME_LOW_RES
 	bool
 	default y
 
+config GENERIC_CLOCKEVENTS
+	bool
+	default n
+
 config NO_IOPORT
 	def_bool y
 
-config ARCH_SUPPORTS_AOUT
-	def_bool y
-
 source "init/Kconfig"
+
+source "kernel/Kconfig.freezer"
 
 menu "Processor type and features"
 
@@ -108,11 +124,13 @@ config M5206e
 
 config M520x
 	bool "MCF520x"
+	select GENERIC_CLOCKEVENTS
 	help
 	   Freescale Coldfire 5207/5208 processor support.
 
 config M523x
 	bool "MCF523x"
+	select GENERIC_CLOCKEVENTS
 	help
 	  Freescale Coldfire 5230/1/2/4/5 processor support
 
@@ -138,6 +156,7 @@ config M5275
 
 config M528x
 	bool "MCF528x"
+	select GENERIC_CLOCKEVENTS
 	help
 	  Motorola ColdFire 5280/5282 processor support.
 
@@ -161,11 +180,14 @@ endchoice
 config M527x
 	bool
 	depends on (M5271 || M5275)
+	select GENERIC_CLOCKEVENTS
 	default y
 
 config COLDFIRE
 	bool
 	depends on (M5206 || M5206e || M520x || M523x || M5249 || M527x || M5272 || M528x || M5307 || M532x || M5407)
+	select GENERIC_GPIO
+	select ARCH_REQUIRE_GPIOLIB
 	default y
 
 config CLOCK_SET
@@ -386,12 +408,6 @@ config M5307C3
 	depends on M5307
 	help
 	  Support for the Motorola M5307C3 board.
-
-config eLIA
-	bool "Moreton Bay eLIA board support"
-	depends on M5307
-	help
-	  Support for the Moreton Bay eLIA board.
 
 config SECUREEDGEMP3
 	bool "SnapGear SecureEdge/MP3 platform support"
@@ -674,6 +690,9 @@ endchoice
 if COLDFIRE
 source "kernel/Kconfig.preempt"
 endif
+
+source "kernel/time/Kconfig"
+
 source "mm/Kconfig"
 
 endmenu
@@ -683,24 +702,7 @@ config ISA_DMA_API
 	depends on !M5272
 	default y
 
-menu "Bus options (PCI, PCMCIA, EISA, MCA, ISA)"
-
-config PCI
-	bool "PCI support"
-	help
-	  Support for PCI bus.
-
-config COMEMPCI
-	bool "CO-MEM lite PCI controller support"
-	depends on (M5307 || M5407)
-
-source "drivers/pci/Kconfig"
-
 source "drivers/pcmcia/Kconfig"
-
-source "drivers/pci/hotplug/Kconfig"
-
-endmenu
 
 menu "Executable file formats"
 

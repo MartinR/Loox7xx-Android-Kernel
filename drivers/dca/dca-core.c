@@ -1,5 +1,5 @@
 /*
- * Copyright(c) 2007 Intel Corporation. All rights reserved.
+ * Copyright(c) 2007 - 2009 Intel Corporation. All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
  * under the terms of the GNU General Public License as published by the Free
@@ -28,13 +28,101 @@
 #include <linux/device.h>
 #include <linux/dca.h>
 
-MODULE_LICENSE("GPL");
+#define DCA_VERSION "1.12.1"
 
-/* For now we're assuming a single, global, DCA provider for the system. */
+MODULE_VERSION(DCA_VERSION);
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Intel Corporation");
 
 static DEFINE_SPINLOCK(dca_lock);
 
-static struct dca_provider *global_dca = NULL;
+static LIST_HEAD(dca_domains);
+
+static struct pci_bus *dca_pci_rc_from_dev(struct device *dev)
+{
+	struct pci_dev *pdev = to_pci_dev(dev);
+	struct pci_bus *bus = pdev->bus;
+
+	while (bus->parent)
+		bus = bus->parent;
+
+	return bus;
+}
+
+static struct dca_domain *dca_allocate_domain(struct pci_bus *rc)
+{
+	struct dca_domain *domain;
+
+	domain = kzalloc(sizeof(*domain), GFP_NOWAIT);
+	if (!domain)
+		return NULL;
+
+	INIT_LIST_HEAD(&domain->dca_providers);
+	domain->pci_rc = rc;
+
+	return domain;
+}
+
+static void dca_free_domain(struct dca_domain *domain)
+{
+	list_del(&domain->node);
+	kfree(domain);
+}
+
+static struct dca_domain *dca_find_domain(struct pci_bus *rc)
+{
+	struct dca_domain *domain;
+
+	list_for_each_entry(domain, &dca_domains, node)
+		if (domain->pci_rc == rc)
+			return domain;
+
+	return NULL;
+}
+
+static struct dca_domain *dca_get_domain(struct device *dev)
+{
+	struct pci_bus *rc;
+	struct dca_domain *domain;
+
+	rc = dca_pci_rc_from_dev(dev);
+	domain = dca_find_domain(rc);
+
+	if (!domain) {
+		domain = dca_allocate_domain(rc);
+		if (domain)
+			list_add(&domain->node, &dca_domains);
+	}
+
+	return domain;
+}
+
+static struct dca_provider *dca_find_provider_by_dev(struct device *dev)
+{
+	struct dca_provider *dca;
+	struct pci_bus *rc;
+	struct dca_domain *domain;
+
+	if (dev) {
+		rc = dca_pci_rc_from_dev(dev);
+		domain = dca_find_domain(rc);
+		if (!domain)
+			return NULL;
+	} else {
+		if (!list_empty(&dca_domains))
+			domain = list_first_entry(&dca_domains,
+						  struct dca_domain,
+						  node);
+		else
+			return NULL;
+	}
+
+	list_for_each_entry(dca, &domain->dca_providers, node)
+		if ((!dev) || (dca->ops->dev_managed(dca, dev)))
+			return dca;
+
+	return NULL;
+}
 
 /**
  * dca_add_requester - add a dca client to the list
@@ -42,22 +130,48 @@ static struct dca_provider *global_dca = NULL;
  */
 int dca_add_requester(struct device *dev)
 {
-	int err, slot;
+	struct dca_provider *dca;
+	int err, slot = -ENODEV;
+	unsigned long flags;
+	struct pci_bus *pci_rc;
+	struct dca_domain *domain;
 
-	if (!global_dca)
+	if (!dev)
+		return -EFAULT;
+
+	spin_lock_irqsave(&dca_lock, flags);
+
+	/* check if the requester has not been added already */
+	dca = dca_find_provider_by_dev(dev);
+	if (dca) {
+		spin_unlock_irqrestore(&dca_lock, flags);
+		return -EEXIST;
+	}
+
+	pci_rc = dca_pci_rc_from_dev(dev);
+	domain = dca_find_domain(pci_rc);
+	if (!domain) {
+		spin_unlock_irqrestore(&dca_lock, flags);
 		return -ENODEV;
+	}
 
-	spin_lock(&dca_lock);
-	slot = global_dca->ops->add_requester(global_dca, dev);
-	spin_unlock(&dca_lock);
+	list_for_each_entry(dca, &domain->dca_providers, node) {
+		slot = dca->ops->add_requester(dca, dev);
+		if (slot >= 0)
+			break;
+	}
+
+	spin_unlock_irqrestore(&dca_lock, flags);
+
 	if (slot < 0)
 		return slot;
 
-	err = dca_sysfs_add_req(global_dca, dev, slot);
+	err = dca_sysfs_add_req(dca, dev, slot);
 	if (err) {
-		spin_lock(&dca_lock);
-		global_dca->ops->remove_requester(global_dca, dev);
-		spin_unlock(&dca_lock);
+		spin_lock_irqsave(&dca_lock, flags);
+		if (dca == dca_find_provider_by_dev(dev))
+			dca->ops->remove_requester(dca, dev);
+		spin_unlock_irqrestore(&dca_lock, flags);
 		return err;
 	}
 
@@ -71,30 +185,79 @@ EXPORT_SYMBOL_GPL(dca_add_requester);
  */
 int dca_remove_requester(struct device *dev)
 {
+	struct dca_provider *dca;
 	int slot;
-	if (!global_dca)
-		return -ENODEV;
+	unsigned long flags;
 
-	spin_lock(&dca_lock);
-	slot = global_dca->ops->remove_requester(global_dca, dev);
-	spin_unlock(&dca_lock);
+	if (!dev)
+		return -EFAULT;
+
+	spin_lock_irqsave(&dca_lock, flags);
+	dca = dca_find_provider_by_dev(dev);
+	if (!dca) {
+		spin_unlock_irqrestore(&dca_lock, flags);
+		return -ENODEV;
+	}
+	slot = dca->ops->remove_requester(dca, dev);
+	spin_unlock_irqrestore(&dca_lock, flags);
+
 	if (slot < 0)
 		return slot;
 
-	dca_sysfs_remove_req(global_dca, slot);
+	dca_sysfs_remove_req(dca, slot);
+
 	return 0;
 }
 EXPORT_SYMBOL_GPL(dca_remove_requester);
 
 /**
- * dca_get_tag - return the dca tag for the given cpu
+ * dca_common_get_tag - return the dca tag (serves both new and old api)
+ * @dev - the device that wants dca service
+ * @cpu - the cpuid as returned by get_cpu()
+ */
+u8 dca_common_get_tag(struct device *dev, int cpu)
+{
+	struct dca_provider *dca;
+	u8 tag;
+	unsigned long flags;
+
+	spin_lock_irqsave(&dca_lock, flags);
+
+	dca = dca_find_provider_by_dev(dev);
+	if (!dca) {
+		spin_unlock_irqrestore(&dca_lock, flags);
+		return -ENODEV;
+	}
+	tag = dca->ops->get_tag(dca, dev, cpu);
+
+	spin_unlock_irqrestore(&dca_lock, flags);
+	return tag;
+}
+
+/**
+ * dca3_get_tag - return the dca tag to the requester device
+ *                for the given cpu (new api)
+ * @dev - the device that wants dca service
+ * @cpu - the cpuid as returned by get_cpu()
+ */
+u8 dca3_get_tag(struct device *dev, int cpu)
+{
+	if (!dev)
+		return -EFAULT;
+
+	return dca_common_get_tag(dev, cpu);
+}
+EXPORT_SYMBOL_GPL(dca3_get_tag);
+
+/**
+ * dca_get_tag - return the dca tag for the given cpu (old api)
  * @cpu - the cpuid as returned by get_cpu()
  */
 u8 dca_get_tag(int cpu)
 {
-	if (!global_dca)
-		return -ENODEV;
-	return global_dca->ops->get_tag(global_dca, cpu);
+	struct device *dev = NULL;
+
+	return dca_common_get_tag(dev, cpu);
 }
 EXPORT_SYMBOL_GPL(dca_get_tag);
 
@@ -139,13 +302,22 @@ static BLOCKING_NOTIFIER_HEAD(dca_provider_chain);
 int register_dca_provider(struct dca_provider *dca, struct device *dev)
 {
 	int err;
+	unsigned long flags;
+	struct dca_domain *domain;
 
-	if (global_dca)
-		return -EEXIST;
 	err = dca_sysfs_add_provider(dca, dev);
 	if (err)
 		return err;
-	global_dca = dca;
+
+	spin_lock_irqsave(&dca_lock, flags);
+	domain = dca_get_domain(dev);
+	if (!domain) {
+		spin_unlock_irqrestore(&dca_lock, flags);
+		return -ENODEV;
+	}
+	list_add(&dca->node, &domain->dca_providers);
+	spin_unlock_irqrestore(&dca_lock, flags);
+
 	blocking_notifier_call_chain(&dca_provider_chain,
 				     DCA_PROVIDER_ADD, NULL);
 	return 0;
@@ -156,13 +328,26 @@ EXPORT_SYMBOL_GPL(register_dca_provider);
  * unregister_dca_provider - remove a dca provider
  * @dca - struct created by alloc_dca_provider()
  */
-void unregister_dca_provider(struct dca_provider *dca)
+void unregister_dca_provider(struct dca_provider *dca, struct device *dev)
 {
-	if (!global_dca)
-		return;
+	unsigned long flags;
+	struct pci_bus *pci_rc;
+	struct dca_domain *domain;
+
 	blocking_notifier_call_chain(&dca_provider_chain,
 				     DCA_PROVIDER_REMOVE, NULL);
-	global_dca = NULL;
+
+	spin_lock_irqsave(&dca_lock, flags);
+
+	list_del(&dca->node);
+
+	pci_rc = dca_pci_rc_from_dev(dev);
+	domain = dca_find_domain(pci_rc);
+	if (list_empty(&domain->dca_providers))
+		dca_free_domain(domain);
+
+	spin_unlock_irqrestore(&dca_lock, flags);
+
 	dca_sysfs_remove_provider(dca);
 }
 EXPORT_SYMBOL_GPL(unregister_dca_provider);
@@ -187,6 +372,7 @@ EXPORT_SYMBOL_GPL(dca_unregister_notify);
 
 static int __init dca_init(void)
 {
+	pr_info("dca service started, version %s\n", DCA_VERSION);
 	return dca_sysfs_init();
 }
 
@@ -195,6 +381,6 @@ static void __exit dca_exit(void)
 	dca_sysfs_exit();
 }
 
-module_init(dca_init);
+arch_initcall(dca_init);
 module_exit(dca_exit);
 

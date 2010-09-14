@@ -2,7 +2,7 @@
  *  drivers/cpufreq/cpufreq_stats.c
  *
  *  Copyright (C) 2003-2004 Venkatesh Pallipadi <venkatesh.pallipadi@intel.com>.
- *	      (C) 2004 Zou Nan hai <nanhai.zou@intel.com>.
+ *  (C) 2004 Zou Nan hai <nanhai.zou@intel.com>.
  *
  * This program is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License version 2 as
@@ -23,7 +23,7 @@
 
 static spinlock_t cpufreq_stats_lock;
 
-#define CPUFREQ_STATDEVICE_ATTR(_name,_mode,_show) \
+#define CPUFREQ_STATDEVICE_ATTR(_name, _mode, _show) \
 static struct freq_attr _attr_##_name = {\
 	.attr = {.name = __stringify(_name), .mode = _mode, }, \
 	.show = _show,\
@@ -43,22 +43,21 @@ struct cpufreq_stats {
 #endif
 };
 
-static struct cpufreq_stats *cpufreq_stats_table[NR_CPUS];
+static DEFINE_PER_CPU(struct cpufreq_stats *, cpufreq_stats_table);
 
 struct cpufreq_stats_attribute {
 	struct attribute attr;
 	ssize_t(*show) (struct cpufreq_stats *, char *);
 };
 
-static int
-cpufreq_stats_update (unsigned int cpu)
+static int cpufreq_stats_update(unsigned int cpu)
 {
 	struct cpufreq_stats *stat;
 	unsigned long long cur_time;
 
 	cur_time = get_jiffies_64();
 	spin_lock(&cpufreq_stats_lock);
-	stat = cpufreq_stats_table[cpu];
+	stat = per_cpu(cpufreq_stats_table, cpu);
 	if (stat->time_in_state)
 		stat->time_in_state[stat->last_index] =
 			cputime64_add(stat->time_in_state[stat->last_index],
@@ -68,40 +67,38 @@ cpufreq_stats_update (unsigned int cpu)
 	return 0;
 }
 
-static ssize_t
-show_total_trans(struct cpufreq_policy *policy, char *buf)
+static ssize_t show_total_trans(struct cpufreq_policy *policy, char *buf)
 {
-	struct cpufreq_stats *stat = cpufreq_stats_table[policy->cpu];
+	struct cpufreq_stats *stat = per_cpu(cpufreq_stats_table, policy->cpu);
 	if (!stat)
 		return 0;
 	return sprintf(buf, "%d\n",
-			cpufreq_stats_table[stat->cpu]->total_trans);
+			per_cpu(cpufreq_stats_table, stat->cpu)->total_trans);
 }
 
-static ssize_t
-show_time_in_state(struct cpufreq_policy *policy, char *buf)
+static ssize_t show_time_in_state(struct cpufreq_policy *policy, char *buf)
 {
 	ssize_t len = 0;
 	int i;
-	struct cpufreq_stats *stat = cpufreq_stats_table[policy->cpu];
+	struct cpufreq_stats *stat = per_cpu(cpufreq_stats_table, policy->cpu);
 	if (!stat)
 		return 0;
 	cpufreq_stats_update(stat->cpu);
 	for (i = 0; i < stat->state_num; i++) {
 		len += sprintf(buf + len, "%u %llu\n", stat->freq_table[i],
-			(unsigned long long)cputime64_to_clock_t(stat->time_in_state[i]));
+			(unsigned long long)
+			cputime64_to_clock_t(stat->time_in_state[i]));
 	}
 	return len;
 }
 
 #ifdef CONFIG_CPU_FREQ_STAT_DETAILS
-static ssize_t
-show_trans_table(struct cpufreq_policy *policy, char *buf)
+static ssize_t show_trans_table(struct cpufreq_policy *policy, char *buf)
 {
 	ssize_t len = 0;
 	int i, j;
 
-	struct cpufreq_stats *stat = cpufreq_stats_table[policy->cpu];
+	struct cpufreq_stats *stat = per_cpu(cpufreq_stats_table, policy->cpu);
 	if (!stat)
 		return 0;
 	cpufreq_stats_update(stat->cpu);
@@ -139,11 +136,11 @@ show_trans_table(struct cpufreq_policy *policy, char *buf)
 		return PAGE_SIZE;
 	return len;
 }
-CPUFREQ_STATDEVICE_ATTR(trans_table,0444,show_trans_table);
+CPUFREQ_STATDEVICE_ATTR(trans_table, 0444, show_trans_table);
 #endif
 
-CPUFREQ_STATDEVICE_ATTR(total_trans,0444,show_total_trans);
-CPUFREQ_STATDEVICE_ATTR(time_in_state,0444,show_time_in_state);
+CPUFREQ_STATDEVICE_ATTR(total_trans, 0444, show_total_trans);
+CPUFREQ_STATDEVICE_ATTR(time_in_state, 0444, show_time_in_state);
 
 static struct attribute *default_attrs[] = {
 	&_attr_total_trans.attr,
@@ -158,8 +155,7 @@ static struct attribute_group stats_attr_group = {
 	.name = "stats"
 };
 
-static int
-freq_table_get_index(struct cpufreq_stats *stat, unsigned int freq)
+static int freq_table_get_index(struct cpufreq_stats *stat, unsigned int freq)
 {
 	int index;
 	for (index = 0; index < stat->max_state; index++)
@@ -170,7 +166,7 @@ freq_table_get_index(struct cpufreq_stats *stat, unsigned int freq)
 
 static void cpufreq_stats_free_table(unsigned int cpu)
 {
-	struct cpufreq_stats *stat = cpufreq_stats_table[cpu];
+	struct cpufreq_stats *stat = per_cpu(cpufreq_stats_table, cpu);
 	struct cpufreq_policy *policy = cpufreq_cpu_get(cpu);
 	if (policy && policy->cpu == cpu)
 		sysfs_remove_group(&policy->kobj, &stats_attr_group);
@@ -178,13 +174,12 @@ static void cpufreq_stats_free_table(unsigned int cpu)
 		kfree(stat->time_in_state);
 		kfree(stat);
 	}
-	cpufreq_stats_table[cpu] = NULL;
+	per_cpu(cpufreq_stats_table, cpu) = NULL;
 	if (policy)
 		cpufreq_cpu_put(policy);
 }
 
-static int
-cpufreq_stats_create_table (struct cpufreq_policy *policy,
+static int cpufreq_stats_create_table(struct cpufreq_policy *policy,
 		struct cpufreq_frequency_table *table)
 {
 	unsigned int i, j, count = 0, ret = 0;
@@ -192,9 +187,10 @@ cpufreq_stats_create_table (struct cpufreq_policy *policy,
 	struct cpufreq_policy *data;
 	unsigned int alloc_size;
 	unsigned int cpu = policy->cpu;
-	if (cpufreq_stats_table[cpu])
+	if (per_cpu(cpufreq_stats_table, cpu))
 		return -EBUSY;
-	if ((stat = kzalloc(sizeof(struct cpufreq_stats), GFP_KERNEL)) == NULL)
+	stat = kzalloc(sizeof(struct cpufreq_stats), GFP_KERNEL);
+	if ((stat) == NULL)
 		return -ENOMEM;
 
 	data = cpufreq_cpu_get(cpu);
@@ -203,13 +199,14 @@ cpufreq_stats_create_table (struct cpufreq_policy *policy,
 		goto error_get_fail;
 	}
 
-	if ((ret = sysfs_create_group(&data->kobj, &stats_attr_group)))
+	ret = sysfs_create_group(&data->kobj, &stats_attr_group);
+	if (ret)
 		goto error_out;
 
 	stat->cpu = cpu;
-	cpufreq_stats_table[cpu] = stat;
+	per_cpu(cpufreq_stats_table, cpu) = stat;
 
-	for (i=0; table[i].frequency != CPUFREQ_TABLE_END; i++) {
+	for (i = 0; table[i].frequency != CPUFREQ_TABLE_END; i++) {
 		unsigned int freq = table[i].frequency;
 		if (freq == CPUFREQ_ENTRY_INVALID)
 			continue;
@@ -251,13 +248,12 @@ error_out:
 	cpufreq_cpu_put(data);
 error_get_fail:
 	kfree(stat);
-	cpufreq_stats_table[cpu] = NULL;
+	per_cpu(cpufreq_stats_table, cpu) = NULL;
 	return ret;
 }
 
-static int
-cpufreq_stat_notifier_policy (struct notifier_block *nb, unsigned long val,
-		void *data)
+static int cpufreq_stat_notifier_policy(struct notifier_block *nb,
+		unsigned long val, void *data)
 {
 	int ret;
 	struct cpufreq_policy *policy = data;
@@ -268,14 +264,14 @@ cpufreq_stat_notifier_policy (struct notifier_block *nb, unsigned long val,
 	table = cpufreq_frequency_get_table(cpu);
 	if (!table)
 		return 0;
-	if ((ret = cpufreq_stats_create_table(policy, table)))
+	ret = cpufreq_stats_create_table(policy, table);
+	if (ret)
 		return ret;
 	return 0;
 }
 
-static int
-cpufreq_stat_notifier_trans (struct notifier_block *nb, unsigned long val,
-		void *data)
+static int cpufreq_stat_notifier_trans(struct notifier_block *nb,
+		unsigned long val, void *data)
 {
 	struct cpufreq_freqs *freq = data;
 	struct cpufreq_stats *stat;
@@ -284,7 +280,7 @@ cpufreq_stat_notifier_trans (struct notifier_block *nb, unsigned long val,
 	if (val != CPUFREQ_POSTCHANGE)
 		return 0;
 
-	stat = cpufreq_stats_table[freq->cpu];
+	stat = per_cpu(cpufreq_stats_table, freq->cpu);
 	if (!stat)
 		return 0;
 
@@ -340,19 +336,20 @@ static struct notifier_block notifier_trans_block = {
 	.notifier_call = cpufreq_stat_notifier_trans
 };
 
-static int
-__init cpufreq_stats_init(void)
+static int __init cpufreq_stats_init(void)
 {
 	int ret;
 	unsigned int cpu;
 
 	spin_lock_init(&cpufreq_stats_lock);
-	if ((ret = cpufreq_register_notifier(&notifier_policy_block,
-				CPUFREQ_POLICY_NOTIFIER)))
+	ret = cpufreq_register_notifier(&notifier_policy_block,
+				CPUFREQ_POLICY_NOTIFIER);
+	if (ret)
 		return ret;
 
-	if ((ret = cpufreq_register_notifier(&notifier_trans_block,
-				CPUFREQ_TRANSITION_NOTIFIER))) {
+	ret = cpufreq_register_notifier(&notifier_trans_block,
+				CPUFREQ_TRANSITION_NOTIFIER);
+	if (ret) {
 		cpufreq_unregister_notifier(&notifier_policy_block,
 				CPUFREQ_POLICY_NOTIFIER);
 		return ret;
@@ -364,8 +361,7 @@ __init cpufreq_stats_init(void)
 	}
 	return 0;
 }
-static void
-__exit cpufreq_stats_exit(void)
+static void __exit cpufreq_stats_exit(void)
 {
 	unsigned int cpu;
 
@@ -379,10 +375,10 @@ __exit cpufreq_stats_exit(void)
 	}
 }
 
-MODULE_AUTHOR ("Zou Nan hai <nanhai.zou@intel.com>");
-MODULE_DESCRIPTION ("'cpufreq_stats' - A driver to export cpufreq stats "
+MODULE_AUTHOR("Zou Nan hai <nanhai.zou@intel.com>");
+MODULE_DESCRIPTION("'cpufreq_stats' - A driver to export cpufreq stats "
 				"through sysfs filesystem");
-MODULE_LICENSE ("GPL");
+MODULE_LICENSE("GPL");
 
 module_init(cpufreq_stats_init);
 module_exit(cpufreq_stats_exit);

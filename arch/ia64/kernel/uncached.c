@@ -98,7 +98,8 @@ static int uncached_add_chunk(struct uncached_pool *uc_pool, int nid)
 
 	/* attempt to allocate a granule's worth of cached memory pages */
 
-	page = alloc_pages_node(nid, GFP_KERNEL | __GFP_ZERO | GFP_THISNODE,
+	page = alloc_pages_exact_node(nid,
+				GFP_KERNEL | __GFP_ZERO | GFP_THISNODE,
 				IA64_GRANULE_SHIFT-PAGE_SHIFT);
 	if (!page) {
 		mutex_unlock(&uc_pool->add_chunk_mutex);
@@ -123,8 +124,7 @@ static int uncached_add_chunk(struct uncached_pool *uc_pool, int nid)
 	status = ia64_pal_prefetch_visibility(PAL_VISIBILITY_PHYSICAL);
 	if (status == PAL_VISIBILITY_OK_REMOTE_NEEDED) {
 		atomic_set(&uc_pool->status, 0);
-		status = smp_call_function(uncached_ipi_visibility, uc_pool,
-					   0, 1);
+		status = smp_call_function(uncached_ipi_visibility, uc_pool, 1);
 		if (status || atomic_read(&uc_pool->status))
 			goto failed;
 	} else if (status != PAL_VISIBILITY_OK)
@@ -146,7 +146,7 @@ static int uncached_add_chunk(struct uncached_pool *uc_pool, int nid)
 	if (status != PAL_STATUS_SUCCESS)
 		goto failed;
 	atomic_set(&uc_pool->status, 0);
-	status = smp_call_function(uncached_ipi_mc_drain, uc_pool, 0, 1);
+	status = smp_call_function(uncached_ipi_mc_drain, uc_pool, 1);
 	if (status || atomic_read(&uc_pool->status))
 		goto failed;
 
@@ -250,8 +250,7 @@ EXPORT_SYMBOL(uncached_free_page);
  * Called at boot time to build a map of pages that can be used for
  * memory special operations.
  */
-static int __init uncached_build_memmap(unsigned long uc_start,
-					unsigned long uc_end, void *arg)
+static int __init uncached_build_memmap(u64 uc_start, u64 uc_end, void *arg)
 {
 	int nid = paddr_to_nid(uc_start - __IA64_UNCACHED_OFFSET);
 	struct gen_pool *pool = uncached_pools[nid].pool;

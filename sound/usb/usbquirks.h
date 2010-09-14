@@ -39,6 +39,16 @@
 	.idProduct = prod, \
 	.bInterfaceClass = USB_CLASS_VENDOR_SPEC
 
+/* Creative/Toshiba Multimedia Center SB-0500 */
+{
+	USB_DEVICE(0x041e, 0x3048),
+	.driver_info = (unsigned long) & (const struct snd_usb_audio_quirk) {
+		.vendor_name = "Toshiba",
+		.product_name = "SB-0500",
+		.ifnum = QUIRK_NO_INTERFACE
+	}
+},
+
 /* Creative/E-Mu devices */
 {
 	USB_DEVICE(0x041e, 0x3010),
@@ -60,6 +70,13 @@
 	.match_flags = USB_DEVICE_ID_MATCH_DEVICE,
 	.idVendor = 0x041e,
 	.idProduct = 0x3f04,
+	.bInterfaceClass = USB_CLASS_AUDIO,
+},
+{
+	/* E-Mu Tracker Pre */
+	.match_flags = USB_DEVICE_ID_MATCH_DEVICE,
+	.idVendor = 0x041e,
+	.idProduct = 0x3f0a,
 	.bInterfaceClass = USB_CLASS_AUDIO,
 },
 
@@ -120,6 +137,14 @@
 	.idProduct = 0x08f6,
 	.bInterfaceClass = USB_CLASS_AUDIO,
 	.bInterfaceSubClass = USB_SUBCLASS_AUDIO_CONTROL
+},
+{
+	USB_DEVICE(0x046d, 0x0990),
+	.driver_info = (unsigned long) & (const struct snd_usb_audio_quirk) {
+		.vendor_name = "Logitech, Inc.",
+		.product_name = "QuickCam Pro 9000",
+		.ifnum = QUIRK_NO_INTERFACE
+	}
 },
 
 /*
@@ -210,6 +235,11 @@ YAMAHA_DEVICE(0x1042, NULL),
 YAMAHA_DEVICE(0x1043, NULL),
 YAMAHA_DEVICE(0x1044, NULL),
 YAMAHA_DEVICE(0x1045, NULL),
+YAMAHA_INTERFACE(0x104e, 0, NULL),
+YAMAHA_DEVICE(0x104f, NULL),
+YAMAHA_DEVICE(0x1050, NULL),
+YAMAHA_DEVICE(0x1051, NULL),
+YAMAHA_DEVICE(0x1052, NULL),
 YAMAHA_DEVICE(0x2000, "DGP-7"),
 YAMAHA_DEVICE(0x2001, "DGP-5"),
 YAMAHA_DEVICE(0x2002, NULL),
@@ -850,15 +880,15 @@ YAMAHA_DEVICE(0x7010, "UB99"),
 		.data = (const struct snd_usb_audio_quirk[]) {
 			{
 				.ifnum = 1,
-				.type = QUIRK_AUDIO_EDIROL_UA700_UA25
+				.type = QUIRK_AUDIO_EDIROL_UAXX
 			},
 			{
 				.ifnum = 2,
-				.type = QUIRK_AUDIO_EDIROL_UA700_UA25
+				.type = QUIRK_AUDIO_EDIROL_UAXX
 			},
 			{
 				.ifnum = 3,
-				.type = QUIRK_AUDIO_EDIROL_UA700_UA25
+				.type = QUIRK_AUDIO_EDIROL_UAXX
 			},
 			{
 				.ifnum = -1
@@ -1192,15 +1222,15 @@ YAMAHA_DEVICE(0x7010, "UB99"),
 		.data = (const struct snd_usb_audio_quirk[]) {
 			{
 				.ifnum = 0,
-				.type = QUIRK_AUDIO_EDIROL_UA700_UA25
+				.type = QUIRK_AUDIO_EDIROL_UAXX
 			},
 			{
 				.ifnum = 1,
-				.type = QUIRK_AUDIO_EDIROL_UA700_UA25
+				.type = QUIRK_AUDIO_EDIROL_UAXX
 			},
 			{
 				.ifnum = 2,
-				.type = QUIRK_AUDIO_EDIROL_UA700_UA25
+				.type = QUIRK_AUDIO_EDIROL_UAXX
 			},
 			{
 				.ifnum = -1
@@ -1333,6 +1363,36 @@ YAMAHA_DEVICE(0x7010, "UB99"),
 		}
 	}
 },
+{
+	/*
+	 * This quirk is for the "Advanced Driver" mode. If off, the UA-4FX
+	 * is standard compliant, but has only 16-bit PCM and no MIDI.
+	 */
+	USB_DEVICE(0x0582, 0x00a3),
+	.driver_info = (unsigned long) & (const struct snd_usb_audio_quirk) {
+		.vendor_name = "EDIROL",
+		.product_name = "UA-4FX",
+		.ifnum = QUIRK_ANY_INTERFACE,
+		.type = QUIRK_COMPOSITE,
+		.data = (const struct snd_usb_audio_quirk[]) {
+			{
+				.ifnum = 0,
+				.type = QUIRK_AUDIO_EDIROL_UAXX
+			},
+			{
+				.ifnum = 1,
+				.type = QUIRK_AUDIO_EDIROL_UAXX
+			},
+			{
+				.ifnum = 2,
+				.type = QUIRK_AUDIO_EDIROL_UAXX
+			},
+			{
+				.ifnum = -1
+			}
+		}
+	}
+},
 	/* TODO: add Edirol MD-P1 support */
 {
 	USB_DEVICE(0x582, 0x00a6),
@@ -1371,6 +1431,131 @@ YAMAHA_DEVICE(0x7010, "UB99"),
 					.out_cables = 0x0001,
 					.in_cables  = 0x0001
 				}
+			},
+			{
+				.ifnum = -1
+			}
+		}
+	}
+},
+{
+	/* Roland SonicCell */
+	USB_DEVICE(0x0582, 0x00c2),
+	.driver_info = (unsigned long) & (const struct snd_usb_audio_quirk) {
+		.vendor_name = "Roland",
+		.product_name = "SonicCell",
+		.ifnum = QUIRK_ANY_INTERFACE,
+		.type = QUIRK_COMPOSITE,
+		.data = (const struct snd_usb_audio_quirk[]) {
+			{
+				.ifnum = 0,
+				.type = QUIRK_AUDIO_STANDARD_INTERFACE
+			},
+			{
+				.ifnum = 1,
+				.type = QUIRK_AUDIO_STANDARD_INTERFACE
+			},
+			{
+				.ifnum = 2,
+				.type = QUIRK_MIDI_FIXED_ENDPOINT,
+				.data = & (const struct snd_usb_midi_endpoint_info) {
+					.out_cables = 0x0001,
+					.in_cables  = 0x0001
+				}
+			},
+			{
+				.ifnum = -1
+			}
+		}
+	}
+},
+{
+	/* Edirol M-16DX */
+	/* FIXME: This quirk gives a good-working capture stream but the
+	 *        playback seems problematic because of lacking of sync
+	 *        with capture stream.  It needs to sync with the capture
+	 *        clock.  As now, you'll get frequent sound distortions
+	 *        via the playback.
+	 */
+	USB_DEVICE(0x0582, 0x00c4),
+	.driver_info = (unsigned long) & (const struct snd_usb_audio_quirk) {
+		.ifnum = QUIRK_ANY_INTERFACE,
+		.type = QUIRK_COMPOSITE,
+		.data = (const struct snd_usb_audio_quirk[]) {
+			{
+				.ifnum = 0,
+				.type = QUIRK_AUDIO_STANDARD_INTERFACE
+			},
+			{
+				.ifnum = 1,
+				.type = QUIRK_AUDIO_STANDARD_INTERFACE
+			},
+			{
+				.ifnum = 2,
+				.type = QUIRK_MIDI_FIXED_ENDPOINT,
+				.data = & (const struct snd_usb_midi_endpoint_info) {
+					.out_cables = 0x0001,
+					.in_cables  = 0x0001
+				}
+			},
+			{
+				.ifnum = -1
+			}
+		}
+	}
+},
+{
+	/* BOSS GT-10 */
+	USB_DEVICE(0x0582, 0x00da),
+	.driver_info = (unsigned long) & (const struct snd_usb_audio_quirk) {
+		.ifnum = QUIRK_ANY_INTERFACE,
+		.type = QUIRK_COMPOSITE,
+		.data = (const struct snd_usb_audio_quirk[]) {
+			{
+				.ifnum = 0,
+				.type = QUIRK_AUDIO_STANDARD_INTERFACE
+			},
+			{
+				.ifnum = 1,
+				.type = QUIRK_AUDIO_STANDARD_INTERFACE
+			},
+			{
+				.ifnum = 2,
+				.type = QUIRK_MIDI_FIXED_ENDPOINT,
+				.data = & (const struct snd_usb_midi_endpoint_info) {
+					.out_cables = 0x0001,
+					.in_cables  = 0x0001
+				}
+			},
+			{
+				.ifnum = -1
+			}
+		}
+	}
+},
+{
+	/* Advanced modes of the Edirol UA-25EX.
+	 * For the standard mode, UA-25EX has ID 0582:00e7, which
+	 * offers only 16-bit PCM at 44.1 kHz and no MIDI.
+	 */
+	USB_DEVICE_VENDOR_SPEC(0x0582, 0x00e6),
+	.driver_info = (unsigned long) & (const struct snd_usb_audio_quirk) {
+		.vendor_name = "EDIROL",
+		.product_name = "UA-25EX",
+		.ifnum = QUIRK_ANY_INTERFACE,
+		.type = QUIRK_COMPOSITE,
+		.data = (const struct snd_usb_audio_quirk[]) {
+			{
+				.ifnum = 0,
+				.type = QUIRK_AUDIO_EDIROL_UAXX
+			},
+			{
+				.ifnum = 1,
+				.type = QUIRK_AUDIO_EDIROL_UAXX
+			},
+			{
+				.ifnum = 2,
+				.type = QUIRK_AUDIO_EDIROL_UAXX
 			},
 			{
 				.ifnum = -1
@@ -1718,7 +1903,7 @@ YAMAHA_DEVICE(0x7010, "UB99"),
 		.data = & (const struct snd_usb_audio_quirk[]) {
 			{
 				.ifnum = 0,
-				.type = QUIRK_MIDI_RAW
+				.type = QUIRK_MIDI_FASTLANE
 			},
 			{
 				.ifnum = 1,
@@ -1798,6 +1983,14 @@ YAMAHA_DEVICE(0x7010, "UB99"),
 		.product_name = "PHASE 26",
 		.ifnum = 3,
 		.type = QUIRK_MIDI_STANDARD_INTERFACE
+	}
+},
+{
+	USB_DEVICE(0x0ccd, 0x0028),
+	.driver_info = (unsigned long) & (const struct snd_usb_audio_quirk) {
+		.vendor_name = "TerraTec",
+		.product_name = "Aureon5.1MkII",
+		.ifnum = QUIRK_NO_INTERFACE
 	}
 },
 {

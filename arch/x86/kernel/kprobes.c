@@ -193,6 +193,9 @@ static int __kprobes can_boost(kprobe_opcode_t *opcodes)
 	kprobe_opcode_t opcode;
 	kprobe_opcode_t *orig_opcodes = opcodes;
 
+	if (search_exception_tables((unsigned long)opcodes))
+		return 0;	/* Page fault may occur on this address. */
+
 retry:
 	if (opcodes - orig_opcodes > MAX_INSN_SIZE - 1)
 		return 0;
@@ -376,9 +379,10 @@ void __kprobes arch_disarm_kprobe(struct kprobe *p)
 
 void __kprobes arch_remove_kprobe(struct kprobe *p)
 {
-	mutex_lock(&kprobe_mutex);
-	free_insn_slot(p->ainsn.insn, (p->ainsn.boostable == 1));
-	mutex_unlock(&kprobe_mutex);
+	if (p->ainsn.insn) {
+		free_insn_slot(p->ainsn.insn, (p->ainsn.boostable == 1));
+		p->ainsn.insn = NULL;
+	}
 }
 
 static void __kprobes save_previous_kprobe(struct kprobe_ctlblk *kcb)
@@ -431,7 +435,6 @@ static void __kprobes prepare_singlestep(struct kprobe *p, struct pt_regs *regs)
 		regs->ip = (unsigned long)p->ainsn.insn;
 }
 
-/* Called with kretprobe_lock held */
 void __kprobes arch_prepare_kretprobe(struct kretprobe_instance *ri,
 				      struct pt_regs *regs)
 {
@@ -446,7 +449,7 @@ void __kprobes arch_prepare_kretprobe(struct kretprobe_instance *ri,
 static void __kprobes setup_singlestep(struct kprobe *p, struct pt_regs *regs,
 				       struct kprobe_ctlblk *kcb)
 {
-#if !defined(CONFIG_PREEMPT) || defined(CONFIG_PM)
+#if !defined(CONFIG_PREEMPT) || defined(CONFIG_FREEZER)
 	if (p->ainsn.boostable == 1 && !p->post_handler) {
 		/* Boost up -- we can execute copied instructions directly */
 		reset_current_kprobe();
@@ -635,13 +638,13 @@ static void __used __kprobes kretprobe_trampoline_holder(void)
 #else
 			"	pushf\n"
 			/*
-			 * Skip cs, ip, orig_ax.
+			 * Skip cs, ip, orig_ax and gs.
 			 * trampoline_handler() will plug in these values
 			 */
-			"	subl $12, %esp\n"
+			"	subl $16, %esp\n"
 			"	pushl %fs\n"
-			"	pushl %ds\n"
 			"	pushl %es\n"
+			"	pushl %ds\n"
 			"	pushl %eax\n"
 			"	pushl %ebp\n"
 			"	pushl %edi\n"
@@ -652,10 +655,10 @@ static void __used __kprobes kretprobe_trampoline_holder(void)
 			"	movl %esp, %eax\n"
 			"	call trampoline_handler\n"
 			/* Move flags to cs */
-			"	movl 52(%esp), %edx\n"
-			"	movl %edx, 48(%esp)\n"
+			"	movl 56(%esp), %edx\n"
+			"	movl %edx, 52(%esp)\n"
 			/* Replace saved flags with true return address. */
-			"	movl %eax, 52(%esp)\n"
+			"	movl %eax, 56(%esp)\n"
 			"	popl %ebx\n"
 			"	popl %ecx\n"
 			"	popl %edx\n"
@@ -663,8 +666,8 @@ static void __used __kprobes kretprobe_trampoline_holder(void)
 			"	popl %edi\n"
 			"	popl %ebp\n"
 			"	popl %eax\n"
-			/* Skip ip, orig_ax, es, ds, fs */
-			"	addl $20, %esp\n"
+			/* Skip ds, es, fs, gs, orig_ax and ip */
+			"	addl $24, %esp\n"
 			"	popf\n"
 #endif
 			"	ret\n");
@@ -682,13 +685,13 @@ static __used __kprobes void *trampoline_handler(struct pt_regs *regs)
 	unsigned long trampoline_address = (unsigned long)&kretprobe_trampoline;
 
 	INIT_HLIST_HEAD(&empty_rp);
-	spin_lock_irqsave(&kretprobe_lock, flags);
-	head = kretprobe_inst_table_head(current);
+	kretprobe_hash_lock(current, &head, &flags);
 	/* fixup registers */
 #ifdef CONFIG_X86_64
 	regs->cs = __KERNEL_CS;
 #else
 	regs->cs = __KERNEL_CS | get_kernel_rpl();
+	regs->gs = 0;
 #endif
 	regs->ip = trampoline_address;
 	regs->orig_ax = ~0UL;
@@ -696,7 +699,7 @@ static __used __kprobes void *trampoline_handler(struct pt_regs *regs)
 	/*
 	 * It is possible to have multiple instances associated with a given
 	 * task either because multiple functions in the call path have
-	 * return probes installed on them, and/or more then one
+	 * return probes installed on them, and/or more than one
 	 * return probe was registered for a target function.
 	 *
 	 * We can handle this because:
@@ -732,7 +735,7 @@ static __used __kprobes void *trampoline_handler(struct pt_regs *regs)
 
 	kretprobe_assert(ri, orig_ret_address, trampoline_address);
 
-	spin_unlock_irqrestore(&kretprobe_lock, flags);
+	kretprobe_hash_unlock(current, &flags);
 
 	hlist_for_each_entry_safe(ri, node, tmp, &empty_rp, hlist) {
 		hlist_del(&ri->hlist);
@@ -860,7 +863,6 @@ static int __kprobes post_kprobe_handler(struct pt_regs *regs)
 
 	resume_execution(cur, regs, kcb);
 	regs->flags |= kcb->kprobe_saved_flags;
-	trace_hardirqs_fixup_flags(regs->flags);
 
 	if ((kcb->kprobe_status != KPROBE_REENTER) && cur->post_handler) {
 		kcb->kprobe_status = KPROBE_HIT_SSDONE;

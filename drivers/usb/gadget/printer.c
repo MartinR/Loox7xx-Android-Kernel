@@ -53,6 +53,20 @@
 
 #include "gadget_chips.h"
 
+
+/*
+ * Kbuild is not very cooperative with respect to linking separately
+ * compiled library objects into one module.  So for now we won't use
+ * separate compilation ... ensuring init/exit sections work to shrink
+ * the runtime footprint, and giving us at least some parts of what
+ * a "gcc --combine ... part1.c part2.c part3.c ... " build would.
+ */
+#include "usbstring.c"
+#include "config.c"
+#include "epautoconf.c"
+
+/*-------------------------------------------------------------------------*/
+
 #define DRIVER_DESC		"Printer Gadget"
 #define DRIVER_VERSION		"2007 OCT 06"
 
@@ -179,7 +193,7 @@ module_param(qlen, uint, S_IRUGO|S_IWUSR);
 
 #define ERROR(dev, fmt, args...) \
 	xprintk(dev, KERN_ERR, fmt, ## args)
-#define WARN(dev, fmt, args...) \
+#define WARNING(dev, fmt, args...) \
 	xprintk(dev, KERN_WARNING, fmt, ## args)
 #define INFO(dev, fmt, args...) \
 	xprintk(dev, KERN_INFO, fmt, ## args)
@@ -211,12 +225,12 @@ module_param(qlen, uint, S_IRUGO|S_IWUSR);
 static struct usb_device_descriptor device_desc = {
 	.bLength =		sizeof device_desc,
 	.bDescriptorType =	USB_DT_DEVICE,
-	.bcdUSB =		__constant_cpu_to_le16(0x0200),
+	.bcdUSB =		cpu_to_le16(0x0200),
 	.bDeviceClass =		USB_CLASS_PER_INTERFACE,
 	.bDeviceSubClass =	0,
 	.bDeviceProtocol =	0,
-	.idVendor =		__constant_cpu_to_le16(PRINTER_VENDOR_NUM),
-	.idProduct =		__constant_cpu_to_le16(PRINTER_PRODUCT_NUM),
+	.idVendor =		cpu_to_le16(PRINTER_VENDOR_NUM),
+	.idProduct =		cpu_to_le16(PRINTER_PRODUCT_NUM),
 	.iManufacturer =	STRING_MANUFACTURER,
 	.iProduct =		STRING_PRODUCT,
 	.iSerialNumber =	STRING_SERIALNUM,
@@ -238,7 +252,7 @@ static struct usb_config_descriptor config_desc = {
 	.bConfigurationValue =	DEV_CONFIG_VALUE,
 	.iConfiguration =	0,
 	.bmAttributes =		USB_CONFIG_ATT_ONE | USB_CONFIG_ATT_SELFPOWER,
-	.bMaxPower =		1	/* Self-Powered */
+	.bMaxPower =		CONFIG_USB_GADGET_VBUS_DRAW / 2,
 };
 
 static struct usb_interface_descriptor intf_desc = {
@@ -285,20 +299,20 @@ static struct usb_endpoint_descriptor hs_ep_in_desc = {
 	.bLength =		USB_DT_ENDPOINT_SIZE,
 	.bDescriptorType =	USB_DT_ENDPOINT,
 	.bmAttributes =		USB_ENDPOINT_XFER_BULK,
-	.wMaxPacketSize =	__constant_cpu_to_le16(512)
+	.wMaxPacketSize =	cpu_to_le16(512)
 };
 
 static struct usb_endpoint_descriptor hs_ep_out_desc = {
 	.bLength =		USB_DT_ENDPOINT_SIZE,
 	.bDescriptorType =	USB_DT_ENDPOINT,
 	.bmAttributes =		USB_ENDPOINT_XFER_BULK,
-	.wMaxPacketSize =	__constant_cpu_to_le16(512)
+	.wMaxPacketSize =	cpu_to_le16(512)
 };
 
 static struct usb_qualifier_descriptor dev_qualifier = {
 	.bLength =		sizeof dev_qualifier,
 	.bDescriptorType =	USB_DT_DEVICE_QUALIFIER,
-	.bcdUSB =		__constant_cpu_to_le16(0x0200),
+	.bcdUSB =		cpu_to_le16(0x0200),
 	.bDeviceClass =		USB_CLASS_PRINTER,
 	.bNumConfigurations =	1
 };
@@ -462,6 +476,7 @@ printer_open(struct inode *inode, struct file *fd)
 	unsigned long		flags;
 	int			ret = -EBUSY;
 
+	lock_kernel();
 	dev = container_of(inode->i_cdev, struct printer_dev, printer_cdev);
 
 	spin_lock_irqsave(&dev->lock, flags);
@@ -477,7 +492,7 @@ printer_open(struct inode *inode, struct file *fd)
 	spin_unlock_irqrestore(&dev->lock, flags);
 
 	DBG(dev, "printer_open returned %x\n", ret);
-
+	unlock_kernel();
 	return ret;
 }
 
@@ -827,9 +842,8 @@ printer_poll(struct file *fd, poll_table *wait)
 	return status;
 }
 
-static int
-printer_ioctl(struct inode *inode, struct file *fd, unsigned int code,
-		unsigned long arg)
+static long
+printer_ioctl(struct file *fd, unsigned int code, unsigned long arg)
 {
 	struct printer_dev	*dev = fd->private_data;
 	unsigned long		flags;
@@ -861,14 +875,14 @@ printer_ioctl(struct inode *inode, struct file *fd, unsigned int code,
 }
 
 /* used after endpoint configuration */
-static struct file_operations printer_io_operations = {
+static const struct file_operations printer_io_operations = {
 	.owner =	THIS_MODULE,
 	.open =		printer_open,
 	.read =		printer_read,
 	.write =	printer_write,
 	.fsync =	printer_fsync,
 	.poll =		printer_poll,
-	.ioctl =	printer_ioctl,
+	.unlocked_ioctl = printer_ioctl,
 	.release =	printer_close
 };
 
@@ -1264,8 +1278,7 @@ unknown:
 	/* respond with data transfer before status phase? */
 	if (value >= 0) {
 		req->length = value;
-		req->zero = value < wLength
-				&& (value % gadget->ep0->maxpacket) == 0;
+		req->zero = value < wLength;
 		value = usb_ep_queue(gadget->ep0, req, GFP_ATOMIC);
 		if (value < 0) {
 			DBG(dev, "ep_queue --> %d\n", value);
@@ -1361,7 +1374,7 @@ printer_bind(struct usb_gadget *gadget)
 
 	/* Setup the sysfs files for the printer gadget. */
 	dev->pdev = device_create(usb_gadget_class, NULL, g_printer_devno,
-			"g_printer");
+				  NULL, "g_printer");
 	if (IS_ERR(dev->pdev)) {
 		ERROR(dev, "Failed to create device: g_printer\n");
 		goto fail;
@@ -1393,16 +1406,16 @@ printer_bind(struct usb_gadget *gadget)
 			gadget->name);
 		/* unrecognized, but safe unless bulk is REALLY quirky */
 		device_desc.bcdDevice =
-			__constant_cpu_to_le16(0xFFFF);
+			cpu_to_le16(0xFFFF);
 	}
 	snprintf(manufacturer, sizeof(manufacturer), "%s %s with %s",
 		init_utsname()->sysname, init_utsname()->release,
 		gadget->name);
 
 	device_desc.idVendor =
-		__constant_cpu_to_le16(PRINTER_VENDOR_NUM);
+		cpu_to_le16(PRINTER_VENDOR_NUM);
 	device_desc.idProduct =
-		__constant_cpu_to_le16(PRINTER_PRODUCT_NUM);
+		cpu_to_le16(PRINTER_PRODUCT_NUM);
 
 	/* support optional vendor/distro customization */
 	if (idVendor) {
@@ -1463,7 +1476,6 @@ autoconf_fail:
 	if (gadget->is_otg) {
 		otg_desc.bmAttributes |= USB_OTG_HNP,
 		config_desc.bmAttributes |= USB_CONFIG_ATT_WAKEUP;
-		config_desc.bMaxPower = 4;
 	}
 
 	spin_lock_init(&dev->lock);

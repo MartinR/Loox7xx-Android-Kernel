@@ -22,7 +22,6 @@
 #include <linux/random.h>
 
 #include <asm/io.h>
-#include <asm/gdb-stub.h>
 #include <int.h>
 #include <uart.h>
 
@@ -70,9 +69,9 @@ static int pnx8550_registers_read(char* page, char** start, off_t offset, int co
         return len;
 }
 
-static struct proc_dir_entry* pnx8550_dir        = NULL;
-static struct proc_dir_entry* pnx8550_timers     = NULL;
-static struct proc_dir_entry* pnx8550_registers  = NULL;
+static struct proc_dir_entry* pnx8550_dir;
+static struct proc_dir_entry* pnx8550_timers;
+static struct proc_dir_entry* pnx8550_registers;
 
 static int pnx8550_proc_init( void )
 {

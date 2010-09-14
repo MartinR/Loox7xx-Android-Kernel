@@ -21,8 +21,7 @@
 
 #include <asm/io.h>
 #include <asm/mtrr.h>
-
-#include <setup_arch.h>
+#include <asm/visws/sgivw.h>
 
 #define INCLUDE_TIMING_TABLE_DATA
 #define DBE_REG_BASE par->regs
@@ -838,6 +837,8 @@ static int sgivwfb_remove(struct platform_device *dev)
 		iounmap(par->regs);
 		iounmap(info->screen_base);
 		release_mem_region(DBE_REG_PHYS, DBE_REG_SIZE);
+		fb_dealloc_cmap(&info->cmap);
+		framebuffer_release(info);
 	}
 	return 0;
 }

@@ -89,7 +89,6 @@ static struct nand_ecclayout fsl_elbc_oob_sp_eccm0 = {
 	.eccbytes = 3,
 	.eccpos = {6, 7, 8},
 	.oobfree = { {0, 5}, {9, 7} },
-	.oobavail = 12,
 };
 
 /* Small Page FLASH with FMR[ECCM] = 1 */
@@ -97,7 +96,6 @@ static struct nand_ecclayout fsl_elbc_oob_sp_eccm1 = {
 	.eccbytes = 3,
 	.eccpos = {8, 9, 10},
 	.oobfree = { {0, 5}, {6, 2}, {11, 5} },
-	.oobavail = 12,
 };
 
 /* Large Page FLASH with FMR[ECCM] = 0 */
@@ -105,7 +103,6 @@ static struct nand_ecclayout fsl_elbc_oob_lp_eccm0 = {
 	.eccbytes = 12,
 	.eccpos = {6, 7, 8, 22, 23, 24, 38, 39, 40, 54, 55, 56},
 	.oobfree = { {1, 5}, {9, 13}, {25, 13}, {41, 13}, {57, 7} },
-	.oobavail = 48,
 };
 
 /* Large Page FLASH with FMR[ECCM] = 1 */
@@ -113,7 +110,48 @@ static struct nand_ecclayout fsl_elbc_oob_lp_eccm1 = {
 	.eccbytes = 12,
 	.eccpos = {8, 9, 10, 24, 25, 26, 40, 41, 42, 56, 57, 58},
 	.oobfree = { {1, 7}, {11, 13}, {27, 13}, {43, 13}, {59, 5} },
-	.oobavail = 48,
+};
+
+/*
+ * fsl_elbc_oob_lp_eccm* specify that LP NAND's OOB free area starts at offset
+ * 1, so we have to adjust bad block pattern. This pattern should be used for
+ * x8 chips only. So far hardware does not support x16 chips anyway.
+ */
+static u8 scan_ff_pattern[] = { 0xff, };
+
+static struct nand_bbt_descr largepage_memorybased = {
+	.options = 0,
+	.offs = 0,
+	.len = 1,
+	.pattern = scan_ff_pattern,
+};
+
+/*
+ * ELBC may use HW ECC, so that OOB offsets, that NAND core uses for bbt,
+ * interfere with ECC positions, that's why we implement our own descriptors.
+ * OOB {11, 5}, works for both SP and LP chips, with ECCM = 1 and ECCM = 0.
+ */
+static u8 bbt_pattern[] = {'B', 'b', 't', '0' };
+static u8 mirror_pattern[] = {'1', 't', 'b', 'B' };
+
+static struct nand_bbt_descr bbt_main_descr = {
+	.options = NAND_BBT_LASTBLOCK | NAND_BBT_CREATE | NAND_BBT_WRITE |
+		   NAND_BBT_2BIT | NAND_BBT_VERSION,
+	.offs =	11,
+	.len = 4,
+	.veroffs = 15,
+	.maxblocks = 4,
+	.pattern = bbt_pattern,
+};
+
+static struct nand_bbt_descr bbt_mirror_descr = {
+	.options = NAND_BBT_LASTBLOCK | NAND_BBT_CREATE | NAND_BBT_WRITE |
+		   NAND_BBT_2BIT | NAND_BBT_VERSION,
+	.offs =	11,
+	.len = 4,
+	.veroffs = 15,
+	.maxblocks = 4,
+	.pattern = mirror_pattern,
 };
 
 /*=================================*/
@@ -638,7 +676,7 @@ static int fsl_elbc_chip_init_tail(struct mtd_info *mtd)
 
 	dev_dbg(ctrl->dev, "fsl_elbc_init: nand->numchips = %d\n",
 	        chip->numchips);
-	dev_dbg(ctrl->dev, "fsl_elbc_init: nand->chipsize = %ld\n",
+	dev_dbg(ctrl->dev, "fsl_elbc_init: nand->chipsize = %lld\n",
 	        chip->chipsize);
 	dev_dbg(ctrl->dev, "fsl_elbc_init: nand->pagemask = %8x\n",
 	        chip->pagemask);
@@ -665,7 +703,7 @@ static int fsl_elbc_chip_init_tail(struct mtd_info *mtd)
 	dev_dbg(ctrl->dev, "fsl_elbc_init: nand->ecc.layout = %p\n",
 	        chip->ecc.layout);
 	dev_dbg(ctrl->dev, "fsl_elbc_init: mtd->flags = %08x\n", mtd->flags);
-	dev_dbg(ctrl->dev, "fsl_elbc_init: mtd->size = %d\n", mtd->size);
+	dev_dbg(ctrl->dev, "fsl_elbc_init: mtd->size = %lld\n", mtd->size);
 	dev_dbg(ctrl->dev, "fsl_elbc_init: mtd->erasesize = %d\n",
 	        mtd->erasesize);
 	dev_dbg(ctrl->dev, "fsl_elbc_init: mtd->writesize = %d\n",
@@ -687,8 +725,7 @@ static int fsl_elbc_chip_init_tail(struct mtd_info *mtd)
 			chip->ecc.layout = (priv->fmr & FMR_ECCM) ?
 			                   &fsl_elbc_oob_lp_eccm1 :
 			                   &fsl_elbc_oob_lp_eccm0;
-			mtd->ecclayout = chip->ecc.layout;
-			mtd->oobavail = chip->ecc.layout->oobavail;
+			chip->badblock_pattern = &largepage_memorybased;
 		}
 	} else {
 		dev_err(ctrl->dev,
@@ -702,7 +739,8 @@ static int fsl_elbc_chip_init_tail(struct mtd_info *mtd)
 
 static int fsl_elbc_read_page(struct mtd_info *mtd,
                               struct nand_chip *chip,
-                              uint8_t *buf)
+			      uint8_t *buf,
+			      int page)
 {
 	fsl_elbc_read_buf(mtd, buf, mtd->writesize);
 	fsl_elbc_read_buf(mtd, chip->oob_poi, mtd->oobsize);
@@ -740,7 +778,9 @@ static int fsl_elbc_chip_init(struct fsl_elbc_mtd *priv)
 	/* Fill in fsl_elbc_mtd structure */
 	priv->mtd.priv = chip;
 	priv->mtd.owner = THIS_MODULE;
-	priv->fmr = 0; /* rest filled in later */
+
+	/* Set the ECCM according to the settings in bootloader.*/
+	priv->fmr = in_be32(&lbc->fmr) & FMR_ECCM;
 
 	/* fill in nand_chip structure */
 	/* set up function call table */
@@ -752,8 +792,12 @@ static int fsl_elbc_chip_init(struct fsl_elbc_mtd *priv)
 	chip->cmdfunc = fsl_elbc_cmdfunc;
 	chip->waitfunc = fsl_elbc_wait;
 
+	chip->bbt_td = &bbt_main_descr;
+	chip->bbt_md = &bbt_mirror_descr;
+
 	/* set up nand options */
-	chip->options = NAND_NO_READRDY | NAND_NO_AUTOINCR;
+	chip->options = NAND_NO_READRDY | NAND_NO_AUTOINCR |
+			NAND_USE_FLASH_BBT;
 
 	chip->controller = &ctrl->controller;
 	chip->priv = priv;
@@ -795,8 +839,8 @@ static int fsl_elbc_chip_remove(struct fsl_elbc_mtd *priv)
 	return 0;
 }
 
-static int fsl_elbc_chip_probe(struct fsl_elbc_ctrl *ctrl,
-                               struct device_node *node)
+static int __devinit fsl_elbc_chip_probe(struct fsl_elbc_ctrl *ctrl,
+					 struct device_node *node)
 {
 	struct fsl_lbc_regs __iomem *lbc = ctrl->regs;
 	struct fsl_elbc_mtd *priv;
@@ -846,7 +890,7 @@ static int fsl_elbc_chip_probe(struct fsl_elbc_ctrl *ctrl,
 		goto err;
 	}
 
-	priv->mtd.name = kasprintf(GFP_KERNEL, "%x.flash", res.start);
+	priv->mtd.name = kasprintf(GFP_KERNEL, "%x.flash", (unsigned)res.start);
 	if (!priv->mtd.name) {
 		ret = -ENOMEM;
 		goto err;
@@ -877,8 +921,7 @@ static int fsl_elbc_chip_probe(struct fsl_elbc_ctrl *ctrl,
 
 #ifdef CONFIG_MTD_OF_PARTS
 	if (ret == 0) {
-		ret = of_mtd_parse_partitions(priv->dev, &priv->mtd,
-		                              node, &parts);
+		ret = of_mtd_parse_partitions(priv->dev, node, &parts);
 		if (ret < 0)
 			goto err;
 	}
@@ -890,8 +933,8 @@ static int fsl_elbc_chip_probe(struct fsl_elbc_ctrl *ctrl,
 #endif
 		add_mtd_device(&priv->mtd);
 
-	printk(KERN_INFO "eLBC NAND device at 0x%zx, bank %d\n",
-	       res.start, priv->bank);
+	printk(KERN_INFO "eLBC NAND device at 0x%llx, bank %d\n",
+	       (unsigned long long)res.start, priv->bank);
 	return 0;
 
 err:
@@ -917,7 +960,7 @@ static int __devinit fsl_elbc_ctrl_init(struct fsl_elbc_ctrl *ctrl)
 	return 0;
 }
 
-static int __devexit fsl_elbc_ctrl_remove(struct of_device *ofdev)
+static int fsl_elbc_ctrl_remove(struct of_device *ofdev)
 {
 	struct fsl_elbc_ctrl *ctrl = dev_get_drvdata(&ofdev->dev);
 	int i;
@@ -1041,7 +1084,7 @@ static struct of_platform_driver fsl_elbc_ctrl_driver = {
 	},
 	.match_table = fsl_elbc_match,
 	.probe = fsl_elbc_ctrl_probe,
-	.remove = __devexit_p(fsl_elbc_ctrl_remove),
+	.remove = fsl_elbc_ctrl_remove,
 };
 
 static int __init fsl_elbc_init(void)

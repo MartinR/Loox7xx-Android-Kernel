@@ -29,6 +29,7 @@
  *		<jkenisto@us.ibm.com>  and Prasanna S Panchamukhi
  *		<prasanna@in.ibm.com> added function-return probes.
  */
+#include <linux/linkage.h>
 #include <linux/list.h>
 #include <linux/notifier.h>
 #include <linux/smp.h>
@@ -48,6 +49,13 @@
 
 /* Attach to insert probes on any functions which should be ignored*/
 #define __kprobes	__attribute__((__section__(".kprobes.text")))
+#else /* CONFIG_KPROBES */
+typedef int kprobe_opcode_t;
+struct arch_specific_insn {
+	int dummy;
+};
+#define __kprobes
+#endif /* CONFIG_KPROBES */
 
 struct kprobe;
 struct pt_regs;
@@ -68,9 +76,6 @@ struct kprobe {
 	/* list of kprobes for multi-handler support */
 	struct list_head list;
 
-	/* Indicates that the corresponding module has been ref counted */
-	unsigned int mod_refcounted;
-
 	/*count the number of times this probe was temporarily disarmed */
 	unsigned long nmissed;
 
@@ -89,12 +94,16 @@ struct kprobe {
 	/* Called after addr is executed, unless... */
 	kprobe_post_handler_t post_handler;
 
-	/* ... called if executing addr causes a fault (eg. page fault).
-	 * Return 1 if it handled fault, otherwise kernel will see it. */
+	/*
+	 * ... called if executing addr causes a fault (eg. page fault).
+	 * Return 1 if it handled fault, otherwise kernel will see it.
+	 */
 	kprobe_fault_handler_t fault_handler;
 
-	/* ... called if breakpoint trap occurs in probe handler.
-	 * Return 1 if it handled break, otherwise kernel will see it. */
+	/*
+	 * ... called if breakpoint trap occurs in probe handler.
+	 * Return 1 if it handled break, otherwise kernel will see it.
+	 */
 	kprobe_break_handler_t break_handler;
 
 	/* Saved opcode (which has been replaced with breakpoint) */
@@ -102,8 +111,29 @@ struct kprobe {
 
 	/* copy of the original instruction */
 	struct arch_specific_insn ainsn;
+
+	/*
+	 * Indicates various status flags.
+	 * Protected by kprobe_mutex after this kprobe is registered.
+	 */
+	u32 flags;
 };
 
+/* Kprobe status flags */
+#define KPROBE_FLAG_GONE	1 /* breakpoint has already gone */
+#define KPROBE_FLAG_DISABLED	2 /* probe is temporarily disabled */
+
+/* Has this kprobe gone ? */
+static inline int kprobe_gone(struct kprobe *p)
+{
+	return p->flags & KPROBE_FLAG_GONE;
+}
+
+/* Is this kprobe disabled ? */
+static inline int kprobe_disabled(struct kprobe *p)
+{
+	return p->flags & (KPROBE_FLAG_DISABLED | KPROBE_FLAG_GONE);
+}
 /*
  * Special probe type that uses setjmp-longjmp type tricks to resume
  * execution at a specified entry with a matching prototype corresponding
@@ -122,23 +152,6 @@ struct jprobe {
 /* For backward compatibility with old code using JPROBE_ENTRY() */
 #define JPROBE_ENTRY(handler)	(handler)
 
-DECLARE_PER_CPU(struct kprobe *, current_kprobe);
-DECLARE_PER_CPU(struct kprobe_ctlblk, kprobe_ctlblk);
-
-#ifdef CONFIG_KRETPROBES
-extern void arch_prepare_kretprobe(struct kretprobe_instance *ri,
-				   struct pt_regs *regs);
-extern int arch_trampoline_kprobe(struct kprobe *p);
-#else /* CONFIG_KRETPROBES */
-static inline void arch_prepare_kretprobe(struct kretprobe *rp,
-					struct pt_regs *regs)
-{
-}
-static inline int arch_trampoline_kprobe(struct kprobe *p)
-{
-	return 0;
-}
-#endif /* CONFIG_KRETPROBES */
 /*
  * Function-return probe -
  * Note:
@@ -157,11 +170,10 @@ struct kretprobe {
 	int nmissed;
 	size_t data_size;
 	struct hlist_head free_instances;
-	struct hlist_head used_instances;
+	spinlock_t lock;
 };
 
 struct kretprobe_instance {
-	struct hlist_node uflist; /* either on free list or used list */
 	struct hlist_node hlist;
 	struct kretprobe *rp;
 	kprobe_opcode_t *ret_addr;
@@ -179,6 +191,33 @@ struct kprobe_blackpoint {
 	unsigned long start_addr;
 	unsigned long range;
 };
+
+#ifdef CONFIG_KPROBES
+DECLARE_PER_CPU(struct kprobe *, current_kprobe);
+DECLARE_PER_CPU(struct kprobe_ctlblk, kprobe_ctlblk);
+
+/*
+ * For #ifdef avoidance:
+ */
+static inline int kprobes_built_in(void)
+{
+	return 1;
+}
+
+#ifdef CONFIG_KRETPROBES
+extern void arch_prepare_kretprobe(struct kretprobe_instance *ri,
+				   struct pt_regs *regs);
+extern int arch_trampoline_kprobe(struct kprobe *p);
+#else /* CONFIG_KRETPROBES */
+static inline void arch_prepare_kretprobe(struct kretprobe *rp,
+					struct pt_regs *regs)
+{
+}
+static inline int arch_trampoline_kprobe(struct kprobe *p)
+{
+	return 0;
+}
+#endif /* CONFIG_KRETPROBES */
 
 extern struct kretprobe_blackpoint kretprobe_blacklist[];
 
@@ -201,8 +240,6 @@ static inline int init_test_probes(void)
 }
 #endif /* CONFIG_KPROBES_SANITY_TEST */
 
-extern spinlock_t kretprobe_lock;
-extern struct mutex kprobe_mutex;
 extern int arch_prepare_kprobe(struct kprobe *p);
 extern void arch_arm_kprobe(struct kprobe *p);
 extern void arch_disarm_kprobe(struct kprobe *p);
@@ -214,6 +251,9 @@ extern void kprobes_inc_nmissed_count(struct kprobe *p);
 
 /* Get the kprobe at this addr (if any) - called with preemption disabled */
 struct kprobe *get_kprobe(void *addr);
+void kretprobe_hash_lock(struct task_struct *tsk,
+			 struct hlist_head **head, unsigned long *flags);
+void kretprobe_hash_unlock(struct task_struct *tsk, unsigned long *flags);
 struct hlist_head * kretprobe_inst_table_head(struct task_struct *tsk);
 
 /* kprobe_running() will just return the current_kprobe on this CPU */
@@ -253,12 +293,23 @@ void unregister_kretprobes(struct kretprobe **rps, int num);
 void kprobe_flush_task(struct task_struct *tk);
 void recycle_rp_inst(struct kretprobe_instance *ri, struct hlist_head *head);
 
-#else /* CONFIG_KPROBES */
+int disable_kprobe(struct kprobe *kp);
+int enable_kprobe(struct kprobe *kp);
 
-#define __kprobes	/**/
-struct jprobe;
-struct kretprobe;
+#else /* !CONFIG_KPROBES: */
 
+static inline int kprobes_built_in(void)
+{
+	return 0;
+}
+static inline int kprobe_fault_handler(struct pt_regs *regs, int trapnr)
+{
+	return 0;
+}
+static inline struct kprobe *get_kprobe(void *addr)
+{
+	return NULL;
+}
 static inline struct kprobe *kprobe_running(void)
 {
 	return NULL;
@@ -311,5 +362,30 @@ static inline void unregister_kretprobes(struct kretprobe **rps, int num)
 static inline void kprobe_flush_task(struct task_struct *tk)
 {
 }
-#endif				/* CONFIG_KPROBES */
-#endif				/* _LINUX_KPROBES_H */
+static inline int disable_kprobe(struct kprobe *kp)
+{
+	return -ENOSYS;
+}
+static inline int enable_kprobe(struct kprobe *kp)
+{
+	return -ENOSYS;
+}
+#endif /* CONFIG_KPROBES */
+static inline int disable_kretprobe(struct kretprobe *rp)
+{
+	return disable_kprobe(&rp->kp);
+}
+static inline int enable_kretprobe(struct kretprobe *rp)
+{
+	return enable_kprobe(&rp->kp);
+}
+static inline int disable_jprobe(struct jprobe *jp)
+{
+	return disable_kprobe(&jp->kp);
+}
+static inline int enable_jprobe(struct jprobe *jp)
+{
+	return enable_kprobe(&jp->kp);
+}
+
+#endif /* _LINUX_KPROBES_H */

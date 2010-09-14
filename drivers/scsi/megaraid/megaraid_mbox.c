@@ -458,7 +458,7 @@ megaraid_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	if (adapter == NULL) {
 		con_log(CL_ANN, (KERN_WARNING
-		"megaraid: out of memory, %s %d.\n", __FUNCTION__, __LINE__));
+		"megaraid: out of memory, %s %d.\n", __func__, __LINE__));
 
 		goto out_probe_one;
 	}
@@ -473,7 +473,7 @@ megaraid_probe_one(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	// Setup the default DMA mask. This would be changed later on
 	// depending on hardware capabilities
-	if (pci_set_dma_mask(adapter->pdev, DMA_32BIT_MASK) != 0) {
+	if (pci_set_dma_mask(adapter->pdev, DMA_BIT_MASK(32)) != 0) {
 
 		con_log(CL_ANN, (KERN_WARNING
 			"megaraid: pci_set_dma_mask failed:%d\n", __LINE__));
@@ -900,11 +900,11 @@ megaraid_init_mbox(adapter_t *adapter)
 		adapter->pdev->device == PCI_DEVICE_ID_PERC4_DI_EVERGLADES) ||
 		(adapter->pdev->vendor == PCI_VENDOR_ID_DELL &&
 		adapter->pdev->device == PCI_DEVICE_ID_PERC4E_DI_KOBUK)) {
-		if (pci_set_dma_mask(adapter->pdev, DMA_64BIT_MASK)) {
+		if (pci_set_dma_mask(adapter->pdev, DMA_BIT_MASK(64))) {
 			con_log(CL_ANN, (KERN_WARNING
 				"megaraid: DMA mask for 64-bit failed\n"));
 
-			if (pci_set_dma_mask (adapter->pdev, DMA_32BIT_MASK)) {
+			if (pci_set_dma_mask (adapter->pdev, DMA_BIT_MASK(32))) {
 				con_log(CL_ANN, (KERN_WARNING
 					"megaraid: 32-bit DMA mask failed\n"));
 				goto out_free_sysfs_res;
@@ -1002,7 +1002,7 @@ megaraid_alloc_cmd_packets(adapter_t *adapter)
 
 	if (!raid_dev->una_mbox64) {
 		con_log(CL_ANN, (KERN_WARNING
-			"megaraid: out of memory, %s %d\n", __FUNCTION__,
+			"megaraid: out of memory, %s %d\n", __func__,
 			__LINE__));
 		return -1;
 	}
@@ -1030,7 +1030,7 @@ megaraid_alloc_cmd_packets(adapter_t *adapter)
 	if (!adapter->ibuf) {
 
 		con_log(CL_ANN, (KERN_WARNING
-			"megaraid: out of memory, %s %d\n", __FUNCTION__,
+			"megaraid: out of memory, %s %d\n", __func__,
 			__LINE__));
 
 		goto out_free_common_mbox;
@@ -1052,7 +1052,7 @@ megaraid_alloc_cmd_packets(adapter_t *adapter)
 
 	if (adapter->kscb_list == NULL) {
 		con_log(CL_ANN, (KERN_WARNING
-			"megaraid: out of memory, %s %d\n", __FUNCTION__,
+			"megaraid: out of memory, %s %d\n", __func__,
 			__LINE__));
 		goto out_free_ibuf;
 	}
@@ -1060,7 +1060,7 @@ megaraid_alloc_cmd_packets(adapter_t *adapter)
 	// memory allocation for our command packets
 	if (megaraid_mbox_setup_dma_pools(adapter) != 0) {
 		con_log(CL_ANN, (KERN_WARNING
-			"megaraid: out of memory, %s %d\n", __FUNCTION__,
+			"megaraid: out of memory, %s %d\n", __func__,
 			__LINE__));
 		goto out_free_scb_list;
 	}
@@ -2981,7 +2981,7 @@ megaraid_mbox_product_info(adapter_t *adapter)
 
 	if (pinfo == NULL) {
 		con_log(CL_ANN, (KERN_WARNING
-			"megaraid: out of memory, %s %d\n", __FUNCTION__,
+			"megaraid: out of memory, %s %d\n", __func__,
 			__LINE__));
 
 		return -1;
@@ -3508,7 +3508,7 @@ megaraid_cmm_register(adapter_t *adapter)
 
 	if (adapter->uscb_list == NULL) {
 		con_log(CL_ANN, (KERN_WARNING
-			"megaraid: out of memory, %s %d\n", __FUNCTION__,
+			"megaraid: out of memory, %s %d\n", __func__,
 			__LINE__));
 		return -1;
 	}
@@ -3879,7 +3879,7 @@ megaraid_sysfs_alloc_resources(adapter_t *adapter)
 		!raid_dev->sysfs_buffer) {
 
 		con_log(CL_ANN, (KERN_WARNING
-			"megaraid: out of memory, %s %d\n", __FUNCTION__,
+			"megaraid: out of memory, %s %d\n", __func__,
 			__LINE__));
 
 		rval = -ENOMEM;

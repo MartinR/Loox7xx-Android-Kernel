@@ -17,6 +17,7 @@
 #include <linux/poll.h>
 #include <linux/proc_fs.h>
 #include <linux/skbuff.h>
+#include <linux/smp_lock.h>
 #include <asm/uaccess.h>
 
 #include "platform.h"
@@ -117,7 +118,6 @@ static int DIVA_INIT_FUNCTION create_um_idi_proc(void)
 		return (0);
 
 	um_idi_proc_entry->read_proc = um_idi_proc_read;
-	um_idi_proc_entry->owner = THIS_MODULE;
 
 	return (1);
 }
@@ -400,6 +400,7 @@ static unsigned int um_idi_poll(struct file *file, poll_table * wait)
 
 static int um_idi_open(struct inode *inode, struct file *file)
 {
+	cycle_kernel_lock();
 	return (0);
 }
 

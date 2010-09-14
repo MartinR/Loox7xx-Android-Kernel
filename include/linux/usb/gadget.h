@@ -33,7 +33,8 @@ struct usb_ep;
  * @short_not_ok: When reading data, makes short packets be
  *     treated as errors (queue stops advancing till cleanup).
  * @complete: Function called when request completes, so this request and
- *	its buffer may be re-used.
+ *	its buffer may be re-used.  The function will always be called with
+ *	interrupts disabled, and it must not sleep.
  *	Reads terminate with a short packet, or when the buffer fills,
  *	whichever comes first.  When writes terminate, some data bytes
  *	will usually still be in flight (often in a hardware fifo).
@@ -271,7 +272,10 @@ static inline void usb_ep_free_request(struct usb_ep *ep,
  * (Note that some USB device controllers disallow protocol stall responses
  * in some cases.)  When control responses are deferred (the response is
  * written after the setup callback returns), then usb_ep_set_halt() may be
- * used on ep0 to trigger protocol stalls.
+ * used on ep0 to trigger protocol stalls.  Depending on the controller,
+ * it may not be possible to trigger a status-stage protocol stall when the
+ * data stage is over, that is, from within the response's completion
+ * routine.
  *
  * For periodic endpoints, like interrupt or isochronous ones, the usb host
  * arranges to poll once per interval, and the gadget driver usually will
@@ -594,6 +598,7 @@ static inline int usb_gadget_clear_selfpowered(struct usb_gadget *gadget)
 /**
  * usb_gadget_vbus_connect - Notify controller that VBUS is powered
  * @gadget:The device which now has VBUS power.
+ * Context: can sleep
  *
  * This call is used by a driver for an external transceiver (or GPIO)
  * that detects a VBUS power session starting.  Common responses include
@@ -632,6 +637,7 @@ static inline int usb_gadget_vbus_draw(struct usb_gadget *gadget, unsigned mA)
 /**
  * usb_gadget_vbus_disconnect - notify controller about VBUS session end
  * @gadget:the device whose VBUS supply is being described
+ * Context: can sleep
  *
  * This call is used by a driver for an external transceiver (or GPIO)
  * that detects a VBUS power session ending.  Common responses include
@@ -788,19 +794,20 @@ struct usb_gadget_driver {
 /**
  * usb_gadget_register_driver - register a gadget driver
  * @driver:the driver being registered
+ * Context: can sleep
  *
  * Call this in your gadget driver's module initialization function,
  * to tell the underlying usb controller driver about your driver.
  * The driver's bind() function will be called to bind it to a
  * gadget before this registration call returns.  It's expected that
  * the bind() functions will be in init sections.
- * This function must be called in a context that can sleep.
  */
 int usb_gadget_register_driver(struct usb_gadget_driver *driver);
 
 /**
  * usb_gadget_unregister_driver - unregister a gadget driver
  * @driver:the driver being unregistered
+ * Context: can sleep
  *
  * Call this in your gadget driver's module cleanup function,
  * to tell the underlying usb controller that your driver is
@@ -809,7 +816,6 @@ int usb_gadget_register_driver(struct usb_gadget_driver *driver);
  * to unbind() and clean up any device state, before this procedure
  * finally returns.  It's expected that the unbind() functions
  * will in in exit sections, so may not be linked in some kernels.
- * This function must be called in a context that can sleep.
  */
 int usb_gadget_unregister_driver(struct usb_gadget_driver *driver);
 
@@ -857,6 +863,25 @@ int usb_descriptor_fillbuf(void *, unsigned,
 /* build config descriptor from single descriptor vector */
 int usb_gadget_config_buf(const struct usb_config_descriptor *config,
 	void *buf, unsigned buflen, const struct usb_descriptor_header **desc);
+
+/* copy a NULL-terminated vector of descriptors */
+struct usb_descriptor_header **usb_copy_descriptors(
+		struct usb_descriptor_header **);
+
+/* return copy of endpoint descriptor given original descriptor set */
+struct usb_endpoint_descriptor *usb_find_endpoint(
+	struct usb_descriptor_header **src,
+	struct usb_descriptor_header **copy,
+	struct usb_endpoint_descriptor *match);
+
+/**
+ * usb_free_descriptors - free descriptors returned by usb_copy_descriptors()
+ * @v: vector of descriptors
+ */
+static inline void usb_free_descriptors(struct usb_descriptor_header **v)
+{
+	kfree(v);
+}
 
 /*-------------------------------------------------------------------------*/
 

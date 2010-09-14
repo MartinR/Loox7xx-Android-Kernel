@@ -33,6 +33,7 @@
 #include <linux/types.h>
 #include <linux/device.h>
 #include <linux/dmapool.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/list.h>
 #include <linux/highmem.h>
@@ -206,7 +207,7 @@ static int ipath_user_sdma_coalesce(const struct ipath_devdata *dd,
 
 	dma_addr = dma_map_page(&dd->pcidev->dev, page, 0, len,
 				DMA_TO_DEVICE);
-	if (dma_mapping_error(dma_addr)) {
+	if (dma_mapping_error(&dd->pcidev->dev, dma_addr)) {
 		ret = -ENOMEM;
 		goto free_unmap;
 	}
@@ -301,7 +302,7 @@ static int ipath_user_sdma_pin_pages(const struct ipath_devdata *dd,
 				     pages[j], 0, flen, DMA_TO_DEVICE);
 		unsigned long fofs = addr & ~PAGE_MASK;
 
-		if (dma_mapping_error(dma_addr)) {
+		if (dma_mapping_error(&dd->pcidev->dev, dma_addr)) {
 			ret = -ENOMEM;
 			goto done;
 		}
@@ -508,7 +509,7 @@ static int ipath_user_sdma_queue_pkts(const struct ipath_devdata *dd,
 		if (page) {
 			dma_addr = dma_map_page(&dd->pcidev->dev,
 						page, 0, len, DMA_TO_DEVICE);
-			if (dma_mapping_error(dma_addr)) {
+			if (dma_mapping_error(&dd->pcidev->dev, dma_addr)) {
 				ret = -ENOMEM;
 				goto free_pbc;
 			}
@@ -667,13 +668,13 @@ static inline __le64 ipath_sdma_make_desc0(struct ipath_devdata *dd,
 
 static inline __le64 ipath_sdma_make_first_desc0(__le64 descq)
 {
-	return descq | __constant_cpu_to_le64(1ULL << 12);
+	return descq | cpu_to_le64(1ULL << 12);
 }
 
 static inline __le64 ipath_sdma_make_last_desc0(__le64 descq)
 {
 					      /* last */  /* dma head */
-	return descq | __constant_cpu_to_le64(1ULL << 11 | 1ULL << 13);
+	return descq | cpu_to_le64(1ULL << 11 | 1ULL << 13);
 }
 
 static inline __le64 ipath_sdma_make_desc1(u64 addr)
@@ -763,7 +764,7 @@ static int ipath_user_sdma_push_pkts(struct ipath_devdata *dd,
 		if (ofs >= IPATH_SMALLBUF_DWORDS) {
 			for (i = 0; i < pkt->naddr; i++) {
 				dd->ipath_sdma_descq[dtail].qw[0] |=
-					__constant_cpu_to_le64(1ULL << 14);
+					cpu_to_le64(1ULL << 14);
 				if (++dtail == dd->ipath_sdma_descq_cnt)
 					dtail = 0;
 			}

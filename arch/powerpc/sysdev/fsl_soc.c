@@ -22,6 +22,7 @@
 #include <linux/module.h>
 #include <linux/device.h>
 #include <linux/platform_device.h>
+#include <linux/of.h>
 #include <linux/of_platform.h>
 #include <linux/phy.h>
 #include <linux/phy_fixed.h>
@@ -36,6 +37,7 @@
 #include <asm/irq.h>
 #include <asm/time.h>
 #include <asm/prom.h>
+#include <asm/machdep.h>
 #include <sysdev/fsl_soc.h>
 #include <mm/mmu_decl.h>
 #include <asm/cpm2.h>
@@ -207,382 +209,6 @@ static int __init of_add_fixed_phys(void)
 arch_initcall(of_add_fixed_phys);
 #endif /* CONFIG_FIXED_PHY */
 
-static int __init gfar_mdio_of_init(void)
-{
-	struct device_node *np = NULL;
-	struct platform_device *mdio_dev;
-	struct resource res;
-	int ret;
-
-	np = of_find_compatible_node(np, NULL, "fsl,gianfar-mdio");
-
-	/* try the deprecated version */
-	if (!np)
-		np = of_find_compatible_node(np, "mdio", "gianfar");
-
-	if (np) {
-		int k;
-		struct device_node *child = NULL;
-		struct gianfar_mdio_data mdio_data;
-
-		memset(&res, 0, sizeof(res));
-		memset(&mdio_data, 0, sizeof(mdio_data));
-
-		ret = of_address_to_resource(np, 0, &res);
-		if (ret)
-			goto err;
-
-		mdio_dev =
-		    platform_device_register_simple("fsl-gianfar_mdio",
-						    res.start, &res, 1);
-		if (IS_ERR(mdio_dev)) {
-			ret = PTR_ERR(mdio_dev);
-			goto err;
-		}
-
-		for (k = 0; k < 32; k++)
-			mdio_data.irq[k] = PHY_POLL;
-
-		while ((child = of_get_next_child(np, child)) != NULL) {
-			int irq = irq_of_parse_and_map(child, 0);
-			if (irq != NO_IRQ) {
-				const u32 *id = of_get_property(child,
-							"reg", NULL);
-				mdio_data.irq[*id] = irq;
-			}
-		}
-
-		ret =
-		    platform_device_add_data(mdio_dev, &mdio_data,
-					     sizeof(struct gianfar_mdio_data));
-		if (ret)
-			goto unreg;
-	}
-
-	of_node_put(np);
-	return 0;
-
-unreg:
-	platform_device_unregister(mdio_dev);
-err:
-	of_node_put(np);
-	return ret;
-}
-
-arch_initcall(gfar_mdio_of_init);
-
-static const char *gfar_tx_intr = "tx";
-static const char *gfar_rx_intr = "rx";
-static const char *gfar_err_intr = "error";
-
-static int __init gfar_of_init(void)
-{
-	struct device_node *np;
-	unsigned int i;
-	struct platform_device *gfar_dev;
-	struct resource res;
-	int ret;
-
-	for (np = NULL, i = 0;
-	     (np = of_find_compatible_node(np, "network", "gianfar")) != NULL;
-	     i++) {
-		struct resource r[4];
-		struct device_node *phy, *mdio;
-		struct gianfar_platform_data gfar_data;
-		const unsigned int *id;
-		const char *model;
-		const char *ctype;
-		const void *mac_addr;
-		const phandle *ph;
-		int n_res = 2;
-
-		memset(r, 0, sizeof(r));
-		memset(&gfar_data, 0, sizeof(gfar_data));
-
-		ret = of_address_to_resource(np, 0, &r[0]);
-		if (ret)
-			goto err;
-
-		of_irq_to_resource(np, 0, &r[1]);
-
-		model = of_get_property(np, "model", NULL);
-
-		/* If we aren't the FEC we have multiple interrupts */
-		if (model && strcasecmp(model, "FEC")) {
-			r[1].name = gfar_tx_intr;
-
-			r[2].name = gfar_rx_intr;
-			of_irq_to_resource(np, 1, &r[2]);
-
-			r[3].name = gfar_err_intr;
-			of_irq_to_resource(np, 2, &r[3]);
-
-			n_res += 2;
-		}
-
-		gfar_dev =
-		    platform_device_register_simple("fsl-gianfar", i, &r[0],
-						    n_res);
-
-		if (IS_ERR(gfar_dev)) {
-			ret = PTR_ERR(gfar_dev);
-			goto err;
-		}
-
-		mac_addr = of_get_mac_address(np);
-		if (mac_addr)
-			memcpy(gfar_data.mac_addr, mac_addr, 6);
-
-		if (model && !strcasecmp(model, "TSEC"))
-			gfar_data.device_flags =
-			    FSL_GIANFAR_DEV_HAS_GIGABIT |
-			    FSL_GIANFAR_DEV_HAS_COALESCE |
-			    FSL_GIANFAR_DEV_HAS_RMON |
-			    FSL_GIANFAR_DEV_HAS_MULTI_INTR;
-		if (model && !strcasecmp(model, "eTSEC"))
-			gfar_data.device_flags =
-			    FSL_GIANFAR_DEV_HAS_GIGABIT |
-			    FSL_GIANFAR_DEV_HAS_COALESCE |
-			    FSL_GIANFAR_DEV_HAS_RMON |
-			    FSL_GIANFAR_DEV_HAS_MULTI_INTR |
-			    FSL_GIANFAR_DEV_HAS_CSUM |
-			    FSL_GIANFAR_DEV_HAS_VLAN |
-			    FSL_GIANFAR_DEV_HAS_EXTENDED_HASH;
-
-		ctype = of_get_property(np, "phy-connection-type", NULL);
-
-		/* We only care about rgmii-id.  The rest are autodetected */
-		if (ctype && !strcmp(ctype, "rgmii-id"))
-			gfar_data.interface = PHY_INTERFACE_MODE_RGMII_ID;
-		else
-			gfar_data.interface = PHY_INTERFACE_MODE_MII;
-
-		ph = of_get_property(np, "phy-handle", NULL);
-		if (ph == NULL) {
-			u32 *fixed_link;
-
-			fixed_link = (u32 *)of_get_property(np, "fixed-link",
-							   NULL);
-			if (!fixed_link) {
-				ret = -ENODEV;
-				goto unreg;
-			}
-
-			snprintf(gfar_data.bus_id, MII_BUS_ID_SIZE, "0");
-			gfar_data.phy_id = fixed_link[0];
-		} else {
-			phy = of_find_node_by_phandle(*ph);
-
-			if (phy == NULL) {
-				ret = -ENODEV;
-				goto unreg;
-			}
-
-			mdio = of_get_parent(phy);
-
-			id = of_get_property(phy, "reg", NULL);
-			ret = of_address_to_resource(mdio, 0, &res);
-			if (ret) {
-				of_node_put(phy);
-				of_node_put(mdio);
-				goto unreg;
-			}
-
-			gfar_data.phy_id = *id;
-			snprintf(gfar_data.bus_id, MII_BUS_ID_SIZE, "%llx",
-				 (unsigned long long)res.start);
-
-			of_node_put(phy);
-			of_node_put(mdio);
-		}
-
-		ret =
-		    platform_device_add_data(gfar_dev, &gfar_data,
-					     sizeof(struct
-						    gianfar_platform_data));
-		if (ret)
-			goto unreg;
-	}
-
-	return 0;
-
-unreg:
-	platform_device_unregister(gfar_dev);
-err:
-	return ret;
-}
-
-arch_initcall(gfar_of_init);
-
-#ifdef CONFIG_I2C_BOARDINFO
-#include <linux/i2c.h>
-struct i2c_driver_device {
-	char	*of_device;
-	char	*i2c_type;
-};
-
-static struct i2c_driver_device i2c_devices[] __initdata = {
-	{"ricoh,rs5c372a", "rs5c372a"},
-	{"ricoh,rs5c372b", "rs5c372b"},
-	{"ricoh,rv5c386",  "rv5c386"},
-	{"ricoh,rv5c387a", "rv5c387a"},
-	{"dallas,ds1307",  "ds1307"},
-	{"dallas,ds1337",  "ds1337"},
-	{"dallas,ds1338",  "ds1338"},
-	{"dallas,ds1339",  "ds1339"},
-	{"dallas,ds1340",  "ds1340"},
-	{"stm,m41t00",     "m41t00"},
-	{"dallas,ds1374",  "ds1374"},
-};
-
-static int __init of_find_i2c_driver(struct device_node *node,
-				     struct i2c_board_info *info)
-{
-	int i;
-
-	for (i = 0; i < ARRAY_SIZE(i2c_devices); i++) {
-		if (!of_device_is_compatible(node, i2c_devices[i].of_device))
-			continue;
-		if (strlcpy(info->type, i2c_devices[i].i2c_type,
-			    I2C_NAME_SIZE) >= I2C_NAME_SIZE)
-			return -ENOMEM;
-		return 0;
-	}
-	return -ENODEV;
-}
-
-static void __init of_register_i2c_devices(struct device_node *adap_node,
-					   int bus_num)
-{
-	struct device_node *node = NULL;
-
-	while ((node = of_get_next_child(adap_node, node))) {
-		struct i2c_board_info info = {};
-		const u32 *addr;
-		int len;
-
-		addr = of_get_property(node, "reg", &len);
-		if (!addr || len < sizeof(int) || *addr > (1 << 10) - 1) {
-			printk(KERN_WARNING "fsl_soc.c: invalid i2c device entry\n");
-			continue;
-		}
-
-		info.irq = irq_of_parse_and_map(node, 0);
-		if (info.irq == NO_IRQ)
-			info.irq = -1;
-
-		if (of_find_i2c_driver(node, &info) < 0)
-			continue;
-
-		info.addr = *addr;
-
-		i2c_register_board_info(bus_num, &info, 1);
-	}
-}
-
-static int __init fsl_i2c_of_init(void)
-{
-	struct device_node *np;
-	unsigned int i = 0;
-	struct platform_device *i2c_dev;
-	int ret;
-
-	for_each_compatible_node(np, NULL, "fsl-i2c") {
-		struct resource r[2];
-		struct fsl_i2c_platform_data i2c_data;
-		const unsigned char *flags = NULL;
-
-		memset(&r, 0, sizeof(r));
-		memset(&i2c_data, 0, sizeof(i2c_data));
-
-		ret = of_address_to_resource(np, 0, &r[0]);
-		if (ret)
-			goto err;
-
-		of_irq_to_resource(np, 0, &r[1]);
-
-		i2c_dev = platform_device_register_simple("fsl-i2c", i, r, 2);
-		if (IS_ERR(i2c_dev)) {
-			ret = PTR_ERR(i2c_dev);
-			goto err;
-		}
-
-		i2c_data.device_flags = 0;
-		flags = of_get_property(np, "dfsrr", NULL);
-		if (flags)
-			i2c_data.device_flags |= FSL_I2C_DEV_SEPARATE_DFSRR;
-
-		flags = of_get_property(np, "fsl5200-clocking", NULL);
-		if (flags)
-			i2c_data.device_flags |= FSL_I2C_DEV_CLOCK_5200;
-
-		ret =
-		    platform_device_add_data(i2c_dev, &i2c_data,
-					     sizeof(struct
-						    fsl_i2c_platform_data));
-		if (ret)
-			goto unreg;
-
-		of_register_i2c_devices(np, i++);
-	}
-
-	return 0;
-
-unreg:
-	platform_device_unregister(i2c_dev);
-err:
-	return ret;
-}
-
-arch_initcall(fsl_i2c_of_init);
-#endif
-
-#ifdef CONFIG_PPC_83xx
-static int __init mpc83xx_wdt_init(void)
-{
-	struct resource r;
-	struct device_node *np;
-	struct platform_device *dev;
-	u32 freq = fsl_get_sys_freq();
-	int ret;
-
-	np = of_find_compatible_node(NULL, "watchdog", "mpc83xx_wdt");
-
-	if (!np) {
-		ret = -ENODEV;
-		goto nodev;
-	}
-
-	memset(&r, 0, sizeof(r));
-
-	ret = of_address_to_resource(np, 0, &r);
-	if (ret)
-		goto err;
-
-	dev = platform_device_register_simple("mpc83xx_wdt", 0, &r, 1);
-	if (IS_ERR(dev)) {
-		ret = PTR_ERR(dev);
-		goto err;
-	}
-
-	ret = platform_device_add_data(dev, &freq, sizeof(freq));
-	if (ret)
-		goto unreg;
-
-	of_node_put(np);
-	return 0;
-
-unreg:
-	platform_device_unregister(dev);
-err:
-	of_node_put(np);
-nodev:
-	return ret;
-}
-
-arch_initcall(mpc83xx_wdt_init);
-#endif
-
 static enum fsl_usb2_phy_modes determine_usb_phy(const char *phy_type)
 {
 	if (!phy_type)
@@ -657,6 +283,9 @@ static int __init fsl_usb_of_init(void)
 		struct resource r[2];
 		struct fsl_usb2_platform_data usb_data;
 		const unsigned char *prop = NULL;
+
+		if (!of_device_is_available(np))
+			continue;
 
 		memset(&r, 0, sizeof(r));
 		memset(&usb_data, 0, sizeof(usb_data));
@@ -743,115 +372,6 @@ err:
 
 arch_initcall(fsl_usb_of_init);
 
-static int __init of_fsl_spi_probe(char *type, char *compatible, u32 sysclk,
-				   struct spi_board_info *board_infos,
-				   unsigned int num_board_infos,
-				   void (*activate_cs)(u8 cs, u8 polarity),
-				   void (*deactivate_cs)(u8 cs, u8 polarity))
-{
-	struct device_node *np;
-	unsigned int i = 0;
-
-	for_each_compatible_node(np, type, compatible) {
-		int ret;
-		unsigned int j;
-		const void *prop;
-		struct resource res[2];
-		struct platform_device *pdev;
-		struct fsl_spi_platform_data pdata = {
-			.activate_cs = activate_cs,
-			.deactivate_cs = deactivate_cs,
-		};
-
-		memset(res, 0, sizeof(res));
-
-		pdata.sysclk = sysclk;
-
-		prop = of_get_property(np, "reg", NULL);
-		if (!prop)
-			goto err;
-		pdata.bus_num = *(u32 *)prop;
-
-		prop = of_get_property(np, "cell-index", NULL);
-		if (prop)
-			i = *(u32 *)prop;
-
-		prop = of_get_property(np, "mode", NULL);
-		if (prop && !strcmp(prop, "cpu-qe"))
-			pdata.qe_mode = 1;
-
-		for (j = 0; j < num_board_infos; j++) {
-			if (board_infos[j].bus_num == pdata.bus_num)
-				pdata.max_chipselect++;
-		}
-
-		if (!pdata.max_chipselect)
-			continue;
-
-		ret = of_address_to_resource(np, 0, &res[0]);
-		if (ret)
-			goto err;
-
-		ret = of_irq_to_resource(np, 0, &res[1]);
-		if (ret == NO_IRQ)
-			goto err;
-
-		pdev = platform_device_alloc("mpc83xx_spi", i);
-		if (!pdev)
-			goto err;
-
-		ret = platform_device_add_data(pdev, &pdata, sizeof(pdata));
-		if (ret)
-			goto unreg;
-
-		ret = platform_device_add_resources(pdev, res,
-						    ARRAY_SIZE(res));
-		if (ret)
-			goto unreg;
-
-		ret = platform_device_add(pdev);
-		if (ret)
-			goto unreg;
-
-		goto next;
-unreg:
-		platform_device_del(pdev);
-err:
-		pr_err("%s: registration failed\n", np->full_name);
-next:
-		i++;
-	}
-
-	return i;
-}
-
-int __init fsl_spi_init(struct spi_board_info *board_infos,
-			unsigned int num_board_infos,
-			void (*activate_cs)(u8 cs, u8 polarity),
-			void (*deactivate_cs)(u8 cs, u8 polarity))
-{
-	u32 sysclk = -1;
-	int ret;
-
-#ifdef CONFIG_QUICC_ENGINE
-	/* SPI controller is either clocked from QE or SoC clock */
-	sysclk = get_brgfreq();
-#endif
-	if (sysclk == -1) {
-		sysclk = fsl_get_sys_freq();
-		if (sysclk == -1)
-			return -ENODEV;
-	}
-
-	ret = of_fsl_spi_probe(NULL, "fsl,spi", sysclk, board_infos,
-			       num_board_infos, activate_cs, deactivate_cs);
-	if (!ret)
-		of_fsl_spi_probe("spi", "fsl_spi", sysclk, board_infos,
-				 num_board_infos, activate_cs, deactivate_cs);
-
-	return spi_register_board_info(board_infos, num_board_infos);
-}
-
 #if defined(CONFIG_PPC_85xx) || defined(CONFIG_PPC_86xx)
 static __be32 __iomem *rstcr;
 
@@ -860,18 +380,13 @@ static int __init setup_rstcr(void)
 	struct device_node *np;
 	np = of_find_node_by_name(NULL, "global-utilities");
 	if ((np && of_get_property(np, "fsl,has-rstcr", NULL))) {
-		const u32 *prop = of_get_property(np, "reg", NULL);
-		if (prop) {
-			/* map reset control register
-			 * 0xE00B0 is offset of reset control register
-			 */
-			rstcr = ioremap(get_immrbase() + *prop + 0xB0, 0xff);
-			if (!rstcr)
-				printk (KERN_EMERG "Error: reset control "
-						"register not mapped!\n");
-		}
-	} else
-		printk (KERN_INFO "rstcr compatible register does not exist!\n");
+		rstcr = of_iomap(np, 0) + 0xb0;
+		if (!rstcr)
+			printk (KERN_EMERG "Error: reset control register "
+					"not mapped!\n");
+	} else if (ppc_md.restart == fsl_rstcr_restart)
+		printk(KERN_ERR "No RSTCR register, warm reboot won't work\n");
+
 	if (np)
 		of_node_put(np);
 	return 0;
@@ -891,42 +406,6 @@ void fsl_rstcr_restart(char *cmd)
 #endif
 
 #if defined(CONFIG_FB_FSL_DIU) || defined(CONFIG_FB_FSL_DIU_MODULE)
-struct platform_diu_data_ops diu_ops = {
-	.diu_size = 1280 * 1024 * 4,	/* default one 1280x1024 buffer */
-};
+struct platform_diu_data_ops diu_ops;
 EXPORT_SYMBOL(diu_ops);
-
-int __init preallocate_diu_videomemory(void)
-{
-	pr_debug("diu_size=%lu\n", diu_ops.diu_size);
-
-	diu_ops.diu_mem = __alloc_bootmem(diu_ops.diu_size, 8, 0);
-	if (!diu_ops.diu_mem) {
-		printk(KERN_ERR "fsl-diu: cannot allocate %lu bytes\n",
-			diu_ops.diu_size);
-		return -ENOMEM;
-	}
-
-	pr_debug("diu_mem=%p\n", diu_ops.diu_mem);
-
-	rh_init(&diu_ops.diu_rh_info, 4096, ARRAY_SIZE(diu_ops.diu_rh_block),
-		diu_ops.diu_rh_block);
-	return rh_attach_region(&diu_ops.diu_rh_info,
-				(unsigned long) diu_ops.diu_mem,
-				diu_ops.diu_size);
-}
-
-static int __init early_parse_diufb(char *p)
-{
-	if (!p)
-		return 1;
-
-	diu_ops.diu_size = _ALIGN_UP(memparse(p, &p), 8);
-
-	pr_debug("diu_size=%lu\n", diu_ops.diu_size);
-
-	return 0;
-}
-early_param("diufb", early_parse_diufb);
-
 #endif

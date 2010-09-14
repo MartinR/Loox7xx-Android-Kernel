@@ -36,10 +36,9 @@
 #include <linux/platform_device.h>
 #include <linux/io.h>
 
-#include <asm/hardware.h>
-#include <asm/mach-types.h>
+#include <mach/hardware.h>
 
-#include <asm/arch/i2c.h>
+#include <mach/i2c.h>
 
 /* ----- global defines ----------------------------------------------- */
 
@@ -85,6 +84,7 @@
 #define DAVINCI_I2C_MDR_MST	(1 << 10)
 #define DAVINCI_I2C_MDR_TRX	(1 << 9)
 #define DAVINCI_I2C_MDR_XA	(1 << 8)
+#define DAVINCI_I2C_MDR_RM	(1 << 7)
 #define DAVINCI_I2C_MDR_IRS	(1 << 5)
 
 #define DAVINCI_I2C_IMR_AAS	(1 << 6)
@@ -112,6 +112,7 @@ struct davinci_i2c_dev {
 	u8			*buf;
 	size_t			buf_len;
 	int			irq;
+	u8			terminate;
 	struct i2c_adapter	adapter;
 };
 
@@ -142,6 +143,7 @@ static int i2c_davinci_init(struct davinci_i2c_dev *dev)
 	struct davinci_i2c_platform_data *pdata = dev->dev->platform_data;
 	u16 psc;
 	u32 clk;
+	u32 d;
 	u32 clkh;
 	u32 clkl;
 	u32 input_clock = clk_get_rate(dev->clk);
@@ -171,23 +173,34 @@ static int i2c_davinci_init(struct davinci_i2c_dev *dev)
 	 *       if PSC > 1 , d = 5
 	 */
 
-	psc = 26; /* To get 1MHz clock */
+	/* get minimum of 7 MHz clock, but max of 12 MHz */
+	psc = (input_clock / 7000000) - 1;
+	if ((input_clock / (psc + 1)) > 12000000)
+		psc++;	/* better to run under spec than over */
+	d = (psc >= 2) ? 5 : 7 - psc;
 
-	clk = ((input_clock / (psc + 1)) / (pdata->bus_freq * 1000)) - 10;
-	clkh = (50 * clk) / 100;
+	clk = ((input_clock / (psc + 1)) / (pdata->bus_freq * 1000)) - (d << 1);
+	clkh = clk >> 1;
 	clkl = clk - clkh;
 
 	davinci_i2c_write_reg(dev, DAVINCI_I2C_PSC_REG, psc);
 	davinci_i2c_write_reg(dev, DAVINCI_I2C_CLKH_REG, clkh);
 	davinci_i2c_write_reg(dev, DAVINCI_I2C_CLKL_REG, clkl);
 
-	dev_dbg(dev->dev, "CLK  = %d\n", clk);
+	/* Respond at reserved "SMBus Host" slave address" (and zero);
+	 * we seem to have no option to not respond...
+	 */
+	davinci_i2c_write_reg(dev, DAVINCI_I2C_OAR_REG, 0x08);
+
+	dev_dbg(dev->dev, "input_clock = %d, CLK = %d\n", input_clock, clk);
 	dev_dbg(dev->dev, "PSC  = %d\n",
 		davinci_i2c_read_reg(dev, DAVINCI_I2C_PSC_REG));
 	dev_dbg(dev->dev, "CLKL = %d\n",
 		davinci_i2c_read_reg(dev, DAVINCI_I2C_CLKL_REG));
 	dev_dbg(dev->dev, "CLKH = %d\n",
 		davinci_i2c_read_reg(dev, DAVINCI_I2C_CLKH_REG));
+	dev_dbg(dev->dev, "bus_freq = %dkHz, bus_delay = %d\n",
+		pdata->bus_freq, pdata->bus_delay);
 
 	/* Take the I2C module out of reset: */
 	w = davinci_i2c_read_reg(dev, DAVINCI_I2C_MDR_REG);
@@ -208,7 +221,7 @@ static int i2c_davinci_wait_bus_not_busy(struct davinci_i2c_dev *dev,
 {
 	unsigned long timeout;
 
-	timeout = jiffies + DAVINCI_I2C_TIMEOUT;
+	timeout = jiffies + dev->adapter.timeout;
 	while (davinci_i2c_read_reg(dev, DAVINCI_I2C_STR_REG)
 	       & DAVINCI_I2C_STR_BB) {
 		if (time_after(jiffies, timeout)) {
@@ -233,7 +246,6 @@ i2c_davinci_xfer_msg(struct i2c_adapter *adap, struct i2c_msg *msg, int stop)
 	struct davinci_i2c_dev *dev = i2c_get_adapdata(adap);
 	struct davinci_i2c_platform_data *pdata = dev->dev->platform_data;
 	u32 flag;
-	u32 stat;
 	u16 w;
 	int r;
 
@@ -254,11 +266,8 @@ i2c_davinci_xfer_msg(struct i2c_adapter *adap, struct i2c_msg *msg, int stop)
 
 	davinci_i2c_write_reg(dev, DAVINCI_I2C_CNT_REG, dev->buf_len);
 
-	init_completion(&dev->cmd_complete);
+	INIT_COMPLETION(dev->cmd_complete);
 	dev->cmd_err = 0;
-
-	/* Clear any pending interrupts by reading the IVR */
-	stat = davinci_i2c_read_reg(dev, DAVINCI_I2C_IVR_REG);
 
 	/* Take I2C out of reset, configure it as master and set the
 	 * start bit */
@@ -280,20 +289,34 @@ i2c_davinci_xfer_msg(struct i2c_adapter *adap, struct i2c_msg *msg, int stop)
 		MOD_REG_BIT(w, DAVINCI_I2C_IMR_XRDY, 1);
 	davinci_i2c_write_reg(dev, DAVINCI_I2C_IMR_REG, w);
 
+	dev->terminate = 0;
 	/* write the data into mode register */
 	davinci_i2c_write_reg(dev, DAVINCI_I2C_MDR_REG, flag);
 
 	r = wait_for_completion_interruptible_timeout(&dev->cmd_complete,
-						      DAVINCI_I2C_TIMEOUT);
-	dev->buf_len = 0;
-	if (r < 0)
-		return r;
-
+						      dev->adapter.timeout);
 	if (r == 0) {
 		dev_err(dev->dev, "controller timed out\n");
 		i2c_davinci_init(dev);
+		dev->buf_len = 0;
 		return -ETIMEDOUT;
 	}
+	if (dev->buf_len) {
+		/* This should be 0 if all bytes were transferred
+		 * or dev->cmd_err denotes an error.
+		 * A signal may have aborted the transfer.
+		 */
+		if (r >= 0) {
+			dev_err(dev->dev, "abnormal termination buf_len=%i\n",
+				dev->buf_len);
+			r = -EREMOTEIO;
+		}
+		dev->terminate = 1;
+		wmb();
+		dev->buf_len = 0;
+	}
+	if (r < 0)
+		return r;
 
 	/* no error */
 	if (likely(!dev->cmd_err))
@@ -338,18 +361,38 @@ i2c_davinci_xfer(struct i2c_adapter *adap, struct i2c_msg msgs[], int num)
 
 	for (i = 0; i < num; i++) {
 		ret = i2c_davinci_xfer_msg(adap, &msgs[i], (i == (num - 1)));
+		dev_dbg(dev->dev, "%s [%d/%d] ret: %d\n", __func__, i + 1, num,
+			ret);
 		if (ret < 0)
 			return ret;
 	}
-
-	dev_dbg(dev->dev, "%s:%d ret: %d\n", __func__, __LINE__, ret);
-
 	return num;
 }
 
 static u32 i2c_davinci_func(struct i2c_adapter *adap)
 {
 	return I2C_FUNC_I2C | (I2C_FUNC_SMBUS_EMUL & ~I2C_FUNC_SMBUS_QUICK);
+}
+
+static void terminate_read(struct davinci_i2c_dev *dev)
+{
+	u16 w = davinci_i2c_read_reg(dev, DAVINCI_I2C_MDR_REG);
+	w |= DAVINCI_I2C_MDR_NACK;
+	davinci_i2c_write_reg(dev, DAVINCI_I2C_MDR_REG, w);
+
+	/* Throw away data */
+	davinci_i2c_read_reg(dev, DAVINCI_I2C_DRR_REG);
+	if (!dev->terminate)
+		dev_err(dev->dev, "RDR IRQ while no data requested\n");
+}
+static void terminate_write(struct davinci_i2c_dev *dev)
+{
+	u16 w = davinci_i2c_read_reg(dev, DAVINCI_I2C_MDR_REG);
+	w |= DAVINCI_I2C_MDR_RM | DAVINCI_I2C_MDR_STP;
+	davinci_i2c_write_reg(dev, DAVINCI_I2C_MDR_REG, w);
+
+	if (!dev->terminate)
+		dev_dbg(dev->dev, "TDR IRQ while no data to send\n");
 }
 
 /*
@@ -372,12 +415,15 @@ static irqreturn_t i2c_davinci_isr(int this_irq, void *dev_id)
 
 		switch (stat) {
 		case DAVINCI_I2C_IVR_AL:
+			/* Arbitration lost, must retry */
 			dev->cmd_err |= DAVINCI_I2C_STR_AL;
+			dev->buf_len = 0;
 			complete(&dev->cmd_complete);
 			break;
 
 		case DAVINCI_I2C_IVR_NACK:
 			dev->cmd_err |= DAVINCI_I2C_STR_NACK;
+			dev->buf_len = 0;
 			complete(&dev->cmd_complete);
 			break;
 
@@ -399,9 +445,10 @@ static irqreturn_t i2c_davinci_isr(int this_irq, void *dev_id)
 				davinci_i2c_write_reg(dev,
 					DAVINCI_I2C_STR_REG,
 					DAVINCI_I2C_IMR_RRDY);
-			} else
-				dev_err(dev->dev, "RDR IRQ while no "
-					"data requested\n");
+			} else {
+				/* signal can terminate transfer */
+				terminate_read(dev);
+			}
 			break;
 
 		case DAVINCI_I2C_IVR_XRDY:
@@ -418,9 +465,10 @@ static irqreturn_t i2c_davinci_isr(int this_irq, void *dev_id)
 				davinci_i2c_write_reg(dev,
 						      DAVINCI_I2C_IMR_REG,
 						      w);
-			} else
-				dev_err(dev->dev, "TDR IRQ while no data to "
-					"send\n");
+			} else {
+				/* signal can terminate transfer */
+				terminate_write(dev);
+			}
 			break;
 
 		case DAVINCI_I2C_IVR_SCD:
@@ -430,9 +478,14 @@ static irqreturn_t i2c_davinci_isr(int this_irq, void *dev_id)
 			break;
 
 		case DAVINCI_I2C_IVR_AAS:
-			dev_warn(dev->dev, "Address as slave interrupt\n");
-		}/* switch */
-	}/* while */
+			dev_dbg(dev->dev, "Address as slave interrupt\n");
+			break;
+
+		default:
+			dev_warn(dev->dev, "Unrecognized irq stat %d\n", stat);
+			break;
+		}
+	}
 
 	return count ? IRQ_HANDLED : IRQ_NONE;
 }
@@ -462,7 +515,7 @@ static int davinci_i2c_probe(struct platform_device *pdev)
 		return -ENODEV;
 	}
 
-	ioarea = request_mem_region(mem->start, (mem->end - mem->start) + 1,
+	ioarea = request_mem_region(mem->start, resource_size(mem),
 				    pdev->name);
 	if (!ioarea) {
 		dev_err(&pdev->dev, "I2C region already claimed\n");
@@ -475,11 +528,12 @@ static int davinci_i2c_probe(struct platform_device *pdev)
 		goto err_release_region;
 	}
 
+	init_completion(&dev->cmd_complete);
 	dev->dev = get_device(&pdev->dev);
 	dev->irq = irq->start;
 	platform_set_drvdata(pdev, dev);
 
-	dev->clk = clk_get(&pdev->dev, "I2CCLK");
+	dev->clk = clk_get(&pdev->dev, NULL);
 	if (IS_ERR(dev->clk)) {
 		r = -ENODEV;
 		goto err_free_mem;
@@ -502,9 +556,7 @@ static int davinci_i2c_probe(struct platform_device *pdev)
 	strlcpy(adap->name, "DaVinci I2C adapter", sizeof(adap->name));
 	adap->algo = &i2c_davinci_algo;
 	adap->dev.parent = &pdev->dev;
-
-	/* FIXME */
-	adap->timeout = 1;
+	adap->timeout = DAVINCI_I2C_TIMEOUT;
 
 	adap->nr = pdev->id;
 	r = i2c_add_numbered_adapter(adap);
@@ -526,7 +578,7 @@ err_free_mem:
 	put_device(&pdev->dev);
 	kfree(dev);
 err_release_region:
-	release_mem_region(mem->start, (mem->end - mem->start) + 1);
+	release_mem_region(mem->start, resource_size(mem));
 
 	return r;
 }
@@ -549,7 +601,7 @@ static int davinci_i2c_remove(struct platform_device *pdev)
 	kfree(dev);
 
 	mem = platform_get_resource(pdev, IORESOURCE_MEM, 0);
-	release_mem_region(mem->start, (mem->end - mem->start) + 1);
+	release_mem_region(mem->start, resource_size(mem));
 	return 0;
 }
 

@@ -42,7 +42,6 @@
 #define ipg_r16(reg)		ioread16(ioaddr + (reg))
 #define ipg_r8(reg)		ioread8(ioaddr + (reg))
 
-#define JUMBO_FRAME_4k_ONLY
 enum {
 	netdev_io_size = 128
 };
@@ -53,6 +52,14 @@ enum {
 MODULE_AUTHOR("IC Plus Corp. 2003");
 MODULE_DESCRIPTION("IC Plus IP1000 Gigabit Ethernet Adapter Linux Driver");
 MODULE_LICENSE("GPL");
+
+/*
+ * Defaults
+ */
+#define IPG_MAX_RXFRAME_SIZE	0x0600
+#define IPG_RXFRAG_SIZE		0x0600
+#define IPG_RXSUPPORT_SIZE	0x0600
+#define IPG_IS_JUMBO		false
 
 /*
  * Variable record -- index by leading revision/length
@@ -631,6 +638,7 @@ static void ipg_nic_set_multicast_list(struct net_device *dev)
 
 static int ipg_io_config(struct net_device *dev)
 {
+	struct ipg_nic_private *sp = netdev_priv(dev);
 	void __iomem *ioaddr = ipg_ioaddr(dev);
 	u32 origmacctrl;
 	u32 restoremacctrl;
@@ -670,7 +678,7 @@ static int ipg_io_config(struct net_device *dev)
 	/* Set RECEIVEMODE register. */
 	ipg_nic_set_multicast_list(dev);
 
-	ipg_w16(IPG_MAX_RXFRAME_SIZE, MAX_FRAME_SIZE);
+	ipg_w16(sp->max_rxframe_size, MAX_FRAME_SIZE);
 
 	ipg_w8(IPG_RXDMAPOLLPERIOD_VALUE,   RX_DMA_POLL_PERIOD);
 	ipg_w8(IPG_RXDMAURGENTTHRESH_VALUE, RX_DMA_URGENT_THRESH);
@@ -730,7 +738,7 @@ static int ipg_get_rxbuff(struct net_device *dev, int entry)
 
 	IPG_DEBUG_MSG("_get_rxbuff\n");
 
-	skb = netdev_alloc_skb(dev, IPG_RXSUPPORT_SIZE + NET_IP_ALIGN);
+	skb = netdev_alloc_skb(dev, sp->rxsupport_size + NET_IP_ALIGN);
 	if (!skb) {
 		sp->rx_buff[entry] = NULL;
 		return -ENOMEM;
@@ -751,7 +759,7 @@ static int ipg_get_rxbuff(struct net_device *dev, int entry)
 		sp->rx_buf_sz, PCI_DMA_FROMDEVICE));
 
 	/* Set the RFD fragment length. */
-	rxfragsize = IPG_RXFRAG_SIZE;
+	rxfragsize = sp->rxfrag_size;
 	rxfd->frag_info |= cpu_to_le64((rxfragsize << 48) & IPG_RFI_FRAGLEN);
 
 	return 0;
@@ -1076,8 +1084,6 @@ static int ipg_nic_rxrestore(struct net_device *dev)
 	return 0;
 }
 
-#ifdef JUMBO_FRAME
-
 /* use jumboindex and jumbosize to control jumbo frame status
  * initial status is jumboindex=-1 and jumbosize=0
  * 1. jumboindex = -1 and jumbosize=0 : previous jumbo frame has been done.
@@ -1097,7 +1103,7 @@ enum {
 	FRAME_WITH_START_WITH_END = 11
 };
 
-inline void ipg_nic_rx_free_skb(struct net_device *dev)
+static void ipg_nic_rx_free_skb(struct net_device *dev)
 {
 	struct ipg_nic_private *sp = netdev_priv(dev);
 	unsigned int entry = sp->rx_current % IPG_RFDLIST_LENGTH;
@@ -1106,14 +1112,14 @@ inline void ipg_nic_rx_free_skb(struct net_device *dev)
 		struct ipg_rx *rxfd = sp->rxd + entry;
 
 		pci_unmap_single(sp->pdev,
-			le64_to_cpu(rxfd->frag_info & ~IPG_RFI_FRAGLEN),
+			le64_to_cpu(rxfd->frag_info) & ~IPG_RFI_FRAGLEN,
 			sp->rx_buf_sz, PCI_DMA_FROMDEVICE);
 		dev_kfree_skb_irq(sp->rx_buff[entry]);
 		sp->rx_buff[entry] = NULL;
 	}
 }
 
-inline int ipg_nic_rx_check_frame_type(struct net_device *dev)
+static int ipg_nic_rx_check_frame_type(struct net_device *dev)
 {
 	struct ipg_nic_private *sp = netdev_priv(dev);
 	struct ipg_rx *rxfd = sp->rxd + (sp->rx_current % IPG_RFDLIST_LENGTH);
@@ -1126,7 +1132,7 @@ inline int ipg_nic_rx_check_frame_type(struct net_device *dev)
 	return type;
 }
 
-inline int ipg_nic_rx_check_error(struct net_device *dev)
+static int ipg_nic_rx_check_error(struct net_device *dev)
 {
 	struct ipg_nic_private *sp = netdev_priv(dev);
 	unsigned int entry = sp->rx_current % IPG_RFDLIST_LENGTH;
@@ -1173,7 +1179,7 @@ inline int ipg_nic_rx_check_error(struct net_device *dev)
 		 */
 		if (sp->rx_buff[entry]) {
 			pci_unmap_single(sp->pdev,
-				le64_to_cpu(rxfd->frag_info & ~IPG_RFI_FRAGLEN),
+				le64_to_cpu(rxfd->frag_info) & ~IPG_RFI_FRAGLEN,
 				sp->rx_buf_sz, PCI_DMA_FROMDEVICE);
 
 			dev_kfree_skb_irq(sp->rx_buff[entry]);
@@ -1209,14 +1215,13 @@ static void ipg_nic_rx_with_start_and_end(struct net_device *dev,
 
 	/* accept this frame and send to upper layer */
 	framelen = le64_to_cpu(rxfd->rfs) & IPG_RFS_RXFRAMELEN;
-	if (framelen > IPG_RXFRAG_SIZE)
-		framelen = IPG_RXFRAG_SIZE;
+	if (framelen > sp->rxfrag_size)
+		framelen = sp->rxfrag_size;
 
 	skb_put(skb, framelen);
 	skb->protocol = eth_type_trans(skb, dev);
 	skb->ip_summed = CHECKSUM_NONE;
 	netif_rx(skb);
-	dev->last_rx = jiffies;
 	sp->rx_buff[entry] = NULL;
 }
 
@@ -1240,17 +1245,16 @@ static void ipg_nic_rx_with_start(struct net_device *dev,
 	if (jumbo->found_start)
 		dev_kfree_skb_irq(jumbo->skb);
 
-	pci_unmap_single(pdev, le64_to_cpu(rxfd->frag_info & ~IPG_RFI_FRAGLEN),
+	pci_unmap_single(pdev, le64_to_cpu(rxfd->frag_info) & ~IPG_RFI_FRAGLEN,
 			 sp->rx_buf_sz, PCI_DMA_FROMDEVICE);
 
-	skb_put(skb, IPG_RXFRAG_SIZE);
+	skb_put(skb, sp->rxfrag_size);
 
 	jumbo->found_start = 1;
-	jumbo->current_size = IPG_RXFRAG_SIZE;
+	jumbo->current_size = sp->rxfrag_size;
 	jumbo->skb = skb;
 
 	sp->rx_buff[entry] = NULL;
-	dev->last_rx = jiffies;
 }
 
 static void ipg_nic_rx_with_end(struct net_device *dev,
@@ -1272,11 +1276,7 @@ static void ipg_nic_rx_with_end(struct net_device *dev,
 			framelen = le64_to_cpu(rxfd->rfs) & IPG_RFS_RXFRAMELEN;
 
 			endframelen = framelen - jumbo->current_size;
-			/*
-			if (framelen > IPG_RXFRAG_SIZE)
-				framelen=IPG_RXFRAG_SIZE;
-			 */
-			if (framelen > IPG_RXSUPPORT_SIZE)
+			if (framelen > sp->rxsupport_size)
 				dev_kfree_skb_irq(jumbo->skb);
 			else {
 				memcpy(skb_put(jumbo->skb, endframelen),
@@ -1290,7 +1290,6 @@ static void ipg_nic_rx_with_end(struct net_device *dev,
 			}
 		}
 
-		dev->last_rx = jiffies;
 		jumbo->found_start = 0;
 		jumbo->current_size = 0;
 		jumbo->skb = NULL;
@@ -1316,14 +1315,13 @@ static void ipg_nic_rx_no_start_no_end(struct net_device *dev,
 
 		if (skb) {
 			if (jumbo->found_start) {
-				jumbo->current_size += IPG_RXFRAG_SIZE;
-				if (jumbo->current_size <= IPG_RXSUPPORT_SIZE) {
+				jumbo->current_size += sp->rxfrag_size;
+				if (jumbo->current_size <= sp->rxsupport_size) {
 					memcpy(skb_put(jumbo->skb,
-						       IPG_RXFRAG_SIZE),
-					       skb->data, IPG_RXFRAG_SIZE);
+						       sp->rxfrag_size),
+					       skb->data, sp->rxfrag_size);
 				}
 			}
-			dev->last_rx = jiffies;
 			ipg_nic_rx_free_skb(dev);
 		}
 	} else {
@@ -1334,7 +1332,7 @@ static void ipg_nic_rx_no_start_no_end(struct net_device *dev,
 	}
 }
 
-static int ipg_nic_rx(struct net_device *dev)
+static int ipg_nic_rx_jumbo(struct net_device *dev)
 {
 	struct ipg_nic_private *sp = netdev_priv(dev);
 	unsigned int curr = sp->rx_current;
@@ -1347,7 +1345,7 @@ static int ipg_nic_rx(struct net_device *dev)
 		unsigned int entry = curr % IPG_RFDLIST_LENGTH;
 		struct ipg_rx *rxfd = sp->rxd + entry;
 
-		if (!(rxfd->rfs & le64_to_cpu(IPG_RFS_RFDDONE)))
+		if (!(rxfd->rfs & cpu_to_le64(IPG_RFS_RFDDONE)))
 			break;
 
 		switch (ipg_nic_rx_check_frame_type(dev)) {
@@ -1382,7 +1380,6 @@ static int ipg_nic_rx(struct net_device *dev)
 	return 0;
 }
 
-#else
 static int ipg_nic_rx(struct net_device *dev)
 {
 	/* Transfer received Ethernet frames to higher network layers. */
@@ -1413,11 +1410,11 @@ static int ipg_nic_rx(struct net_device *dev)
 		/* Check for jumbo frame arrival with too small
 		 * RXFRAG_SIZE.
 		 */
-		if (framelen > IPG_RXFRAG_SIZE) {
+		if (framelen > sp->rxfrag_size) {
 			IPG_DEBUG_MSG
 			    ("RFS FrameLen > allocated fragment size.\n");
 
-			framelen = IPG_RXFRAG_SIZE;
+			framelen = sp->rxfrag_size;
 		}
 
 		if ((IPG_DROP_ON_RX_ETH_ERRORS && (le64_to_cpu(rxfd->rfs) &
@@ -1493,11 +1490,6 @@ static int ipg_nic_rx(struct net_device *dev)
 			 * when processing completes.
 			 */
 			netif_rx(skb);
-
-			/* Record frame receive time (jiffies = Linux
-			 * kernel current time stamp).
-			 */
-			dev->last_rx = jiffies;
 		}
 
 		/* Assure RX buffer is not reused by IPG. */
@@ -1556,7 +1548,6 @@ static int ipg_nic_rx(struct net_device *dev)
 
 	return 0;
 }
-#endif
 
 static void ipg_reset_after_host_error(struct work_struct *work)
 {
@@ -1592,9 +1583,9 @@ static irqreturn_t ipg_interrupt_handler(int irq, void *dev_inst)
 
 	IPG_DEBUG_MSG("_interrupt_handler\n");
 
-#ifdef JUMBO_FRAME
-	ipg_nic_rxrestore(dev);
-#endif
+	if (sp->is_jumbo)
+		ipg_nic_rxrestore(dev);
+
 	spin_lock(&sp->lock);
 
 	/* Get interrupt source information, and acknowledge
@@ -1650,7 +1641,10 @@ static irqreturn_t ipg_interrupt_handler(int irq, void *dev_inst)
 			sp->RFDListCheckedCount++;
 #endif
 
-		ipg_nic_rx(dev);
+		if (sp->is_jumbo)
+			ipg_nic_rx_jumbo(dev);
+		else
+			ipg_nic_rx(dev);
 	}
 
 	/* If TxDMAComplete interrupt, free used TFDs. */
@@ -1749,7 +1743,7 @@ static int ipg_nic_open(struct net_device *dev)
 
 	IPG_DEBUG_MSG("_nic_open\n");
 
-	sp->rx_buf_sz = IPG_RXSUPPORT_SIZE;
+	sp->rx_buf_sz = sp->rxsupport_size;
 
 	/* Check for interrupt line conflicts, and request interrupt
 	 * line for IPG.
@@ -1804,13 +1798,10 @@ static int ipg_nic_open(struct net_device *dev)
 	if (ipg_config_autoneg(dev) < 0)
 		printk(KERN_INFO "%s: Auto-negotiation error.\n", dev->name);
 
-#ifdef JUMBO_FRAME
 	/* initialize JUMBO Frame control variable */
 	sp->jumbo.found_start = 0;
 	sp->jumbo.current_size = 0;
 	sp->jumbo.skb = NULL;
-	dev->mtu = IPG_TXFRAG_SIZE;
-#endif
 
 	/* Enable transmit and receive operation of the IPG. */
 	ipg_w32((ipg_r32(MAC_CTRL) | IPG_MC_RX_ENABLE | IPG_MC_TX_ENABLE) &
@@ -1867,7 +1858,8 @@ static int ipg_nic_stop(struct net_device *dev)
 	return 0;
 }
 
-static int ipg_nic_hard_start_xmit(struct sk_buff *skb, struct net_device *dev)
+static netdev_tx_t ipg_nic_hard_start_xmit(struct sk_buff *skb,
+					   struct net_device *dev)
 {
 	struct ipg_nic_private *sp = netdev_priv(dev);
 	void __iomem *ioaddr = sp->ioaddr;
@@ -2119,6 +2111,9 @@ static int ipg_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
 
 static int ipg_nic_change_mtu(struct net_device *dev, int new_mtu)
 {
+	struct ipg_nic_private *sp = netdev_priv(dev);
+	int err;
+
 	/* Function to accomodate changes to Maximum Transfer Unit
 	 * (or MTU) of IPG NIC. Cannot use default function since
 	 * the default will not allow for MTU > 1500 bytes.
@@ -2126,16 +2121,33 @@ static int ipg_nic_change_mtu(struct net_device *dev, int new_mtu)
 
 	IPG_DEBUG_MSG("_nic_change_mtu\n");
 
-	/* Check that the new MTU value is between 68 (14 byte header, 46
-	 * byte payload, 4 byte FCS) and IPG_MAX_RXFRAME_SIZE, which
-	 * corresponds to the MAXFRAMESIZE register in the IPG.
+	/*
+	 * Check that the new MTU value is between 68 (14 byte header, 46 byte
+	 * payload, 4 byte FCS) and 10 KB, which is the largest supported MTU.
 	 */
-	if ((new_mtu < 68) || (new_mtu > IPG_MAX_RXFRAME_SIZE))
+	if (new_mtu < 68 || new_mtu > 10240)
 		return -EINVAL;
+
+	err = ipg_nic_stop(dev);
+	if (err)
+		return err;
 
 	dev->mtu = new_mtu;
 
-	return 0;
+	sp->max_rxframe_size = new_mtu;
+
+	sp->rxfrag_size = new_mtu;
+	if (sp->rxfrag_size > 4088)
+		sp->rxfrag_size = 4088;
+
+	sp->rxsupport_size = sp->max_rxframe_size;
+
+	if (new_mtu > 0x0600)
+		sp->is_jumbo = true;
+	else
+		sp->is_jumbo = false;
+
+	return ipg_nic_open(dev);
 }
 
 static int ipg_get_settings(struct net_device *dev, struct ethtool_cmd *cmd)
@@ -2174,7 +2186,7 @@ static int ipg_nway_reset(struct net_device *dev)
 	return rc;
 }
 
-static struct ethtool_ops ipg_ethtool_ops = {
+static const struct ethtool_ops ipg_ethtool_ops = {
 	.get_settings = ipg_get_settings,
 	.set_settings = ipg_set_settings,
 	.nway_reset   = ipg_nway_reset,
@@ -2199,6 +2211,19 @@ static void __devexit ipg_remove(struct pci_dev *pdev)
 	pci_set_drvdata(pdev, NULL);
 }
 
+static const struct net_device_ops ipg_netdev_ops = {
+	.ndo_open		= ipg_nic_open,
+	.ndo_stop		= ipg_nic_stop,
+	.ndo_start_xmit		= ipg_nic_hard_start_xmit,
+	.ndo_get_stats		= ipg_nic_get_stats,
+	.ndo_set_multicast_list = ipg_nic_set_multicast_list,
+	.ndo_do_ioctl		= ipg_ioctl,
+	.ndo_tx_timeout 	= ipg_tx_timeout,
+	.ndo_change_mtu 	= ipg_nic_change_mtu,
+	.ndo_set_mac_address	= eth_mac_addr,
+	.ndo_validate_addr	= eth_validate_addr,
+};
+
 static int __devinit ipg_probe(struct pci_dev *pdev,
 			       const struct pci_device_id *id)
 {
@@ -2216,9 +2241,9 @@ static int __devinit ipg_probe(struct pci_dev *pdev,
 
 	pci_set_master(pdev);
 
-	rc = pci_set_dma_mask(pdev, DMA_40BIT_MASK);
+	rc = pci_set_dma_mask(pdev, DMA_BIT_MASK(40));
 	if (rc < 0) {
-		rc = pci_set_dma_mask(pdev, DMA_32BIT_MASK);
+		rc = pci_set_dma_mask(pdev, DMA_BIT_MASK(32));
 		if (rc < 0) {
 			printk(KERN_ERR "%s: DMA config failed.\n",
 			       pci_name(pdev));
@@ -2240,17 +2265,14 @@ static int __devinit ipg_probe(struct pci_dev *pdev,
 	spin_lock_init(&sp->lock);
 	mutex_init(&sp->mii_mutex);
 
+	sp->is_jumbo = IPG_IS_JUMBO;
+	sp->rxfrag_size = IPG_RXFRAG_SIZE;
+	sp->rxsupport_size = IPG_RXSUPPORT_SIZE;
+	sp->max_rxframe_size = IPG_MAX_RXFRAME_SIZE;
+
 	/* Declare IPG NIC functions for Ethernet device methods.
 	 */
-	dev->open = &ipg_nic_open;
-	dev->stop = &ipg_nic_stop;
-	dev->hard_start_xmit = &ipg_nic_hard_start_xmit;
-	dev->get_stats = &ipg_nic_get_stats;
-	dev->set_multicast_list = &ipg_nic_set_multicast_list;
-	dev->do_ioctl = ipg_ioctl;
-	dev->tx_timeout = ipg_tx_timeout;
-	dev->change_mtu = &ipg_nic_change_mtu;
-
+	dev->netdev_ops = &ipg_netdev_ops;
 	SET_NETDEV_DEV(dev, &pdev->dev);
 	SET_ETHTOOL_OPS(dev, &ipg_ethtool_ops);
 

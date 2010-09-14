@@ -379,11 +379,11 @@ void ipath_uc_rcv(struct ipath_ibdev *dev, struct ipath_ib_header *hdr,
 	case OP(SEND_LAST_WITH_IMMEDIATE):
 	send_last_imm:
 		if (header_in_data) {
-			wc.imm_data = *(__be32 *) data;
+			wc.ex.imm_data = *(__be32 *) data;
 			data += sizeof(__be32);
 		} else {
 			/* Immediate data comes after BTH */
-			wc.imm_data = ohdr->u.imm_data;
+			wc.ex.imm_data = ohdr->u.imm_data;
 		}
 		hdrsize += 4;
 		wc.wc_flags = IB_WC_WITH_IMM;
@@ -419,7 +419,7 @@ void ipath_uc_rcv(struct ipath_ibdev *dev, struct ipath_ib_header *hdr,
 		/* Signal completion event if the solicited bit is set. */
 		ipath_cq_enter(to_icq(qp->ibqp.recv_cq), &wc,
 			       (ohdr->bth[0] &
-				__constant_cpu_to_be32(1 << 23)) != 0);
+				cpu_to_be32(1 << 23)) != 0);
 		break;
 
 	case OP(RDMA_WRITE_FIRST):
@@ -483,11 +483,11 @@ void ipath_uc_rcv(struct ipath_ibdev *dev, struct ipath_ib_header *hdr,
 	case OP(RDMA_WRITE_LAST_WITH_IMMEDIATE):
 	rdma_last_imm:
 		if (header_in_data) {
-			wc.imm_data = *(__be32 *) data;
+			wc.ex.imm_data = *(__be32 *) data;
 			data += sizeof(__be32);
 		} else {
 			/* Immediate data comes after BTH */
-			wc.imm_data = ohdr->u.imm_data;
+			wc.ex.imm_data = ohdr->u.imm_data;
 		}
 		hdrsize += 4;
 		wc.wc_flags = IB_WC_WITH_IMM;

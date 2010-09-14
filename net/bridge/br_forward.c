@@ -5,8 +5,6 @@
  *	Authors:
  *	Lennert Buytenhek		<buytenh@gnu.org>
  *
- *	$Id: br_forward.c,v 1.4 2001/08/14 22:05:57 davem Exp $
- *
  *	This program is free software; you can redistribute it and/or
  *	modify it under the terms of the GNU General Public License
  *	as published by the Free Software Foundation; either version
@@ -24,7 +22,8 @@
 static inline int should_deliver(const struct net_bridge_port *p,
 				 const struct sk_buff *skb)
 {
-	return (skb->dev != p->dev && p->state == BR_STATE_FORWARDING);
+	return (((p->flags & BR_HAIRPIN_MODE) || skb->dev != p->dev) &&
+		p->state == BR_STATE_FORWARDING);
 }
 
 static inline unsigned packet_length(const struct sk_buff *skb)
@@ -68,6 +67,11 @@ static void __br_deliver(const struct net_bridge_port *to, struct sk_buff *skb)
 static void __br_forward(const struct net_bridge_port *to, struct sk_buff *skb)
 {
 	struct net_device *indev;
+
+	if (skb_warn_if_lro(skb)) {
+		kfree_skb(skb);
+		return;
+	}
 
 	indev = skb->dev;
 	skb->dev = to->dev;
@@ -115,7 +119,7 @@ static void br_flood(struct net_bridge *br, struct sk_buff *skb,
 				struct sk_buff *skb2;
 
 				if ((skb2 = skb_clone(skb, GFP_ATOMIC)) == NULL) {
-					br->statistics.tx_dropped++;
+					br->dev->stats.tx_dropped++;
 					kfree_skb(skb);
 					return;
 				}

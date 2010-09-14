@@ -25,6 +25,7 @@
 #include <linux/fcntl.h>
 #include <linux/slab.h>
 #include <linux/pagemap.h>
+#include <linux/security.h>
 #include <linux/highmem.h>
 #include <linux/highuid.h>
 #include <linux/personality.h>
@@ -167,9 +168,6 @@ static int load_elf_fdpic_binary(struct linux_binprm *bprm,
 	struct elf_fdpic_params exec_params, interp_params;
 	struct elf_phdr *phdr;
 	unsigned long stack_size, entryaddr;
-#ifndef CONFIG_MMU
-	unsigned long fullsize;
-#endif
 #ifdef ELF_FDPIC_PLAT_INIT
 	unsigned long dynaddr;
 #endif
@@ -285,19 +283,22 @@ static int load_elf_fdpic_binary(struct linux_binprm *bprm,
 	}
 
 	stack_size = exec_params.stack_size;
-	if (stack_size < interp_params.stack_size)
-		stack_size = interp_params.stack_size;
-
 	if (exec_params.flags & ELF_FDPIC_FLAG_EXEC_STACK)
 		executable_stack = EXSTACK_ENABLE_X;
 	else if (exec_params.flags & ELF_FDPIC_FLAG_NOEXEC_STACK)
 		executable_stack = EXSTACK_DISABLE_X;
-	else if (interp_params.flags & ELF_FDPIC_FLAG_EXEC_STACK)
-		executable_stack = EXSTACK_ENABLE_X;
-	else if (interp_params.flags & ELF_FDPIC_FLAG_NOEXEC_STACK)
-		executable_stack = EXSTACK_DISABLE_X;
 	else
 		executable_stack = EXSTACK_DEFAULT;
+
+	if (stack_size == 0) {
+		stack_size = interp_params.stack_size;
+		if (interp_params.flags & ELF_FDPIC_FLAG_EXEC_STACK)
+			executable_stack = EXSTACK_ENABLE_X;
+		else if (interp_params.flags & ELF_FDPIC_FLAG_NOEXEC_STACK)
+			executable_stack = EXSTACK_DISABLE_X;
+		else
+			executable_stack = EXSTACK_DEFAULT;
+	}
 
 	retval = -ENOEXEC;
 	if (stack_size == 0)
@@ -389,11 +390,6 @@ static int load_elf_fdpic_binary(struct linux_binprm *bprm,
 		goto error_kill;
 	}
 
-	/* expand the stack mapping to use up the entire allocation granule */
-	fullsize = kobjsize((char *) current->mm->start_brk);
-	if (!IS_ERR_VALUE(do_mremap(current->mm->start_brk, stack_size,
-				    fullsize, 0, 0)))
-		stack_size = fullsize;
 	up_write(&current->mm->mmap_sem);
 
 	current->mm->brk = current->mm->start_brk;
@@ -403,7 +399,7 @@ static int load_elf_fdpic_binary(struct linux_binprm *bprm,
 	current->mm->start_stack = current->mm->start_brk + stack_size;
 #endif
 
-	compute_creds(bprm);
+	install_exec_creds(bprm);
 	current->flags &= ~PF_FORKNOEXEC;
 	if (create_elf_fdpic_tables(bprm, current->mm,
 				    &exec_params, &interp_params) < 0)
@@ -433,13 +429,6 @@ static int load_elf_fdpic_binary(struct linux_binprm *bprm,
 	entryaddr = interp_params.entry_addr ?: exec_params.entry_addr;
 	start_thread(regs, entryaddr, current->mm->start_stack);
 
-	if (unlikely(current->ptrace & PT_PTRACED)) {
-		if (current->ptrace & PT_TRACE_EXEC)
-			ptrace_notify((PTRACE_EVENT_EXEC << 8) | SIGTRAP);
-		else
-			send_sig(SIGTRAP, current, 0);
-	}
-
 	retval = 0;
 
 error:
@@ -462,25 +451,42 @@ error_kill:
 }
 
 /*****************************************************************************/
+
+#ifndef ELF_BASE_PLATFORM
 /*
- * present useful information to the program
+ * AT_BASE_PLATFORM indicates the "real" hardware/microarchitecture.
+ * If the arch defines ELF_BASE_PLATFORM (in asm/elf.h), the value
+ * will be copied to the user stack in the same manner as AT_PLATFORM.
+ */
+#define ELF_BASE_PLATFORM NULL
+#endif
+
+/*
+ * present useful information to the program by shovelling it onto the new
+ * process's stack
  */
 static int create_elf_fdpic_tables(struct linux_binprm *bprm,
 				   struct mm_struct *mm,
 				   struct elf_fdpic_params *exec_params,
 				   struct elf_fdpic_params *interp_params)
 {
+	const struct cred *cred = current_cred();
 	unsigned long sp, csp, nitems;
 	elf_caddr_t __user *argv, *envp;
 	size_t platform_len = 0, len;
-	char *k_platform;
-	char __user *u_platform, *p;
+	char *k_platform, *k_base_platform;
+	char __user *u_platform, *u_base_platform, *p;
 	long hwcap;
 	int loop;
+	int nr;	/* reset for each csp adjustment */
 
-	/* we're going to shovel a whole load of stuff onto the stack */
 #ifdef CONFIG_MMU
-	sp = bprm->p;
+	/* In some cases (e.g. Hyper-Threading), we want to avoid L1 evictions
+	 * by the processes running on the same package. One thing we can do is
+	 * to shuffle the initial stack for them, so we give the architecture
+	 * an opportunity to do so here.
+	 */
+	sp = arch_align_stack(bprm->p);
 #else
 	sp = mm->start_stack;
 
@@ -489,11 +495,14 @@ static int create_elf_fdpic_tables(struct linux_binprm *bprm,
 		return -EFAULT;
 #endif
 
-	/* get hold of platform and hardware capabilities masks for the machine
-	 * we are running on.  In some cases (Sparc), this info is impossible
-	 * to get, in others (i386) it is merely difficult.
-	 */
 	hwcap = ELF_HWCAP;
+
+	/*
+	 * If this architecture has a platform capability string, copy it
+	 * to userspace.  In some cases (Sparc), this info is impossible
+	 * for userspace to get any other way, in others (i386) it is
+	 * merely difficult.
+	 */
 	k_platform = ELF_PLATFORM;
 	u_platform = NULL;
 
@@ -505,19 +514,20 @@ static int create_elf_fdpic_tables(struct linux_binprm *bprm,
 			return -EFAULT;
 	}
 
-#if defined(__i386__) && defined(CONFIG_SMP)
-	/* in some cases (e.g. Hyper-Threading), we want to avoid L1 evictions
-	 * by the processes running on the same package. One thing we can do is
-	 * to shuffle the initial stack for them.
-	 *
-	 * the conditionals here are unneeded, but kept in to make the code
-	 * behaviour the same as pre change unless we have hyperthreaded
-	 * processors. This keeps Mr Marcelo Person happier but should be
-	 * removed for 2.5
+	/*
+	 * If this architecture has a "base" platform capability
+	 * string, copy it to userspace.
 	 */
-	if (smp_num_siblings > 1)
-		sp = sp - ((current->pid % 64) << 7);
-#endif
+	k_base_platform = ELF_BASE_PLATFORM;
+	u_base_platform = NULL;
+
+	if (k_base_platform) {
+		platform_len = strlen(k_base_platform) + 1;
+		sp -= platform_len;
+		u_base_platform = (char __user *) sp;
+		if (__copy_to_user(u_base_platform, k_base_platform, platform_len) != 0)
+			return -EFAULT;
+	}
 
 	sp &= ~7UL;
 
@@ -547,12 +557,13 @@ static int create_elf_fdpic_tables(struct linux_binprm *bprm,
 	}
 
 	/* force 16 byte _final_ alignment here for generality */
-#define DLINFO_ITEMS 13
+#define DLINFO_ITEMS 15
 
-	nitems = 1 + DLINFO_ITEMS + (k_platform ? 1 : 0);
-#ifdef DLINFO_ARCH_ITEMS
-	nitems += DLINFO_ARCH_ITEMS;
-#endif
+	nitems = 1 + DLINFO_ITEMS + (k_platform ? 1 : 0) +
+		(k_base_platform ? 1 : 0) + AT_VECTOR_SIZE_ARCH;
+
+	if (bprm->interp_flags & BINPRM_FLAGS_EXECFD)
+		nitems++;
 
 	csp = sp;
 	sp -= nitems * 2 * sizeof(unsigned long);
@@ -564,39 +575,61 @@ static int create_elf_fdpic_tables(struct linux_binprm *bprm,
 	sp -= sp & 15UL;
 
 	/* put the ELF interpreter info on the stack */
-#define NEW_AUX_ENT(nr, id, val)					\
+#define NEW_AUX_ENT(id, val)						\
 	do {								\
 		struct { unsigned long _id, _val; } __user *ent;	\
 									\
 		ent = (void __user *) csp;				\
 		__put_user((id), &ent[nr]._id);				\
 		__put_user((val), &ent[nr]._val);			\
+		nr++;							\
 	} while (0)
 
+	nr = 0;
 	csp -= 2 * sizeof(unsigned long);
-	NEW_AUX_ENT(0, AT_NULL, 0);
+	NEW_AUX_ENT(AT_NULL, 0);
 	if (k_platform) {
+		nr = 0;
 		csp -= 2 * sizeof(unsigned long);
-		NEW_AUX_ENT(0, AT_PLATFORM,
+		NEW_AUX_ENT(AT_PLATFORM,
 			    (elf_addr_t) (unsigned long) u_platform);
 	}
 
+	if (k_base_platform) {
+		nr = 0;
+		csp -= 2 * sizeof(unsigned long);
+		NEW_AUX_ENT(AT_BASE_PLATFORM,
+			    (elf_addr_t) (unsigned long) u_base_platform);
+	}
+
+	if (bprm->interp_flags & BINPRM_FLAGS_EXECFD) {
+		nr = 0;
+		csp -= 2 * sizeof(unsigned long);
+		NEW_AUX_ENT(AT_EXECFD, bprm->interp_data);
+	}
+
+	nr = 0;
 	csp -= DLINFO_ITEMS * 2 * sizeof(unsigned long);
-	NEW_AUX_ENT( 0, AT_HWCAP,	hwcap);
-	NEW_AUX_ENT( 1, AT_PAGESZ,	PAGE_SIZE);
-	NEW_AUX_ENT( 2, AT_CLKTCK,	CLOCKS_PER_SEC);
-	NEW_AUX_ENT( 3, AT_PHDR,	exec_params->ph_addr);
-	NEW_AUX_ENT( 4, AT_PHENT,	sizeof(struct elf_phdr));
-	NEW_AUX_ENT( 5, AT_PHNUM,	exec_params->hdr.e_phnum);
-	NEW_AUX_ENT( 6,	AT_BASE,	interp_params->elfhdr_addr);
-	NEW_AUX_ENT( 7, AT_FLAGS,	0);
-	NEW_AUX_ENT( 8, AT_ENTRY,	exec_params->entry_addr);
-	NEW_AUX_ENT( 9, AT_UID,		(elf_addr_t) current->uid);
-	NEW_AUX_ENT(10, AT_EUID,	(elf_addr_t) current->euid);
-	NEW_AUX_ENT(11, AT_GID,		(elf_addr_t) current->gid);
-	NEW_AUX_ENT(12, AT_EGID,	(elf_addr_t) current->egid);
+	NEW_AUX_ENT(AT_HWCAP,	hwcap);
+	NEW_AUX_ENT(AT_PAGESZ,	PAGE_SIZE);
+	NEW_AUX_ENT(AT_CLKTCK,	CLOCKS_PER_SEC);
+	NEW_AUX_ENT(AT_PHDR,	exec_params->ph_addr);
+	NEW_AUX_ENT(AT_PHENT,	sizeof(struct elf_phdr));
+	NEW_AUX_ENT(AT_PHNUM,	exec_params->hdr.e_phnum);
+	NEW_AUX_ENT(AT_BASE,	interp_params->elfhdr_addr);
+	NEW_AUX_ENT(AT_FLAGS,	0);
+	NEW_AUX_ENT(AT_ENTRY,	exec_params->entry_addr);
+	NEW_AUX_ENT(AT_UID,	(elf_addr_t) cred->uid);
+	NEW_AUX_ENT(AT_EUID,	(elf_addr_t) cred->euid);
+	NEW_AUX_ENT(AT_GID,	(elf_addr_t) cred->gid);
+	NEW_AUX_ENT(AT_EGID,	(elf_addr_t) cred->egid);
+	NEW_AUX_ENT(AT_SECURE,	security_bprm_secureexec(bprm));
+	NEW_AUX_ENT(AT_EXECFN,	bprm->exec);
 
 #ifdef ARCH_DLINFO
+	nr = 0;
+	csp -= AT_VECTOR_SIZE_ARCH * 2 * sizeof(unsigned long);
+
 	/* ARCH_DLINFO must come last so platform specific code can enforce
 	 * special alignment requirements on the AUXV if necessary (eg. PPC).
 	 */
@@ -942,9 +975,12 @@ static int elf_fdpic_map_file_constdisp_on_uclinux(
 			params->elfhdr_addr = seg->addr;
 
 		/* clear any space allocated but not loaded */
-		if (phdr->p_filesz < phdr->p_memsz)
-			clear_user((void *) (seg->addr + phdr->p_filesz),
-				   phdr->p_memsz - phdr->p_filesz);
+		if (phdr->p_filesz < phdr->p_memsz) {
+			ret = clear_user((void *) (seg->addr + phdr->p_filesz),
+					 phdr->p_memsz - phdr->p_filesz);
+			if (ret)
+				return ret;
+		}
 
 		if (mm) {
 			if (phdr->p_flags & PF_X) {
@@ -984,7 +1020,7 @@ static int elf_fdpic_map_file_by_direct_mmap(struct elf_fdpic_params *params,
 	struct elf32_fdpic_loadseg *seg;
 	struct elf32_phdr *phdr;
 	unsigned long load_addr, delta_vaddr;
-	int loop, dvset;
+	int loop, dvset, ret;
 
 	load_addr = params->load_addr;
 	delta_vaddr = 0;
@@ -1084,7 +1120,9 @@ static int elf_fdpic_map_file_by_direct_mmap(struct elf_fdpic_params *params,
 		 * PT_LOAD */
 		if (prot & PROT_WRITE && disp > 0) {
 			kdebug("clear[%d] ad=%lx sz=%lx", loop, maddr, disp);
-			clear_user((void __user *) maddr, disp);
+			ret = clear_user((void __user *) maddr, disp);
+			if (ret)
+				return ret;
 			maddr += disp;
 		}
 
@@ -1119,15 +1157,19 @@ static int elf_fdpic_map_file_by_direct_mmap(struct elf_fdpic_params *params,
 		if (prot & PROT_WRITE && excess1 > 0) {
 			kdebug("clear[%d] ad=%lx sz=%lx",
 			       loop, maddr + phdr->p_filesz, excess1);
-			clear_user((void __user *) maddr + phdr->p_filesz,
-				   excess1);
+			ret = clear_user((void __user *) maddr + phdr->p_filesz,
+					 excess1);
+			if (ret)
+				return ret;
 		}
 
 #else
 		if (excess > 0) {
 			kdebug("clear[%d] ad=%lx sz=%lx",
 			       loop, maddr + phdr->p_filesz, excess);
-			clear_user((void *) maddr + phdr->p_filesz, excess);
+			ret = clear_user((void *) maddr + phdr->p_filesz, excess);
+			if (ret)
+				return ret;
 		}
 #endif
 
@@ -1286,9 +1328,6 @@ static int writenote(struct memelfnote *men, struct file *file)
 #define DUMP_WRITE(addr, nr)	\
 	if ((size += (nr)) > limit || !dump_write(file, (addr), (nr))) \
 		goto end_coredump;
-#define DUMP_SEEK(off)	\
-	if (!dump_seek(file, (off))) \
-		goto end_coredump;
 
 static inline void fill_elf_fdpic_header(struct elfhdr *elf, int segs)
 {
@@ -1348,25 +1387,22 @@ static void fill_prstatus(struct elf_prstatus *prstatus,
 	prstatus->pr_info.si_signo = prstatus->pr_cursig = signr;
 	prstatus->pr_sigpend = p->pending.signal.sig[0];
 	prstatus->pr_sighold = p->blocked.sig[0];
+	rcu_read_lock();
+	prstatus->pr_ppid = task_pid_vnr(rcu_dereference(p->real_parent));
+	rcu_read_unlock();
 	prstatus->pr_pid = task_pid_vnr(p);
-	prstatus->pr_ppid = task_pid_vnr(p->parent);
 	prstatus->pr_pgrp = task_pgrp_vnr(p);
 	prstatus->pr_sid = task_session_vnr(p);
 	if (thread_group_leader(p)) {
+		struct task_cputime cputime;
+
 		/*
-		 * This is the record for the group leader.  Add in the
-		 * cumulative times of previous dead threads.  This total
-		 * won't include the time of each live thread whose state
-		 * is included in the core dump.  The final total reported
-		 * to our parent process when it calls wait4 will include
-		 * those sums as well as the little bit more time it takes
-		 * this and each other thread to finish dying after the
-		 * core dump synchronization phase.
+		 * This is the record for the group leader.  It shows the
+		 * group-wide total, not its individual thread total.
 		 */
-		cputime_to_timeval(cputime_add(p->utime, p->signal->utime),
-				   &prstatus->pr_utime);
-		cputime_to_timeval(cputime_add(p->stime, p->signal->stime),
-				   &prstatus->pr_stime);
+		thread_group_cputime(p, &cputime);
+		cputime_to_timeval(cputime.utime, &prstatus->pr_utime);
+		cputime_to_timeval(cputime.stime, &prstatus->pr_stime);
 	} else {
 		cputime_to_timeval(p->utime, &prstatus->pr_utime);
 		cputime_to_timeval(p->stime, &prstatus->pr_stime);
@@ -1381,6 +1417,7 @@ static void fill_prstatus(struct elf_prstatus *prstatus,
 static int fill_psinfo(struct elf_prpsinfo *psinfo, struct task_struct *p,
 		       struct mm_struct *mm)
 {
+	const struct cred *cred;
 	unsigned int i, len;
 
 	/* first copy the parameters from user space */
@@ -1397,8 +1434,10 @@ static int fill_psinfo(struct elf_prpsinfo *psinfo, struct task_struct *p,
 			psinfo->pr_psargs[i] = ' ';
 	psinfo->pr_psargs[len] = 0;
 
+	rcu_read_lock();
+	psinfo->pr_ppid = task_pid_vnr(rcu_dereference(p->real_parent));
+	rcu_read_unlock();
 	psinfo->pr_pid = task_pid_vnr(p);
-	psinfo->pr_ppid = task_pid_vnr(p->parent);
 	psinfo->pr_pgrp = task_pgrp_vnr(p);
 	psinfo->pr_sid = task_session_vnr(p);
 
@@ -1408,8 +1447,11 @@ static int fill_psinfo(struct elf_prpsinfo *psinfo, struct task_struct *p,
 	psinfo->pr_zomb = psinfo->pr_sname == 'Z';
 	psinfo->pr_nice = task_nice(p);
 	psinfo->pr_flag = p->flags;
-	SET_UID(psinfo->pr_uid, p->uid);
-	SET_GID(psinfo->pr_gid, p->gid);
+	rcu_read_lock();
+	cred = __task_cred(p);
+	SET_UID(psinfo->pr_uid, cred->uid);
+	SET_GID(psinfo->pr_gid, cred->gid);
+	rcu_read_unlock();
 	strncpy(psinfo->pr_fname, p->comm, sizeof(psinfo->pr_fname));
 
 	return 0;
@@ -1476,6 +1518,7 @@ static int elf_fdpic_dump_segments(struct file *file, size_t *size,
 			   unsigned long *limit, unsigned long mm_flags)
 {
 	struct vm_area_struct *vma;
+	int err = 0;
 
 	for (vma = current->mm->mmap; vma; vma = vma->vm_next) {
 		unsigned long addr;
@@ -1483,43 +1526,26 @@ static int elf_fdpic_dump_segments(struct file *file, size_t *size,
 		if (!maydump(vma, mm_flags))
 			continue;
 
-		for (addr = vma->vm_start;
-		     addr < vma->vm_end;
-		     addr += PAGE_SIZE
-		     ) {
-			struct vm_area_struct *vma;
-			struct page *page;
-
-			if (get_user_pages(current, current->mm, addr, 1, 0, 1,
-					   &page, &vma) <= 0) {
-				DUMP_SEEK(file->f_pos + PAGE_SIZE);
-			}
-			else if (page == ZERO_PAGE(0)) {
-				page_cache_release(page);
-				DUMP_SEEK(file->f_pos + PAGE_SIZE);
-			}
-			else {
-				void *kaddr;
-
-				flush_cache_page(vma, addr, page_to_pfn(page));
-				kaddr = kmap(page);
-				if ((*size += PAGE_SIZE) > *limit ||
-				    !dump_write(file, kaddr, PAGE_SIZE)
-				    ) {
-					kunmap(page);
-					page_cache_release(page);
-					return -EIO;
-				}
+		for (addr = vma->vm_start; addr < vma->vm_end;
+							addr += PAGE_SIZE) {
+			struct page *page = get_dump_page(addr);
+			if (page) {
+				void *kaddr = kmap(page);
+				*size += PAGE_SIZE;
+				if (*size > *limit)
+					err = -EFBIG;
+				else if (!dump_write(file, kaddr, PAGE_SIZE))
+					err = -EIO;
 				kunmap(page);
 				page_cache_release(page);
-			}
+			} else if (!dump_seek(file, file->f_pos + PAGE_SIZE))
+				err = -EFBIG;
+			if (err)
+				goto out;
 		}
 	}
-
-	return 0;
-
-end_coredump:
-	return -EFBIG;
+out:
+	return err;
 }
 #endif
 
@@ -1530,11 +1556,9 @@ end_coredump:
 static int elf_fdpic_dump_segments(struct file *file, size_t *size,
 			   unsigned long *limit, unsigned long mm_flags)
 {
-	struct vm_list_struct *vml;
+	struct vm_area_struct *vma;
 
-	for (vml = current->mm->context.vmlist; vml; vml = vml->next) {
-	struct vm_area_struct *vma = vml->vma;
-
+	for (vma = current->mm->mmap; vma; vma = vma->vm_next) {
 		if (!maydump(vma, mm_flags))
 			continue;
 
@@ -1573,7 +1597,6 @@ static int elf_fdpic_core_dump(long signr, struct pt_regs *regs,
 	struct memelfnote *notes = NULL;
 	struct elf_prstatus *prstatus = NULL;	/* NT_PRSTATUS */
 	struct elf_prpsinfo *psinfo = NULL;	/* NT_PRPSINFO */
- 	struct task_struct *g, *p;
  	LIST_HEAD(thread_list);
  	struct list_head *t;
 	elf_fpregset_t *fpu = NULL;
@@ -1581,9 +1604,6 @@ static int elf_fdpic_core_dump(long signr, struct pt_regs *regs,
 	elf_fpxregset_t *xfpu = NULL;
 #endif
 	int thread_status_size = 0;
-#ifndef CONFIG_MMU
-	struct vm_list_struct *vml;
-#endif
 	elf_addr_t *auxv;
 	unsigned long mm_flags;
 
@@ -1622,20 +1642,19 @@ static int elf_fdpic_core_dump(long signr, struct pt_regs *regs,
 #endif
 
 	if (signr) {
+		struct core_thread *ct;
 		struct elf_thread_status *tmp;
-		rcu_read_lock();
-		do_each_thread(g,p)
-			if (current->mm == p->mm && current != p) {
-				tmp = kzalloc(sizeof(*tmp), GFP_ATOMIC);
-				if (!tmp) {
-					rcu_read_unlock();
-					goto cleanup;
-				}
-				tmp->thread = p;
-				list_add(&tmp->list, &thread_list);
-			}
-		while_each_thread(g,p);
-		rcu_read_unlock();
+
+		for (ct = current->mm->core_state->dumper.next;
+						ct; ct = ct->next) {
+			tmp = kzalloc(sizeof(*tmp), GFP_KERNEL);
+			if (!tmp)
+				goto cleanup;
+
+			tmp->thread = ct->task;
+			list_add(&tmp->list, &thread_list);
+		}
+
 		list_for_each(t, &thread_list) {
 			struct elf_thread_status *tmp;
 			int sz;
@@ -1650,13 +1669,7 @@ static int elf_fdpic_core_dump(long signr, struct pt_regs *regs,
 	fill_prstatus(prstatus, current, signr);
 	elf_core_copy_regs(&prstatus->pr_reg, regs);
 
-#ifdef CONFIG_MMU
 	segs = current->mm->map_count;
-#else
-	segs = 0;
-	for (vml = current->mm->context.vmlist; vml; vml = vml->next)
-	    segs++;
-#endif
 #ifdef ELF_CORE_EXTRA_PHDRS
 	segs += ELF_CORE_EXTRA_PHDRS;
 #endif
@@ -1731,19 +1744,9 @@ static int elf_fdpic_core_dump(long signr, struct pt_regs *regs,
 	mm_flags = current->mm->flags;
 
 	/* write program headers for segments dump */
-	for (
-#ifdef CONFIG_MMU
-		vma = current->mm->mmap; vma; vma = vma->vm_next
-#else
-			vml = current->mm->context.vmlist; vml; vml = vml->next
-#endif
-	     ) {
+	for (vma = current->mm->mmap; vma; vma = vma->vm_next) {
 		struct elf_phdr phdr;
 		size_t sz;
-
-#ifndef CONFIG_MMU
-		vma = vml->vma;
-#endif
 
 		sz = vma->vm_end - vma->vm_start;
 
@@ -1783,7 +1786,8 @@ static int elf_fdpic_core_dump(long signr, struct pt_regs *regs,
 				goto end_coredump;
 	}
 
-	DUMP_SEEK(dataoff);
+	if (!dump_seek(file, dataoff))
+		goto end_coredump;
 
 	if (elf_fdpic_dump_segments(file, &size, &limit, mm_flags) < 0)
 		goto end_coredump;

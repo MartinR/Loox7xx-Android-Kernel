@@ -135,7 +135,6 @@ struct rpc_task_setup {
 #define RPC_IS_SWAPPER(t)	((t)->tk_flags & RPC_TASK_SWAPPER)
 #define RPC_DO_ROOTOVERRIDE(t)	((t)->tk_flags & RPC_TASK_ROOTCREDS)
 #define RPC_ASSASSINATED(t)	((t)->tk_flags & RPC_TASK_KILLED)
-#define RPC_DO_CALLBACK(t)	((t)->tk_callback != NULL)
 #define RPC_IS_SOFT(t)		((t)->tk_flags & RPC_TASK_SOFT)
 
 #define RPC_TASK_RUNNING	0
@@ -211,6 +210,8 @@ struct rpc_wait_queue {
  */
 struct rpc_task *rpc_new_task(const struct rpc_task_setup *);
 struct rpc_task *rpc_run_task(const struct rpc_task_setup *);
+struct rpc_task *rpc_run_bc_task(struct rpc_rqst *req,
+				const struct rpc_call_ops *ops);
 void		rpc_put_task(struct rpc_task *);
 void		rpc_exit_task(struct rpc_task *);
 void		rpc_release_calldata(const struct rpc_call_ops *, void *);
@@ -238,6 +239,7 @@ void		rpc_show_tasks(void);
 int		rpc_init_mempool(void);
 void		rpc_destroy_mempool(void);
 extern struct workqueue_struct *rpciod_workqueue;
+void		rpc_prepare_task(struct rpc_task *task);
 
 static inline void rpc_exit(struct rpc_task *task, int status)
 {

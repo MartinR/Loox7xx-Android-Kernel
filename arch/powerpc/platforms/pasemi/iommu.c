@@ -83,9 +83,10 @@ static u32 *iob_l2_base;
 static struct iommu_table iommu_table_iobmap;
 static int iommu_table_iobmap_inited;
 
-static void iobmap_build(struct iommu_table *tbl, long index,
+static int iobmap_build(struct iommu_table *tbl, long index,
 			 long npages, unsigned long uaddr,
-			 enum dma_data_direction direction)
+			 enum dma_data_direction direction,
+			 struct dma_attrs *attrs)
 {
 	u32 *ip;
 	u32 rpn;
@@ -107,6 +108,7 @@ static void iobmap_build(struct iommu_table *tbl, long index,
 		uaddr += IOBMAP_PAGE_SIZE;
 		bus_addr += IOBMAP_PAGE_SIZE;
 	}
+	return 0;
 }
 
 
@@ -187,7 +189,7 @@ static void pci_dma_dev_setup_pasemi(struct pci_dev *dev)
 	}
 #endif
 
-	dev->dev.archdata.dma_data = &iommu_table_iobmap;
+	set_iommu_table_base(&dev->dev, &iommu_table_iobmap);
 }
 
 static void pci_dma_bus_setup_null(struct pci_bus *b) { }

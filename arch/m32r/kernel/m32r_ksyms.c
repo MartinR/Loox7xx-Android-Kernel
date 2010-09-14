@@ -14,6 +14,7 @@
 #include <asm/delay.h>
 #include <asm/irq.h>
 #include <asm/tlbflush.h>
+#include <asm/pgtable.h>
 
 /* platform dependent support */
 EXPORT_SYMBOL(boot_cpu_data);
@@ -21,12 +22,6 @@ EXPORT_SYMBOL(dump_fpu);
 EXPORT_SYMBOL(__ioremap);
 EXPORT_SYMBOL(iounmap);
 EXPORT_SYMBOL(kernel_thread);
-
-/* Networking helper routines. */
-/* Delay loops */
-EXPORT_SYMBOL(__udelay);
-EXPORT_SYMBOL(__delay);
-EXPORT_SYMBOL(__const_udelay);
 
 EXPORT_SYMBOL(strncpy_from_user);
 EXPORT_SYMBOL(__strncpy_from_user);
@@ -42,9 +37,6 @@ extern void *dcache_dummy;
 EXPORT_SYMBOL(dcache_dummy);
 #endif
 EXPORT_SYMBOL(cpu_data);
-
-/* Global SMP stuff */
-EXPORT_SYMBOL(smp_call_function);
 
 /* TLB flushing */
 EXPORT_SYMBOL(smp_flush_tlb_page);
@@ -68,6 +60,7 @@ EXPORT_SYMBOL(memset);
 EXPORT_SYMBOL(copy_page);
 EXPORT_SYMBOL(clear_page);
 EXPORT_SYMBOL(strlen);
+EXPORT_SYMBOL(empty_zero_page);
 
 EXPORT_SYMBOL(_inb);
 EXPORT_SYMBOL(_inw);

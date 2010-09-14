@@ -92,12 +92,12 @@ static int red_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 			break;
 	}
 
-	ret = child->enqueue(skb, child);
+	ret = qdisc_enqueue(skb, child);
 	if (likely(ret == NET_XMIT_SUCCESS)) {
-		sch->bstats.bytes += skb->len;
+		sch->bstats.bytes += qdisc_pkt_len(skb);
 		sch->bstats.packets++;
 		sch->q.qlen++;
-	} else {
+	} else if (net_xmit_drop_count(ret)) {
 		q->stats.pdrop++;
 		sch->qstats.drops++;
 	}
@@ -106,23 +106,6 @@ static int red_enqueue(struct sk_buff *skb, struct Qdisc* sch)
 congestion_drop:
 	qdisc_drop(skb, sch);
 	return NET_XMIT_CN;
-}
-
-static int red_requeue(struct sk_buff *skb, struct Qdisc* sch)
-{
-	struct red_sched_data *q = qdisc_priv(sch);
-	struct Qdisc *child = q->qdisc;
-	int ret;
-
-	if (red_is_idling(&q->parms))
-		red_end_of_idle_period(&q->parms);
-
-	ret = child->ops->requeue(skb, child);
-	if (likely(ret == NET_XMIT_SUCCESS)) {
-		sch->qstats.requeues++;
-		sch->q.qlen++;
-	}
-	return ret;
 }
 
 static struct sk_buff * red_dequeue(struct Qdisc* sch)
@@ -138,6 +121,14 @@ static struct sk_buff * red_dequeue(struct Qdisc* sch)
 		red_start_of_idle_period(&q->parms);
 
 	return skb;
+}
+
+static struct sk_buff * red_peek(struct Qdisc* sch)
+{
+	struct red_sched_data *q = qdisc_priv(sch);
+	struct Qdisc *child = q->qdisc;
+
+	return child->ops->peek(child);
 }
 
 static unsigned int red_drop(struct Qdisc* sch)
@@ -174,33 +165,6 @@ static void red_destroy(struct Qdisc *sch)
 	qdisc_destroy(q->qdisc);
 }
 
-static struct Qdisc *red_create_dflt(struct Qdisc *sch, u32 limit)
-{
-	struct Qdisc *q;
-	struct nlattr *nla;
-	int ret;
-
-	q = qdisc_create_dflt(sch->dev, &bfifo_qdisc_ops,
-			      TC_H_MAKE(sch->handle, 1));
-	if (q) {
-		nla = kmalloc(nla_attr_size(sizeof(struct tc_fifo_qopt)),
-			      GFP_KERNEL);
-		if (nla) {
-			nla->nla_type = RTM_NEWQDISC;
-			nla->nla_len = nla_attr_size(sizeof(struct tc_fifo_qopt));
-			((struct tc_fifo_qopt *)nla_data(nla))->limit = limit;
-
-			ret = q->ops->change(q, nla);
-			kfree(nla);
-
-			if (ret == 0)
-				return q;
-		}
-		qdisc_destroy(q);
-	}
-	return NULL;
-}
-
 static const struct nla_policy red_policy[TCA_RED_MAX + 1] = {
 	[TCA_RED_PARMS]	= { .len = sizeof(struct tc_red_qopt) },
 	[TCA_RED_STAB]	= { .len = RED_STAB_SIZE },
@@ -228,9 +192,9 @@ static int red_change(struct Qdisc *sch, struct nlattr *opt)
 	ctl = nla_data(tb[TCA_RED_PARMS]);
 
 	if (ctl->limit > 0) {
-		child = red_create_dflt(sch, ctl->limit);
-		if (child == NULL)
-			return -ENOMEM;
+		child = fifo_create_dflt(sch, &bfifo_qdisc_ops, ctl->limit);
+		if (IS_ERR(child))
+			return PTR_ERR(child);
 	}
 
 	sch_tree_lock(sch);
@@ -238,7 +202,8 @@ static int red_change(struct Qdisc *sch, struct nlattr *opt)
 	q->limit = ctl->limit;
 	if (child) {
 		qdisc_tree_decrease_qlen(q->qdisc, q->qdisc->q.qlen);
-		qdisc_destroy(xchg(&q->qdisc, child));
+		qdisc_destroy(q->qdisc);
+		q->qdisc = child;
 	}
 
 	red_set_parms(&q->parms, ctl->qth_min, ctl->qth_max, ctl->Wlog,
@@ -303,8 +268,6 @@ static int red_dump_class(struct Qdisc *sch, unsigned long cl,
 {
 	struct red_sched_data *q = qdisc_priv(sch);
 
-	if (cl != 1)
-		return -ENOENT;
 	tcm->tcm_handle |= TC_H_MIN(1);
 	tcm->tcm_info = q->qdisc->handle;
 	return 0;
@@ -319,7 +282,8 @@ static int red_graft(struct Qdisc *sch, unsigned long arg, struct Qdisc *new,
 		new = &noop_qdisc;
 
 	sch_tree_lock(sch);
-	*old = xchg(&q->qdisc, new);
+	*old = q->qdisc;
+	q->qdisc = new;
 	qdisc_tree_decrease_qlen(*old, (*old)->q.qlen);
 	qdisc_reset(*old);
 	sch_tree_unlock(sch);
@@ -342,17 +306,6 @@ static void red_put(struct Qdisc *sch, unsigned long arg)
 	return;
 }
 
-static int red_change_class(struct Qdisc *sch, u32 classid, u32 parentid,
-			    struct nlattr **tca, unsigned long *arg)
-{
-	return -ENOSYS;
-}
-
-static int red_delete(struct Qdisc *sch, unsigned long cl)
-{
-	return -ENOSYS;
-}
-
 static void red_walk(struct Qdisc *sch, struct qdisc_walker *walker)
 {
 	if (!walker->stop) {
@@ -365,20 +318,12 @@ static void red_walk(struct Qdisc *sch, struct qdisc_walker *walker)
 	}
 }
 
-static struct tcf_proto **red_find_tcf(struct Qdisc *sch, unsigned long cl)
-{
-	return NULL;
-}
-
 static const struct Qdisc_class_ops red_class_ops = {
 	.graft		=	red_graft,
 	.leaf		=	red_leaf,
 	.get		=	red_get,
 	.put		=	red_put,
-	.change		=	red_change_class,
-	.delete		=	red_delete,
 	.walk		=	red_walk,
-	.tcf_chain	=	red_find_tcf,
 	.dump		=	red_dump_class,
 };
 
@@ -388,7 +333,7 @@ static struct Qdisc_ops red_qdisc_ops __read_mostly = {
 	.cl_ops		=	&red_class_ops,
 	.enqueue	=	red_enqueue,
 	.dequeue	=	red_dequeue,
-	.requeue	=	red_requeue,
+	.peek		=	red_peek,
 	.drop		=	red_drop,
 	.init		=	red_init,
 	.reset		=	red_reset,

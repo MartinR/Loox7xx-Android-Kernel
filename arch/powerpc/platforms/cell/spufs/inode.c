@@ -42,9 +42,18 @@
 
 #include "spufs.h"
 
+struct spufs_sb_info {
+	int debug;
+};
+
 static struct kmem_cache *spufs_inode_cache;
 char *isolated_loader;
 static int isolated_loader_size;
+
+static struct spufs_sb_info *spufs_get_sb_info(struct super_block *sb)
+{
+	return sb->s_fs_info;
+}
 
 static struct inode *
 spufs_alloc_inode(struct super_block *sb)
@@ -69,7 +78,7 @@ spufs_destroy_inode(struct inode *inode)
 }
 
 static void
-spufs_init_once(struct kmem_cache *cachep, void *p)
+spufs_init_once(void *p)
 {
 	struct spufs_inode_info *ei = p;
 
@@ -86,9 +95,8 @@ spufs_new_inode(struct super_block *sb, int mode)
 		goto out;
 
 	inode->i_mode = mode;
-	inode->i_uid = current->fsuid;
-	inode->i_gid = current->fsgid;
-	inode->i_blocks = 0;
+	inode->i_uid = current_fsuid();
+	inode->i_gid = current_fsgid();
 	inode->i_atime = inode->i_mtime = inode->i_ctime = CURRENT_TIME;
 out:
 	return inode;
@@ -109,9 +117,9 @@ spufs_setattr(struct dentry *dentry, struct iattr *attr)
 static int
 spufs_new_file(struct super_block *sb, struct dentry *dentry,
 		const struct file_operations *fops, int mode,
-		struct spu_context *ctx)
+		size_t size, struct spu_context *ctx)
 {
-	static struct inode_operations spufs_file_iops = {
+	static const struct inode_operations spufs_file_iops = {
 		.setattr = spufs_setattr,
 	};
 	struct inode *inode;
@@ -125,6 +133,7 @@ spufs_new_file(struct super_block *sb, struct dentry *dentry,
 	ret = 0;
 	inode->i_op = &spufs_file_iops;
 	inode->i_fop = fops;
+	inode->i_size = size;
 	inode->i_private = SPUFS_I(inode)->i_ctx = get_spu_context(ctx);
 	d_add(dentry, inode);
 out:
@@ -177,8 +186,9 @@ static int spufs_rmdir(struct inode *parent, struct dentry *dir)
 	return simple_rmdir(parent, dir);
 }
 
-static int spufs_fill_dir(struct dentry *dir, struct tree_descr *files,
-			  int mode, struct spu_context *ctx)
+static int spufs_fill_dir(struct dentry *dir,
+		const struct spufs_tree_descr *files, int mode,
+		struct spu_context *ctx)
 {
 	struct dentry *dentry, *tmp;
 	int ret;
@@ -189,7 +199,7 @@ static int spufs_fill_dir(struct dentry *dir, struct tree_descr *files,
 		if (!dentry)
 			goto out;
 		ret = spufs_new_file(dir->d_sb, dentry, files->ops,
-					files->mode & mode, ctx);
+					files->mode & mode, files->size, ctx);
 		if (ret)
 			goto out;
 		files++;
@@ -279,10 +289,17 @@ spufs_mkdir(struct inode *dir, struct dentry *dentry, unsigned int flags,
 	if (ret)
 		goto out_free_ctx;
 
+	if (spufs_get_sb_info(dir->i_sb)->debug)
+		ret = spufs_fill_dir(dentry, spufs_dir_debug_contents,
+				mode, ctx);
+
+	if (ret)
+		goto out_free_ctx;
+
 	d_instantiate(dentry, inode);
 	dget(dentry);
-	dir->i_nlink++;
-	dentry->d_inode->i_nlink++;
+	inc_nlink(dir);
+	inc_nlink(dentry->d_inode);
 	goto out;
 
 out_free_ctx:
@@ -306,7 +323,7 @@ static int spufs_context_open(struct dentry *dentry, struct vfsmount *mnt)
 		goto out;
 	}
 
-	filp = dentry_open(dentry, mnt, O_RDONLY);
+	filp = dentry_open(dentry, mnt, O_RDONLY, current_cred());
 	if (IS_ERR(filp)) {
 		put_unused_fd(ret);
 		ret = PTR_ERR(filp);
@@ -479,6 +496,8 @@ spufs_create_context(struct inode *inode, struct dentry *dentry,
 	ret = spufs_context_open(dget(dentry), mntget(mnt));
 	if (ret < 0) {
 		WARN_ON(spufs_rmdir(inode, dentry));
+		if (affinity)
+			mutex_unlock(&gang->aff_mutex);
 		mutex_unlock(&inode->i_mutex);
 		spu_forget(SPUFS_I(dentry->d_inode)->i_ctx);
 		goto out;
@@ -521,8 +540,8 @@ spufs_mkgang(struct inode *dir, struct dentry *dentry, int mode)
 	inode->i_fop = &simple_dir_operations;
 
 	d_instantiate(dentry, inode);
-	dir->i_nlink++;
-	dentry->d_inode->i_nlink++;
+	inc_nlink(dir);
+	inc_nlink(dentry->d_inode);
 	return ret;
 
 out_iput:
@@ -543,7 +562,7 @@ static int spufs_gang_open(struct dentry *dentry, struct vfsmount *mnt)
 		goto out;
 	}
 
-	filp = dentry_open(dentry, mnt, O_RDONLY);
+	filp = dentry_open(dentry, mnt, O_RDONLY, current_cred());
 	if (IS_ERR(filp)) {
 		put_unused_fd(ret);
 		ret = PTR_ERR(filp);
@@ -612,11 +631,7 @@ long spufs_create(struct nameidata *nd, unsigned int flags, mode_t mode,
 	if (IS_ERR(dentry))
 		goto out_dir;
 
-	ret = -EEXIST;
-	if (dentry->d_inode)
-		goto out_dput;
-
-	mode &= ~current->fs->umask;
+	mode &= ~current_umask();
 
 	if (flags & SPU_CREATE_GANG)
 		ret = spufs_create_gang(nd->path.dentry->d_inode,
@@ -629,8 +644,6 @@ long spufs_create(struct nameidata *nd, unsigned int flags, mode_t mode,
 		fsnotify_mkdir(nd->path.dentry->d_inode, dentry);
 	return ret;
 
-out_dput:
-	dput(dentry);
 out_dir:
 	mutex_unlock(&nd->path.dentry->d_inode->i_mutex);
 out:
@@ -639,18 +652,19 @@ out:
 
 /* File system initialization */
 enum {
-	Opt_uid, Opt_gid, Opt_mode, Opt_err,
+	Opt_uid, Opt_gid, Opt_mode, Opt_debug, Opt_err,
 };
 
-static match_table_t spufs_tokens = {
-	{ Opt_uid,  "uid=%d" },
-	{ Opt_gid,  "gid=%d" },
-	{ Opt_mode, "mode=%o" },
-	{ Opt_err,   NULL  },
+static const match_table_t spufs_tokens = {
+	{ Opt_uid,   "uid=%d" },
+	{ Opt_gid,   "gid=%d" },
+	{ Opt_mode,  "mode=%o" },
+	{ Opt_debug, "debug" },
+	{ Opt_err,    NULL  },
 };
 
 static int
-spufs_parse_options(char *options, struct inode *root)
+spufs_parse_options(struct super_block *sb, char *options, struct inode *root)
 {
 	char *p;
 	substring_t args[MAX_OPT_ARGS];
@@ -677,6 +691,9 @@ spufs_parse_options(char *options, struct inode *root)
 			if (match_octal(&args[0], &option))
 				return 0;
 			root->i_mode = option | S_IFDIR;
+			break;
+		case Opt_debug:
+			spufs_get_sb_info(sb)->debug = 1;
 			break;
 		default:
 			return 0;
@@ -734,9 +751,10 @@ spufs_create_root(struct super_block *sb, void *data)
 	inode->i_op = &simple_dir_inode_operations;
 	inode->i_fop = &simple_dir_operations;
 	SPUFS_I(inode)->i_ctx = NULL;
+	inc_nlink(inode);
 
 	ret = -EINVAL;
-	if (!spufs_parse_options(data, inode))
+	if (!spufs_parse_options(sb, data, inode))
 		goto out_iput;
 
 	ret = -ENOMEM;
@@ -754,7 +772,8 @@ out:
 static int
 spufs_fill_super(struct super_block *sb, void *data, int silent)
 {
-	static struct super_operations s_ops = {
+	struct spufs_sb_info *info;
+	static const struct super_operations s_ops = {
 		.alloc_inode = spufs_alloc_inode,
 		.destroy_inode = spufs_destroy_inode,
 		.statfs = simple_statfs,
@@ -765,11 +784,16 @@ spufs_fill_super(struct super_block *sb, void *data, int silent)
 
 	save_mount_options(sb, data);
 
+	info = kzalloc(sizeof(*info), GFP_KERNEL);
+	if (!info)
+		return -ENOMEM;
+
 	sb->s_maxbytes = MAX_LFS_FILESIZE;
 	sb->s_blocksize = PAGE_CACHE_SIZE;
 	sb->s_blocksize_bits = PAGE_CACHE_SHIFT;
 	sb->s_magic = SPUFS_MAGIC;
 	sb->s_op = &s_ops;
+	sb->s_fs_info = info;
 
 	return spufs_create_root(sb, data);
 }

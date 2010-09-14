@@ -41,17 +41,6 @@ MODULE_AUTHOR("Vojtech Pavlik <vojtech@ucw.cz>");
 MODULE_DESCRIPTION("Serio abstraction core");
 MODULE_LICENSE("GPL");
 
-EXPORT_SYMBOL(serio_interrupt);
-EXPORT_SYMBOL(__serio_register_port);
-EXPORT_SYMBOL(serio_unregister_port);
-EXPORT_SYMBOL(serio_unregister_child_port);
-EXPORT_SYMBOL(__serio_register_driver);
-EXPORT_SYMBOL(serio_unregister_driver);
-EXPORT_SYMBOL(serio_open);
-EXPORT_SYMBOL(serio_close);
-EXPORT_SYMBOL(serio_rescan);
-EXPORT_SYMBOL(serio_reconnect);
-
 /*
  * serio_mutex protects entire serio subsystem and is taken every time
  * serio port or driver registrered or unregistered.
@@ -63,8 +52,9 @@ static LIST_HEAD(serio_list);
 static struct bus_type serio_bus;
 
 static void serio_add_port(struct serio *serio);
-static void serio_reconnect_port(struct serio *serio);
+static int serio_reconnect_port(struct serio *serio);
 static void serio_disconnect_port(struct serio *serio);
+static void serio_reconnect_chain(struct serio *serio);
 static void serio_attach_driver(struct serio_driver *drv);
 
 static int serio_connect_driver(struct serio *serio, struct serio_driver *drv)
@@ -161,6 +151,7 @@ static void serio_find_driver(struct serio *serio)
 enum serio_event_type {
 	SERIO_RESCAN_PORT,
 	SERIO_RECONNECT_PORT,
+	SERIO_RECONNECT_CHAIN,
 	SERIO_REGISTER_PORT,
 	SERIO_ATTACH_DRIVER,
 };
@@ -315,6 +306,10 @@ static void serio_handle_event(void)
 				serio_find_driver(event->object);
 				break;
 
+			case SERIO_RECONNECT_CHAIN:
+				serio_reconnect_chain(event->object);
+				break;
+
 			case SERIO_ATTACH_DRIVER:
 				serio_attach_driver(event->object);
 				break;
@@ -331,9 +326,10 @@ static void serio_handle_event(void)
 }
 
 /*
- * Remove all events that have been submitted for a given serio port.
+ * Remove all events that have been submitted for a given
+ * object, be it serio port or driver.
  */
-static void serio_remove_pending_events(struct serio *serio)
+static void serio_remove_pending_events(void *object)
 {
 	struct list_head *node, *next;
 	struct serio_event *event;
@@ -343,7 +339,7 @@ static void serio_remove_pending_events(struct serio *serio)
 
 	list_for_each_safe(node, next, &serio_event_list) {
 		event = list_entry(node, struct serio_event, node);
-		if (event->object == serio) {
+		if (event->object == object) {
 			list_del_init(node);
 			serio_free_event(event);
 		}
@@ -469,7 +465,7 @@ static ssize_t serio_rebind_driver(struct device *dev, struct device_attribute *
 	if (!strncmp(buf, "none", count)) {
 		serio_disconnect_port(serio);
 	} else if (!strncmp(buf, "reconnect", count)) {
-		serio_reconnect_port(serio);
+		serio_reconnect_chain(serio);
 	} else if (!strncmp(buf, "rescan", count)) {
 		serio_disconnect_port(serio);
 		serio_find_driver(serio);
@@ -499,9 +495,9 @@ static ssize_t serio_set_bind_mode(struct device *dev, struct device_attribute *
 
 	retval = count;
 	if (!strncmp(buf, "manual", count)) {
-		serio->manual_bind = 1;
+		serio->manual_bind = true;
 	} else if (!strncmp(buf, "auto", count)) {
-		serio->manual_bind = 0;
+		serio->manual_bind = false;
 	} else {
 		retval = -EINVAL;
 	}
@@ -539,8 +535,8 @@ static void serio_init_port(struct serio *serio)
 	spin_lock_init(&serio->lock);
 	mutex_init(&serio->drv_mutex);
 	device_initialize(&serio->dev);
-	snprintf(serio->dev.bus_id, sizeof(serio->dev.bus_id),
-		 "serio%ld", (long)atomic_inc_return(&serio_no) - 1);
+	dev_set_name(&serio->dev, "serio%ld",
+			(long)atomic_inc_return(&serio_no) - 1);
 	serio->dev.bus = &serio_bus;
 	serio->dev.release = serio_release_port;
 	if (serio->parent) {
@@ -574,7 +570,7 @@ static void serio_add_port(struct serio *serio)
 			"serio: device_add() failed for %s (%s), error: %d\n",
 			serio->phys, serio->name, error);
 	else {
-		serio->registered = 1;
+		serio->registered = true;
 		error = sysfs_create_group(&serio->dev.kobj, &serio_id_attr_group);
 		if (error)
 			printk(KERN_ERR
@@ -610,7 +606,7 @@ static void serio_destroy_port(struct serio *serio)
 	if (serio->registered) {
 		sysfs_remove_group(&serio->dev.kobj, &serio_id_attr_group);
 		device_del(&serio->dev);
-		serio->registered = 0;
+		serio->registered = false;
 	}
 
 	list_del_init(&serio->node);
@@ -619,14 +615,30 @@ static void serio_destroy_port(struct serio *serio)
 }
 
 /*
+ * Reconnect serio port (re-initialize attached device).
+ * If reconnect fails (old device is no longer attached or
+ * there was no device to begin with) we do full rescan in
+ * hope of finding a driver for the port.
+ */
+static int serio_reconnect_port(struct serio *serio)
+{
+	int error = serio_reconnect_driver(serio);
+
+	if (error) {
+		serio_disconnect_port(serio);
+		serio_find_driver(serio);
+	}
+
+	return error;
+}
+
+/*
  * Reconnect serio port and all its children (re-initialize attached devices)
  */
-static void serio_reconnect_port(struct serio *serio)
+static void serio_reconnect_chain(struct serio *serio)
 {
 	do {
-		if (serio_reconnect_driver(serio)) {
-			serio_disconnect_port(serio);
-			serio_find_driver(serio);
+		if (serio_reconnect_port(serio)) {
 			/* Ok, old children are now gone, we are done */
 			break;
 		}
@@ -669,11 +681,13 @@ void serio_rescan(struct serio *serio)
 {
 	serio_queue_event(serio, NULL, SERIO_RESCAN_PORT);
 }
+EXPORT_SYMBOL(serio_rescan);
 
 void serio_reconnect(struct serio *serio)
 {
-	serio_queue_event(serio, NULL, SERIO_RECONNECT_PORT);
+	serio_queue_event(serio, NULL, SERIO_RECONNECT_CHAIN);
 }
+EXPORT_SYMBOL(serio_reconnect);
 
 /*
  * Submits register request to kseriod for subsequent execution.
@@ -684,6 +698,7 @@ void __serio_register_port(struct serio *serio, struct module *owner)
 	serio_init_port(serio);
 	serio_queue_event(serio, owner, SERIO_REGISTER_PORT);
 }
+EXPORT_SYMBOL(__serio_register_port);
 
 /*
  * Synchronously unregisters serio port.
@@ -695,6 +710,7 @@ void serio_unregister_port(struct serio *serio)
 	serio_destroy_port(serio);
 	mutex_unlock(&serio_mutex);
 }
+EXPORT_SYMBOL(serio_unregister_port);
 
 /*
  * Safely unregisters child port if one is present.
@@ -708,6 +724,7 @@ void serio_unregister_child_port(struct serio *serio)
 	}
 	mutex_unlock(&serio_mutex);
 }
+EXPORT_SYMBOL(serio_unregister_child_port);
 
 
 /*
@@ -733,9 +750,9 @@ static ssize_t serio_driver_set_bind_mode(struct device_driver *drv, const char 
 
 	retval = count;
 	if (!strncmp(buf, "manual", count)) {
-		serio_drv->manual_bind = 1;
+		serio_drv->manual_bind = true;
 	} else if (!strncmp(buf, "auto", count)) {
-		serio_drv->manual_bind = 0;
+		serio_drv->manual_bind = false;
 	} else {
 		retval = -EINVAL;
 	}
@@ -795,7 +812,7 @@ static void serio_attach_driver(struct serio_driver *drv)
 
 int __serio_register_driver(struct serio_driver *drv, struct module *owner, const char *mod_name)
 {
-	int manual_bind = drv->manual_bind;
+	bool manual_bind = drv->manual_bind;
 	int error;
 
 	drv->driver.bus = &serio_bus;
@@ -806,7 +823,7 @@ int __serio_register_driver(struct serio_driver *drv, struct module *owner, cons
 	 * Temporarily disable automatic binding because probing
 	 * takes long time and we are better off doing it in kseriod
 	 */
-	drv->manual_bind = 1;
+	drv->manual_bind = true;
 
 	error = driver_register(&drv->driver);
 	if (error) {
@@ -821,7 +838,7 @@ int __serio_register_driver(struct serio_driver *drv, struct module *owner, cons
 	 * driver to free ports
 	 */
 	if (!manual_bind) {
-		drv->manual_bind = 0;
+		drv->manual_bind = false;
 		error = serio_queue_event(drv, NULL, SERIO_ATTACH_DRIVER);
 		if (error) {
 			driver_unregister(&drv->driver);
@@ -831,13 +848,16 @@ int __serio_register_driver(struct serio_driver *drv, struct module *owner, cons
 
 	return 0;
 }
+EXPORT_SYMBOL(__serio_register_driver);
 
 void serio_unregister_driver(struct serio_driver *drv)
 {
 	struct serio *serio;
 
 	mutex_lock(&serio_mutex);
-	drv->manual_bind = 1;	/* so serio_find_driver ignores it */
+
+	drv->manual_bind = true;	/* so serio_find_driver ignores it */
+	serio_remove_pending_events(drv);
 
 start_over:
 	list_for_each_entry(serio, &serio_list, node) {
@@ -852,6 +872,7 @@ start_over:
 	driver_unregister(&drv->driver);
 	mutex_unlock(&serio_mutex);
 }
+EXPORT_SYMBOL(serio_unregister_driver);
 
 static void serio_set_drv(struct serio *serio, struct serio_driver *drv)
 {
@@ -910,14 +931,11 @@ static int serio_uevent(struct device *dev, struct kobj_uevent_env *env)
 #endif /* CONFIG_HOTPLUG */
 
 #ifdef CONFIG_PM
-static int serio_suspend(struct device *dev, pm_message_t state)
+static int serio_suspend(struct device *dev)
 {
-	if (dev->power.power_state.event != state.event) {
-		if (state.event == PM_EVENT_SUSPEND)
-			serio_cleanup(to_serio_port(dev));
+	struct serio *serio = to_serio_port(dev);
 
-		dev->power.power_state = state;
-	}
+	serio_cleanup(serio);
 
 	return 0;
 }
@@ -926,19 +944,21 @@ static int serio_resume(struct device *dev)
 {
 	struct serio *serio = to_serio_port(dev);
 
-	if (dev->power.power_state.event != PM_EVENT_ON &&
-	    serio_reconnect_driver(serio)) {
-		/*
-		 * Driver re-probing can take a while, so better let kseriod
-		 * deal with it.
-		 */
-		serio_rescan(serio);
-	}
-
-	dev->power.power_state = PMSG_ON;
+	/*
+	 * Driver reconnect can take a while, so better let kseriod
+	 * deal with it.
+	 */
+	serio_queue_event(serio, NULL, SERIO_RECONNECT_PORT);
 
 	return 0;
 }
+
+static const struct dev_pm_ops serio_pm_ops = {
+	.suspend	= serio_suspend,
+	.resume		= serio_resume,
+	.poweroff	= serio_suspend,
+	.restore	= serio_resume,
+};
 #endif /* CONFIG_PM */
 
 /* called from serio_driver->connect/disconnect methods under serio_mutex */
@@ -952,6 +972,7 @@ int serio_open(struct serio *serio, struct serio_driver *drv)
 	}
 	return 0;
 }
+EXPORT_SYMBOL(serio_open);
 
 /* called from serio_driver->connect/disconnect methods under serio_mutex */
 void serio_close(struct serio *serio)
@@ -961,6 +982,7 @@ void serio_close(struct serio *serio)
 
 	serio_set_drv(serio, NULL);
 }
+EXPORT_SYMBOL(serio_close);
 
 irqreturn_t serio_interrupt(struct serio *serio,
 		unsigned char data, unsigned int dfl)
@@ -981,6 +1003,7 @@ irqreturn_t serio_interrupt(struct serio *serio,
 
 	return ret;
 }
+EXPORT_SYMBOL(serio_interrupt);
 
 static struct bus_type serio_bus = {
 	.name		= "serio",
@@ -992,8 +1015,7 @@ static struct bus_type serio_bus = {
 	.remove		= serio_driver_remove,
 	.shutdown	= serio_shutdown,
 #ifdef CONFIG_PM
-	.suspend	= serio_suspend,
-	.resume		= serio_resume,
+	.pm		= &serio_pm_ops,
 #endif
 };
 

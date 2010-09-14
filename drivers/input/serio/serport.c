@@ -15,6 +15,7 @@
 
 #include <asm/uaccess.h>
 #include <linux/kernel.h>
+#include <linux/sched.h>
 #include <linux/slab.h>
 #include <linux/module.h>
 #include <linux/init.h>
@@ -216,7 +217,7 @@ static void serport_ldisc_write_wakeup(struct tty_struct * tty)
  * The line discipline structure.
  */
 
-static struct tty_ldisc serport_ldisc = {
+static struct tty_ldisc_ops serport_ldisc = {
 	.owner =	THIS_MODULE,
 	.name =		"input",
 	.open =		serport_ldisc_open,

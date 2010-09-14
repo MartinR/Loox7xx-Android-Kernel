@@ -5,13 +5,15 @@
  *
  * For more information please refer to Documentation/s390/zfcpdump.txt
  *
- * Copyright IBM Corp. 2003,2007
+ * Copyright IBM Corp. 2003,2008
  * Author(s): Michael Holzheu
  */
 
+#define KMSG_COMPONENT "zdump"
+#define pr_fmt(fmt) KMSG_COMPONENT ": " fmt
+
 #include <linux/init.h>
 #include <linux/miscdevice.h>
-#include <linux/utsname.h>
 #include <linux/debugfs.h>
 #include <asm/ipl.h>
 #include <asm/sclp.h>
@@ -21,14 +23,14 @@
 #include <asm/debug.h>
 #include <asm/processor.h>
 #include <asm/irqflags.h>
+#include <asm/checksum.h>
 #include "sclp.h"
 
 #define TRACE(x...) debug_sprintf_event(zcore_dbf, 1, x)
-#define MSG(x...) printk( KERN_ALERT x )
-#define ERROR_MSG(x...) printk ( KERN_ALERT "DUMP: " x )
 
 #define TO_USER		0
 #define TO_KERNEL	1
+#define CHUNK_INFO_SIZE	34 /* 2 16-byte char, each followed by blank */
 
 enum arch_id {
 	ARCH_S390	= 0,
@@ -46,11 +48,19 @@ struct sys_info {
 	union save_area	lc_mask;
 };
 
+struct ipib_info {
+	unsigned long	ipib;
+	u32		checksum;
+}  __attribute__((packed));
+
 static struct sys_info sys_info;
 static struct debug_info *zcore_dbf;
 static int hsa_available;
 static struct dentry *zcore_dir;
 static struct dentry *zcore_file;
+static struct dentry *zcore_memmap_file;
+static struct dentry *zcore_reipl_file;
+static struct ipl_parameter_block *ipl_block;
 
 /*
  * Copy memory from HSA to kernel or user memory (not reentrant):
@@ -223,12 +233,10 @@ static int __init init_cpu_info(enum arch_id arch)
 	/* get info for boot cpu from lowcore, stored in the HSA */
 
 	sa = kmalloc(sizeof(*sa), GFP_KERNEL);
-	if (!sa) {
-		ERROR_MSG("kmalloc failed: %s: %i\n",__func__, __LINE__);
+	if (!sa)
 		return -ENOMEM;
-	}
 	if (memcpy_hsa_kernel(sa, sys_info.sa_base, sys_info.sa_size) < 0) {
-		ERROR_MSG("could not copy from HSA\n");
+		TRACE("could not copy from HSA\n");
 		kfree(sa);
 		return -EIO;
 	}
@@ -266,7 +274,7 @@ struct zcore_header {
 	u32 num_pages;
 	u32 pad1;
 	u64 tod;
-	cpuid_t cpu_id;
+	struct cpuid cpu_id;
 	u32 arch_id;
 	u32 volnr;
 	u32 build_arch;
@@ -478,6 +486,81 @@ static const struct file_operations zcore_fops = {
 	.release	= zcore_release,
 };
 
+static ssize_t zcore_memmap_read(struct file *filp, char __user *buf,
+				 size_t count, loff_t *ppos)
+{
+	return simple_read_from_buffer(buf, count, ppos, filp->private_data,
+				       MEMORY_CHUNKS * CHUNK_INFO_SIZE);
+}
+
+static int zcore_memmap_open(struct inode *inode, struct file *filp)
+{
+	int i;
+	char *buf;
+	struct mem_chunk *chunk_array;
+
+	chunk_array = kzalloc(MEMORY_CHUNKS * sizeof(struct mem_chunk),
+			      GFP_KERNEL);
+	if (!chunk_array)
+		return -ENOMEM;
+	detect_memory_layout(chunk_array);
+	buf = kzalloc(MEMORY_CHUNKS * CHUNK_INFO_SIZE, GFP_KERNEL);
+	if (!buf) {
+		kfree(chunk_array);
+		return -ENOMEM;
+	}
+	for (i = 0; i < MEMORY_CHUNKS; i++) {
+		sprintf(buf + (i * CHUNK_INFO_SIZE), "%016llx %016llx ",
+			(unsigned long long) chunk_array[i].addr,
+			(unsigned long long) chunk_array[i].size);
+		if (chunk_array[i].size == 0)
+			break;
+	}
+	kfree(chunk_array);
+	filp->private_data = buf;
+	return 0;
+}
+
+static int zcore_memmap_release(struct inode *inode, struct file *filp)
+{
+	kfree(filp->private_data);
+	return 0;
+}
+
+static const struct file_operations zcore_memmap_fops = {
+	.owner		= THIS_MODULE,
+	.read		= zcore_memmap_read,
+	.open		= zcore_memmap_open,
+	.release	= zcore_memmap_release,
+};
+
+static ssize_t zcore_reipl_write(struct file *filp, const char __user *buf,
+				 size_t count, loff_t *ppos)
+{
+	if (ipl_block) {
+		diag308(DIAG308_SET, ipl_block);
+		diag308(DIAG308_IPL, NULL);
+	}
+	return count;
+}
+
+static int zcore_reipl_open(struct inode *inode, struct file *filp)
+{
+	return 0;
+}
+
+static int zcore_reipl_release(struct inode *inode, struct file *filp)
+{
+	return 0;
+}
+
+static const struct file_operations zcore_reipl_fops = {
+	.owner		= THIS_MODULE,
+	.write		= zcore_reipl_write,
+	.open		= zcore_reipl_open,
+	.release	= zcore_reipl_release,
+};
+
 
 static void __init set_s390_lc_mask(union save_area *map)
 {
@@ -511,28 +594,29 @@ static void __init set_s390x_lc_mask(union save_area *map)
  */
 static int __init sys_info_init(enum arch_id arch)
 {
+	int rc;
+
 	switch (arch) {
 	case ARCH_S390X:
-		MSG("DETECTED 'S390X (64 bit) OS'\n");
+		pr_alert("DETECTED 'S390X (64 bit) OS'\n");
 		sys_info.sa_base = SAVE_AREA_BASE_S390X;
 		sys_info.sa_size = sizeof(struct save_area_s390x);
 		set_s390x_lc_mask(&sys_info.lc_mask);
 		break;
 	case ARCH_S390:
-		MSG("DETECTED 'S390 (32 bit) OS'\n");
+		pr_alert("DETECTED 'S390 (32 bit) OS'\n");
 		sys_info.sa_base = SAVE_AREA_BASE_S390;
 		sys_info.sa_size = sizeof(struct save_area_s390);
 		set_s390_lc_mask(&sys_info.lc_mask);
 		break;
 	default:
-		ERROR_MSG("unknown architecture 0x%x.\n",arch);
+		pr_alert("0x%x is an unknown architecture.\n",arch);
 		return -EINVAL;
 	}
 	sys_info.arch = arch;
-	if (init_cpu_info(arch)) {
-		ERROR_MSG("get cpu info failed\n");
-		return -ENOMEM;
-	}
+	rc = init_cpu_info(arch);
+	if (rc)
+		return rc;
 	sys_info.mem_size = real_memory_size;
 
 	return 0;
@@ -544,29 +628,89 @@ static int __init check_sdias(void)
 
 	rc = sclp_sdias_blk_count();
 	if (rc < 0) {
-		ERROR_MSG("Could not determine HSA size\n");
+		TRACE("Could not determine HSA size\n");
 		return rc;
 	}
 	act_hsa_size = (rc - 1) * PAGE_SIZE;
 	if (act_hsa_size < ZFCPDUMP_HSA_SIZE) {
-		ERROR_MSG("HSA size too small: %i\n", act_hsa_size);
+		TRACE("HSA size too small: %i\n", act_hsa_size);
 		return -EINVAL;
 	}
 	return 0;
 }
 
-static void __init zcore_header_init(int arch, struct zcore_header *hdr)
+static int __init get_mem_size(unsigned long *mem)
 {
+	int i;
+	struct mem_chunk *chunk_array;
+
+	chunk_array = kzalloc(MEMORY_CHUNKS * sizeof(struct mem_chunk),
+			      GFP_KERNEL);
+	if (!chunk_array)
+		return -ENOMEM;
+	detect_memory_layout(chunk_array);
+	for (i = 0; i < MEMORY_CHUNKS; i++) {
+		if (chunk_array[i].size == 0)
+			break;
+		*mem += chunk_array[i].size;
+	}
+	kfree(chunk_array);
+	return 0;
+}
+
+static int __init zcore_header_init(int arch, struct zcore_header *hdr)
+{
+	int rc;
+	unsigned long memory = 0;
+
 	if (arch == ARCH_S390X)
 		hdr->arch_id = DUMP_ARCH_S390X;
 	else
 		hdr->arch_id = DUMP_ARCH_S390;
-	hdr->mem_size = sys_info.mem_size;
-	hdr->rmem_size = sys_info.mem_size;
+	rc = get_mem_size(&memory);
+	if (rc)
+		return rc;
+	hdr->mem_size = memory;
+	hdr->rmem_size = memory;
 	hdr->mem_end = sys_info.mem_size;
-	hdr->num_pages = sys_info.mem_size / PAGE_SIZE;
+	hdr->num_pages = memory / PAGE_SIZE;
 	hdr->tod = get_clock();
 	get_cpu_id(&hdr->cpu_id);
+	return 0;
+}
+
+/*
+ * Provide IPL parameter information block from either HSA or memory
+ * for future reipl
+ */
+static int __init zcore_reipl_init(void)
+{
+	struct ipib_info ipib_info;
+	int rc;
+
+	rc = memcpy_hsa_kernel(&ipib_info, __LC_DUMP_REIPL, sizeof(ipib_info));
+	if (rc)
+		return rc;
+	if (ipib_info.ipib == 0)
+		return 0;
+	ipl_block = (void *) __get_free_page(GFP_KERNEL);
+	if (!ipl_block)
+		return -ENOMEM;
+	if (ipib_info.ipib < ZFCPDUMP_HSA_SIZE)
+		rc = memcpy_hsa_kernel(ipl_block, ipib_info.ipib, PAGE_SIZE);
+	else
+		rc = memcpy_real(ipl_block, ipib_info.ipib, PAGE_SIZE);
+	if (rc) {
+		free_page((unsigned long) ipl_block);
+		return rc;
+	}
+	if (csum_partial(ipl_block, ipl_block->hdr.len, 0) !=
+	    ipib_info.checksum) {
+		TRACE("Checksum does not match\n");
+		free_page((unsigned long) ipl_block);
+		ipl_block = NULL;
+	}
+	return 0;
 }
 
 static int __init zcore_init(void)
@@ -590,32 +734,33 @@ static int __init zcore_init(void)
 		goto fail;
 
 	rc = check_sdias();
-	if (rc) {
-		ERROR_MSG("Dump initialization failed\n");
+	if (rc)
 		goto fail;
-	}
 
 	rc = memcpy_hsa_kernel(&arch, __LC_AR_MODE_ID, 1);
-	if (rc) {
-		ERROR_MSG("sdial memcpy for arch id failed\n");
+	if (rc)
 		goto fail;
-	}
 
 #ifndef __s390x__
 	if (arch == ARCH_S390X) {
-		ERROR_MSG("32 bit dumper can't dump 64 bit system!\n");
+		pr_alert("The 32-bit dump tool cannot be used for a "
+			 "64-bit system\n");
 		rc = -EINVAL;
 		goto fail;
 	}
 #endif
 
 	rc = sys_info_init(arch);
-	if (rc) {
-		ERROR_MSG("arch init failed\n");
+	if (rc)
 		goto fail;
-	}
 
-	zcore_header_init(arch, &zcore_header);
+	rc = zcore_header_init(arch, &zcore_header);
+	if (rc)
+		goto fail;
+
+	rc = zcore_reipl_init();
+	if (rc)
+		goto fail;
 
 	zcore_dir = debugfs_create_dir("zcore" , NULL);
 	if (!zcore_dir) {
@@ -625,13 +770,30 @@ static int __init zcore_init(void)
 	zcore_file = debugfs_create_file("mem", S_IRUSR, zcore_dir, NULL,
 					 &zcore_fops);
 	if (!zcore_file) {
-		debugfs_remove(zcore_dir);
 		rc = -ENOMEM;
-		goto fail;
+		goto fail_dir;
+	}
+	zcore_memmap_file = debugfs_create_file("memmap", S_IRUSR, zcore_dir,
+						NULL, &zcore_memmap_fops);
+	if (!zcore_memmap_file) {
+		rc = -ENOMEM;
+		goto fail_file;
+	}
+	zcore_reipl_file = debugfs_create_file("reipl", S_IRUSR, zcore_dir,
+						NULL, &zcore_reipl_fops);
+	if (!zcore_reipl_file) {
+		rc = -ENOMEM;
+		goto fail_memmap_file;
 	}
 	hsa_available = 1;
 	return 0;
 
+fail_memmap_file:
+	debugfs_remove(zcore_memmap_file);
+fail_file:
+	debugfs_remove(zcore_file);
+fail_dir:
+	debugfs_remove(zcore_dir);
 fail:
 	diag308(DIAG308_REL_HSA, NULL);
 	return rc;
@@ -641,10 +803,15 @@ static void __exit zcore_exit(void)
 {
 	debug_unregister(zcore_dbf);
 	sclp_sdias_exit();
+	free_page((unsigned long) ipl_block);
+	debugfs_remove(zcore_reipl_file);
+	debugfs_remove(zcore_memmap_file);
+	debugfs_remove(zcore_file);
+	debugfs_remove(zcore_dir);
 	diag308(DIAG308_REL_HSA, NULL);
 }
 
-MODULE_AUTHOR("Copyright IBM Corp. 2003,2007");
+MODULE_AUTHOR("Copyright IBM Corp. 2003,2008");
 MODULE_DESCRIPTION("zcore module for zfcpdump support");
 MODULE_LICENSE("GPL");
 

@@ -2,6 +2,7 @@
 #include <linux/fs.h>
 #include <linux/buffer_head.h>
 #include <linux/amigaffs.h>
+#include <linux/mutex.h>
 
 /* AmigaOS allows file names with up to 30 characters length.
  * Names longer than that will be silently truncated. If you
@@ -98,7 +99,7 @@ struct affs_sb_info {
 	gid_t s_gid;			/* gid to override */
 	umode_t s_mode;			/* mode to override */
 	struct buffer_head *s_root_bh;	/* Cached root block. */
-	struct semaphore s_bmlock;	/* Protects bitmap access. */
+	struct mutex s_bmlock;		/* Protects bitmap access. */
 	struct affs_bm_info *s_bitmap;	/* Bitmap infos. */
 	u32 s_bmap_count;		/* # of bitmap blocks. */
 	u32 s_bmap_bits;		/* # of bits in one bitmap blocks */
@@ -181,6 +182,7 @@ extern int			 affs_add_entry(struct inode *dir, struct inode *inode, struct dent
 
 void		affs_free_prealloc(struct inode *inode);
 extern void	affs_truncate(struct inode *);
+int		affs_file_fsync(struct file *, struct dentry *, int);
 
 /* dir.c */
 
@@ -198,8 +200,7 @@ extern const struct address_space_operations	 affs_symlink_aops;
 extern const struct address_space_operations	 affs_aops;
 extern const struct address_space_operations	 affs_aops_ofs;
 
-extern struct dentry_operations	 affs_dentry_operations;
-extern struct dentry_operations	 affs_dentry_operations_intl;
+extern const struct dentry_operations	 affs_dentry_operations;
 
 static inline void
 affs_set_blocksize(struct super_block *sb, int size)

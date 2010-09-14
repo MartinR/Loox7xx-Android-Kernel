@@ -15,7 +15,7 @@
  * 			Save more value for the resume function! Support
  * 			Bitsy/Assabet/Freebird board
  *
- * 2001-08-29:	Nicolas Pitre <nico@cam.org>
+ * 2001-08-29:	Nicolas Pitre <nico@fluxnic.net>
  * 			Cleaned up, pushed platform dependent stuff
  * 			in the platform specific files.
  *
@@ -27,7 +27,7 @@
 #include <linux/errno.h>
 #include <linux/time.h>
 
-#include <asm/hardware.h>
+#include <mach/hardware.h>
 #include <asm/memory.h>
 #include <asm/system.h>
 #include <asm/mach/time.h>

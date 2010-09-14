@@ -51,6 +51,8 @@
 #include <asm/mca.h>
 #include <asm/meminit.h>
 #include <asm/page.h>
+#include <asm/paravirt.h>
+#include <asm/paravirt_patch.h>
 #include <asm/patch.h>
 #include <asm/pgtable.h>
 #include <asm/processor.h>
@@ -115,6 +117,13 @@ unsigned int num_io_spaces;
  */
 #define	I_CACHE_STRIDE_SHIFT	5	/* Safest way to go: 32 bytes by 32 bytes */
 unsigned long ia64_i_cache_stride_shift = ~0;
+/*
+ * "clflush_cache_range()" needs to know what processor dependent stride size to
+ * use when it flushes cache lines including both d-cache and i-cache.
+ */
+/* Safest way to go: 32 bytes by 32 bytes */
+#define	CACHE_STRIDE_SHIFT	5
+unsigned long ia64_cache_stride_shift = ~0;
 
 /*
  * The merge_mask variable needs to be set to (max(iommu_page_size(iommu)) - 1).  This
@@ -142,9 +151,9 @@ int num_rsvd_regions __initdata;
  * This routine does not assume the incoming segments are sorted.
  */
 int __init
-filter_rsvd_memory (unsigned long start, unsigned long end, void *arg)
+filter_rsvd_memory (u64 start, u64 end, void *arg)
 {
-	unsigned long range_start, range_end, prev_start;
+	u64 range_start, range_end, prev_start;
 	void (*func)(unsigned long, unsigned long, int);
 	int i;
 
@@ -182,7 +191,7 @@ filter_rsvd_memory (unsigned long start, unsigned long end, void *arg)
  * are not filtered out.
  */
 int __init
-filter_memory(unsigned long start, unsigned long end, void *arg)
+filter_memory(u64 start, u64 end, void *arg)
 {
 	void (*func)(unsigned long, unsigned long, int);
 
@@ -313,7 +322,7 @@ static inline void __init setup_crashkernel(unsigned long total, int *n)
  *
  * Setup the reserved memory areas set aside for the boot parameters,
  * initrd, etc.  There are currently %IA64_MAX_RSVD_REGIONS defined,
- * see include/asm-ia64/meminit.h if you need to define more.
+ * see arch/ia64/include/asm/meminit.h if you need to define more.
  */
 void __init
 reserve_memory (void)
@@ -341,6 +350,8 @@ reserve_memory (void)
 	rsvd_region[n].end   = (unsigned long) ia64_imva(_end);
 	n++;
 
+	n += paravirt_reserve_memory(&rsvd_region[n]);
+
 #ifdef CONFIG_BLK_DEV_INITRD
 	if (ia64_boot_param->initrd_start) {
 		rsvd_region[n].start = (unsigned long)__va(ia64_boot_param->initrd_start);
@@ -349,7 +360,7 @@ reserve_memory (void)
 	}
 #endif
 
-#ifdef CONFIG_PROC_VMCORE
+#ifdef CONFIG_CRASH_DUMP
 	if (reserve_elfcorehdr(&rsvd_region[n].start,
 			       &rsvd_region[n].end) == 0)
 		n++;
@@ -386,7 +397,7 @@ find_initrd (void)
 		initrd_start = (unsigned long)__va(ia64_boot_param->initrd_start);
 		initrd_end   = initrd_start+ia64_boot_param->initrd_size;
 
-		printk(KERN_INFO "Initial ramdisk at: 0x%lx (%lu bytes)\n",
+		printk(KERN_INFO "Initial ramdisk at: 0x%lx (%llu bytes)\n",
 		       initrd_start, ia64_boot_param->initrd_size);
 	}
 #endif
@@ -475,7 +486,12 @@ static __init int setup_nomca(char *s)
 }
 early_param("nomca", setup_nomca);
 
-#ifdef CONFIG_PROC_VMCORE
+/*
+ * Note: elfcorehdr_addr is not just limited to vmcore. It is also used by
+ * is_kdump_kernel() to determine if we are booting after a panic. Hence
+ * ifdef it under CONFIG_CRASH_DUMP and not CONFIG_PROC_VMCORE.
+ */
+#ifdef CONFIG_CRASH_DUMP
 /* elfcorehdr= specifies the location of elf core header
  * stored by the crashed kernel.
  */
@@ -489,9 +505,9 @@ static int __init parse_elfcorehdr(char *arg)
 }
 early_param("elfcorehdr", parse_elfcorehdr);
 
-int __init reserve_elfcorehdr(unsigned long *start, unsigned long *end)
+int __init reserve_elfcorehdr(u64 *start, u64 *end)
 {
-	unsigned long length;
+	u64 length;
 
 	/* We get the address using the kernel command line,
 	 * but the size is extracted from the EFI tables.
@@ -499,11 +515,11 @@ int __init reserve_elfcorehdr(unsigned long *start, unsigned long *end)
 	 * to work properly.
 	 */
 
-	if (elfcorehdr_addr >= ELFCORE_ADDR_MAX)
+	if (!is_vmcore_usable())
 		return -EINVAL;
 
 	if ((length = vmcore_find_descriptor_size(elfcorehdr_addr)) == 0) {
-		elfcorehdr_addr = ELFCORE_ADDR_MAX;
+		vmcore_unusable();
 		return -EINVAL;
 	}
 
@@ -519,7 +535,10 @@ setup_arch (char **cmdline_p)
 {
 	unw_init();
 
+	paravirt_arch_setup_early();
+
 	ia64_patch_vtop((u64) __start___vtop_patchlist, (u64) __end___vtop_patchlist);
+	paravirt_patch_apply();
 
 	*cmdline_p = __va(ia64_boot_param->command_line);
 	strlcpy(boot_command_line, *cmdline_p, COMMAND_LINE_SIZE);
@@ -544,8 +563,12 @@ setup_arch (char **cmdline_p)
 #ifdef CONFIG_ACPI
 	/* Initialize the ACPI boot-time table parser */
 	acpi_table_init();
+	early_acpi_boot_init();
 # ifdef CONFIG_ACPI_NUMA
 	acpi_numa_init();
+#ifdef CONFIG_ACPI_HOTPLUG_CPU
+	prefill_possible_map();
+#endif
 	per_cpu_scan_finalize((cpus_weight(early_cpu_possible_map) == 0 ?
 		32 : cpus_weight(early_cpu_possible_map)),
 		additional_cpus > 0 ? additional_cpus : 0);
@@ -565,7 +588,7 @@ setup_arch (char **cmdline_p)
 	ia64_patch_rse((u64) __start___rse_patchlist, (u64) __end___rse_patchlist);
 #else
 	{
-		u64 num_phys_stacked;
+		unsigned long num_phys_stacked;
 
 		if (ia64_pal_rse_info(&num_phys_stacked, 0) == 0 && num_phys_stacked > 96)
 			ia64_patch_rse((u64) __start___rse_patchlist, (u64) __end___rse_patchlist);
@@ -582,6 +605,9 @@ setup_arch (char **cmdline_p)
 #ifdef CONFIG_ACPI
 	acpi_boot_init();
 #endif
+
+	paravirt_banner();
+	paravirt_arch_setup_console(cmdline_p);
 
 #ifdef CONFIG_VT
 	if (!conswitchp) {
@@ -602,11 +628,15 @@ setup_arch (char **cmdline_p)
 #endif
 
 	/* enable IA-64 Machine Check Abort Handling unless disabled */
+	if (paravirt_arch_setup_nomca())
+		nomca = 1;
 	if (!nomca)
 		ia64_mca_init();
 
 	platform_setup(cmdline_p);
+#ifndef CONFIG_IA64_HP_SIM
 	check_sal_cache_flush();
+#endif
 	paging_init();
 }
 
@@ -702,10 +732,10 @@ static void *
 c_start (struct seq_file *m, loff_t *pos)
 {
 #ifdef CONFIG_SMP
-	while (*pos < NR_CPUS && !cpu_isset(*pos, cpu_online_map))
+	while (*pos < nr_cpu_ids && !cpu_online(*pos))
 		++*pos;
 #endif
-	return *pos < NR_CPUS ? cpu_data(*pos) : NULL;
+	return *pos < nr_cpu_ids ? cpu_data(*pos) : NULL;
 }
 
 static void *
@@ -825,28 +855,32 @@ identify_cpu (struct cpuinfo_ia64 *c)
 	c->unimpl_pa_mask = ~((1L<<63) | ((1L << phys_addr_size) - 1));
 }
 
+/*
+ * In UP configuration, setup_per_cpu_areas() is defined in
+ * include/linux/percpu.h
+ */
+#ifdef CONFIG_SMP
 void __init
 setup_per_cpu_areas (void)
 {
 	/* start_kernel() requires this... */
-#ifdef CONFIG_ACPI_HOTPLUG_CPU
-	prefill_possible_map();
-#endif
 }
+#endif
 
 /*
- * Calculate the max. cache line size.
+ * Do the following calculations:
  *
- * In addition, the minimum of the i-cache stride sizes is calculated for
- * "flush_icache_range()".
+ * 1. the max. cache line size.
+ * 2. the minimum of the i-cache stride sizes for "flush_icache_range()".
+ * 3. the minimum of the cache stride sizes for "clflush_cache_range()".
  */
 static void __cpuinit
-get_max_cacheline_size (void)
+get_cache_info(void)
 {
 	unsigned long line_size, max = 1;
-	u64 l, levels, unique_caches;
-        pal_cache_config_info_t cci;
-        s64 status;
+	unsigned long l, levels, unique_caches;
+	pal_cache_config_info_t cci;
+	long status;
 
         status = ia64_pal_cache_summary(&levels, &unique_caches);
         if (status != 0) {
@@ -855,33 +889,41 @@ get_max_cacheline_size (void)
                 max = SMP_CACHE_BYTES;
 		/* Safest setup for "flush_icache_range()" */
 		ia64_i_cache_stride_shift = I_CACHE_STRIDE_SHIFT;
+		/* Safest setup for "clflush_cache_range()" */
+		ia64_cache_stride_shift = CACHE_STRIDE_SHIFT;
 		goto out;
         }
 
 	for (l = 0; l < levels; ++l) {
-		status = ia64_pal_cache_config_info(l, /* cache_type (data_or_unified)= */ 2,
-						    &cci);
+		/* cache_type (data_or_unified)=2 */
+		status = ia64_pal_cache_config_info(l, 2, &cci);
 		if (status != 0) {
-			printk(KERN_ERR
-			       "%s: ia64_pal_cache_config_info(l=%lu, 2) failed (status=%ld)\n",
-			       __func__, l, status);
+			printk(KERN_ERR "%s: ia64_pal_cache_config_info"
+				"(l=%lu, 2) failed (status=%ld)\n",
+				__func__, l, status);
 			max = SMP_CACHE_BYTES;
 			/* The safest setup for "flush_icache_range()" */
 			cci.pcci_stride = I_CACHE_STRIDE_SHIFT;
+			/* The safest setup for "clflush_cache_range()" */
+			ia64_cache_stride_shift = CACHE_STRIDE_SHIFT;
 			cci.pcci_unified = 1;
+		} else {
+			if (cci.pcci_stride < ia64_cache_stride_shift)
+				ia64_cache_stride_shift = cci.pcci_stride;
+
+			line_size = 1 << cci.pcci_line_size;
+			if (line_size > max)
+				max = line_size;
 		}
-		line_size = 1 << cci.pcci_line_size;
-		if (line_size > max)
-			max = line_size;
+
 		if (!cci.pcci_unified) {
-			status = ia64_pal_cache_config_info(l,
-						    /* cache_type (instruction)= */ 1,
-						    &cci);
+			/* cache_type (instruction)=1*/
+			status = ia64_pal_cache_config_info(l, 1, &cci);
 			if (status != 0) {
-				printk(KERN_ERR
-				"%s: ia64_pal_cache_config_info(l=%lu, 1) failed (status=%ld)\n",
+				printk(KERN_ERR "%s: ia64_pal_cache_config_info"
+					"(l=%lu, 1) failed (status=%ld)\n",
 					__func__, l, status);
-				/* The safest setup for "flush_icache_range()" */
+				/* The safest setup for flush_icache_range() */
 				cci.pcci_stride = I_CACHE_STRIDE_SHIFT;
 			}
 		}
@@ -917,18 +959,20 @@ cpu_init (void)
 	if (smp_processor_id() == 0) {
 		cpu_set(0, per_cpu(cpu_sibling_map, 0));
 		cpu_set(0, cpu_core_map[0]);
+	} else {
+		/*
+		 * Set ar.k3 so that assembly code in MCA handler can compute
+		 * physical addresses of per cpu variables with a simple:
+		 *   phys = ar.k3 + &per_cpu_var
+		 * and the alt-dtlb-miss handler can set per-cpu mapping into
+		 * the TLB when needed. head.S already did this for cpu0.
+		 */
+		ia64_set_kr(IA64_KR_PER_CPU_DATA,
+			    ia64_tpa(cpu_data) - (long) __per_cpu_start);
 	}
 #endif
 
-	/*
-	 * We set ar.k3 so that assembly code in MCA handler can compute
-	 * physical addresses of per cpu variables with a simple:
-	 *   phys = ar.k3 + &per_cpu_var
-	 */
-	ia64_set_kr(IA64_KR_PER_CPU_DATA,
-		    ia64_tpa(cpu_data) - (long) __per_cpu_start);
-
-	get_max_cacheline_size();
+	get_cache_info();
 
 	/*
 	 * We can't pass "local_cpu_data" to identify_cpu() because we haven't called
@@ -980,8 +1024,7 @@ cpu_init (void)
 					| IA64_DCR_DA | IA64_DCR_DD | IA64_DCR_LC));
 	atomic_inc(&init_mm.mm_count);
 	current->active_mm = &init_mm;
-	if (current->mm)
-		BUG();
+	BUG_ON(current->mm);
 
 	ia64_mmu_init(ia64_imva(cpu_data));
 	ia64_mca_cpu_init(ia64_imva(cpu_data));

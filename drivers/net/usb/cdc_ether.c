@@ -25,7 +25,6 @@
 #include <linux/init.h>
 #include <linux/netdevice.h>
 #include <linux/etherdevice.h>
-#include <linux/ctype.h>
 #include <linux/ethtool.h>
 #include <linux/workqueue.h>
 #include <linux/mii.h>
@@ -50,10 +49,18 @@ static int is_activesync(struct usb_interface_descriptor *desc)
 		&& desc->bInterfaceProtocol == 1;
 }
 
+static int is_wireless_rndis(struct usb_interface_descriptor *desc)
+{
+	return desc->bInterfaceClass == USB_CLASS_WIRELESS_CONTROLLER
+		&& desc->bInterfaceSubClass == 1
+		&& desc->bInterfaceProtocol == 3;
+}
+
 #else
 
 #define is_rndis(desc)		0
 #define is_activesync(desc)	0
+#define is_wireless_rndis(desc)	0
 
 #endif
 
@@ -110,7 +117,8 @@ int usbnet_generic_cdc_bind(struct usbnet *dev, struct usb_interface *intf)
 	 * of cdc-acm, it'll fail RNDIS requests cleanly.
 	 */
 	rndis = is_rndis(&intf->cur_altsetting->desc)
-		|| is_activesync(&intf->cur_altsetting->desc);
+		|| is_activesync(&intf->cur_altsetting->desc)
+		|| is_wireless_rndis(&intf->cur_altsetting->desc);
 
 	memset(info, 0, sizeof *info);
 	info->control = intf;
@@ -380,36 +388,6 @@ static void cdc_status(struct usbnet *dev, struct urb *urb)
 	}
 }
 
-static u8 nibble(unsigned char c)
-{
-	if (likely(isdigit(c)))
-		return c - '0';
-	c = toupper(c);
-	if (likely(isxdigit(c)))
-		return 10 + c - 'A';
-	return 0;
-}
-
-static inline int
-get_ethernet_addr(struct usbnet *dev, struct usb_cdc_ether_desc *e)
-{
-	int 		tmp, i;
-	unsigned char	buf [13];
-
-	tmp = usb_string(dev->udev, e->iMACAddress, buf, sizeof buf);
-	if (tmp != 12) {
-		dev_dbg(&dev->udev->dev,
-			"bad MAC string %d fetch, %d\n", e->iMACAddress, tmp);
-		if (tmp >= 0)
-			tmp = -EINVAL;
-		return tmp;
-	}
-	for (i = tmp = 0; i < 6; i++, tmp += 2)
-		dev->net->dev_addr [i] =
-			(nibble(buf [tmp]) << 4) + nibble(buf [tmp + 1]);
-	return 0;
-}
-
 static int cdc_bind(struct usbnet *dev, struct usb_interface *intf)
 {
 	int				status;
@@ -419,7 +397,7 @@ static int cdc_bind(struct usbnet *dev, struct usb_interface *intf)
 	if (status < 0)
 		return status;
 
-	status = get_ethernet_addr(dev, info->ether);
+	status = usbnet_get_ethernet_addr(dev, info->ether->iMACAddress);
 	if (status < 0) {
 		usb_set_intfdata(info->data, NULL);
 		usb_driver_release_interface(driver_of(intf), info->data);
@@ -549,6 +527,76 @@ static const struct usb_device_id	products [] = {
 {
 	USB_INTERFACE_INFO(USB_CLASS_COMM, USB_CDC_SUBCLASS_ETHERNET,
 			USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long) &cdc_info,
+}, {
+	/* Ericsson F3507g */
+	USB_DEVICE_AND_INTERFACE_INFO(0x0bdb, 0x1900, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long) &cdc_info,
+}, {
+	/* Ericsson F3507g ver. 2 */
+	USB_DEVICE_AND_INTERFACE_INFO(0x0bdb, 0x1902, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long) &cdc_info,
+}, {
+	/* Ericsson F3607gw */
+	USB_DEVICE_AND_INTERFACE_INFO(0x0bdb, 0x1904, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long) &cdc_info,
+}, {
+	/* Ericsson F3607gw ver 2 */
+	USB_DEVICE_AND_INTERFACE_INFO(0x0bdb, 0x1905, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long) &cdc_info,
+}, {
+	/* Ericsson F3607gw ver 3 */
+	USB_DEVICE_AND_INTERFACE_INFO(0x0bdb, 0x1906, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long) &cdc_info,
+}, {
+	/* Ericsson F3307 */
+	USB_DEVICE_AND_INTERFACE_INFO(0x0bdb, 0x190a, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long) &cdc_info,
+}, {
+	/* Ericsson F3307 ver 2 */
+	USB_DEVICE_AND_INTERFACE_INFO(0x0bdb, 0x1909, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long) &cdc_info,
+}, {
+	/* Ericsson C3607w */
+	USB_DEVICE_AND_INTERFACE_INFO(0x0bdb, 0x1049, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long) &cdc_info,
+}, {
+	/* Toshiba F3507g */
+	USB_DEVICE_AND_INTERFACE_INFO(0x0930, 0x130b, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long) &cdc_info,
+}, {
+	/* Toshiba F3607gw */
+	USB_DEVICE_AND_INTERFACE_INFO(0x0930, 0x130c, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long) &cdc_info,
+}, {
+	/* Toshiba F3607gw ver 2 */
+	USB_DEVICE_AND_INTERFACE_INFO(0x0930, 0x1311, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long) &cdc_info,
+}, {
+	/* Dell F3507g */
+	USB_DEVICE_AND_INTERFACE_INFO(0x413c, 0x8147, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long) &cdc_info,
+}, {
+	/* Dell F3607gw */
+	USB_DEVICE_AND_INTERFACE_INFO(0x413c, 0x8183, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
+	.driver_info = (unsigned long) &cdc_info,
+}, {
+	/* Dell F3607gw ver 2 */
+	USB_DEVICE_AND_INTERFACE_INFO(0x413c, 0x8184, USB_CLASS_COMM,
+			USB_CDC_SUBCLASS_MDLM, USB_CDC_PROTO_NONE),
 	.driver_info = (unsigned long) &cdc_info,
 },
 	{ },		// END

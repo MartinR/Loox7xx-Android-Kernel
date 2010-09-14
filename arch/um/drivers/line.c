@@ -5,6 +5,7 @@
 
 #include "linux/irqreturn.h"
 #include "linux/kd.h"
+#include "linux/sched.h"
 #include "chan_kern.h"
 #include "irq_kern.h"
 #include "irq_user.h"
@@ -275,6 +276,8 @@ int line_ioctl(struct tty_struct *tty, struct file * file,
 	case TIOCGLTC:
 	case TIOCSLTC:
 #endif
+	/* Note: these are out of date as we now have TCGETS2 etc but this
+	   whole lot should probably go away */
 	case TCGETS:
 	case TCSETSF:
 	case TCSETSW:
@@ -362,19 +365,7 @@ static irqreturn_t line_write_interrupt(int irq, void *data)
 	if (tty == NULL)
 		return IRQ_NONE;
 
-	if (test_bit(TTY_DO_WRITE_WAKEUP, &tty->flags) &&
-	   (tty->ldisc.write_wakeup != NULL))
-		(tty->ldisc.write_wakeup)(tty);
-
-	/*
-	 * BLOCKING mode
-	 * In blocking mode, everything sleeps on tty->write_wait.
-	 * Sleeping in the console driver would break non-blocking
-	 * writes.
-	 */
-
-	if (waitqueue_active(&tty->write_wait))
-		wake_up_interruptible(&tty->write_wait);
+	tty_wakeup(tty);
 	return IRQ_HANDLED;
 }
 

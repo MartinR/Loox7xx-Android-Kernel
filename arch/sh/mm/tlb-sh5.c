@@ -15,9 +15,7 @@
 #include <asm/mmu_context.h>
 
 /**
- * sh64_tlb_init
- *
- * Perform initial setup for the DTLB and ITLB.
+ * sh64_tlb_init - Perform initial setup for the DTLB and ITLB.
  */
 int __init sh64_tlb_init(void)
 {
@@ -46,9 +44,7 @@ int __init sh64_tlb_init(void)
 }
 
 /**
- * sh64_next_free_dtlb_entry
- *
- * Find the next available DTLB entry
+ * sh64_next_free_dtlb_entry - Find the next available DTLB entry
  */
 unsigned long long sh64_next_free_dtlb_entry(void)
 {
@@ -56,9 +52,7 @@ unsigned long long sh64_next_free_dtlb_entry(void)
 }
 
 /**
- * sh64_get_wired_dtlb_entry
- *
- * Allocate a wired (locked-in) entry in the DTLB
+ * sh64_get_wired_dtlb_entry - Allocate a wired (locked-in) entry in the DTLB
  */
 unsigned long long sh64_get_wired_dtlb_entry(void)
 {
@@ -71,11 +65,9 @@ unsigned long long sh64_get_wired_dtlb_entry(void)
 }
 
 /**
- * sh64_put_wired_dtlb_entry
+ * sh64_put_wired_dtlb_entry - Free a wired (locked-in) entry in the DTLB.
  *
  * @entry:	Address of TLB slot.
- *
- * Free a wired (locked-in) entry in the DTLB.
  *
  * Works like a stack, last one to allocate must be first one to free.
  */
@@ -115,7 +107,7 @@ int sh64_put_wired_dtlb_entry(unsigned long long entry)
 }
 
 /**
- * sh64_setup_tlb_slot
+ * sh64_setup_tlb_slot - Load up a translation in a wired slot.
  *
  * @config_addr:	Address of TLB slot.
  * @eaddr:		Virtual address.
@@ -125,26 +117,15 @@ int sh64_put_wired_dtlb_entry(unsigned long long entry)
  * Load up a virtual<->physical translation for @eaddr<->@paddr in the
  * pre-allocated TLB slot @config_addr (see sh64_get_wired_dtlb_entry).
  */
-inline void sh64_setup_tlb_slot(unsigned long long config_addr,
-				unsigned long eaddr,
-				unsigned long asid,
-				unsigned long paddr)
+void sh64_setup_tlb_slot(unsigned long long config_addr, unsigned long eaddr,
+			 unsigned long asid, unsigned long paddr)
 {
 	unsigned long long pteh, ptel;
 
-	/* Sign extension */
-#if (NEFF == 32)
-	pteh = (unsigned long long)(signed long long)(signed long) eaddr;
-#else
-#error "Can't sign extend more than 32 bits yet"
-#endif
+	pteh = neff_sign_extend(eaddr);
 	pteh &= PAGE_MASK;
 	pteh |= (asid << PTEH_ASID_SHIFT) | PTEH_VALID;
-#if (NEFF == 32)
-	ptel = (unsigned long long)(signed long long)(signed long) paddr;
-#else
-#error "Can't sign extend more than 32 bits yet"
-#endif
+	ptel = neff_sign_extend(paddr);
 	ptel &= PAGE_MASK;
 	ptel |= (_PAGE_CACHABLE | _PAGE_READ | _PAGE_WRITE);
 
@@ -154,11 +135,11 @@ inline void sh64_setup_tlb_slot(unsigned long long config_addr,
 }
 
 /**
- * sh64_teardown_tlb_slot
+ * sh64_teardown_tlb_slot - Teardown a translation.
  *
  * @config_addr:	Address of TLB slot.
  *
  * Teardown any existing mapping in the TLB slot @config_addr.
  */
-inline void sh64_teardown_tlb_slot(unsigned long long config_addr)
+void sh64_teardown_tlb_slot(unsigned long long config_addr)
 	__attribute__ ((alias("__flush_tlb_slot")));

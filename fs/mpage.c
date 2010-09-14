@@ -6,7 +6,7 @@
  * Contains functions related to preparing and submitting BIOs which contain
  * multiple pagecache pages.
  *
- * 15May2002	akpm@zip.com.au
+ * 15May2002	Andrew Morton
  *		Initial version
  * 27Jun2002	axboe@suse.de
  *		use bio_add_page() to build bio's just the right size
@@ -240,7 +240,6 @@ do_mpage_readpage(struct bio *bio, struct page *page, unsigned nr_pages,
 				first_hole = page_block;
 			page_block++;
 			block_in_file++;
-			clear_buffer_mapped(map_bh);
 			continue;
 		}
 
@@ -307,7 +306,10 @@ alloc_new:
 		goto alloc_new;
 	}
 
-	if (buffer_boundary(map_bh) || (first_hole != blocks_per_page))
+	relative_block = block_in_file - *first_logical_block;
+	nblocks = map_bh->b_size >> blkbits;
+	if ((buffer_boundary(map_bh) && relative_block == nblocks) ||
+	    (first_hole != blocks_per_page))
 		bio = mpage_bio_submit(READ, bio);
 	else
 		*last_block_in_bio = blocks[blocks_per_page - 1];
@@ -377,7 +379,8 @@ mpage_readpages(struct address_space *mapping, struct list_head *pages,
 	struct buffer_head map_bh;
 	unsigned long first_logical_block = 0;
 
-	clear_buffer_mapped(&map_bh);
+	map_bh.b_state = 0;
+	map_bh.b_size = 0;
 	for (page_idx = 0; page_idx < nr_pages; page_idx++) {
 		struct page *page = list_entry(pages->prev, struct page, lru);
 
@@ -410,7 +413,8 @@ int mpage_readpage(struct page *page, get_block_t get_block)
 	struct buffer_head map_bh;
 	unsigned long first_logical_block = 0;
 
-	clear_buffer_mapped(&map_bh);
+	map_bh.b_state = 0;
+	map_bh.b_size = 0;
 	bio = do_mpage_readpage(bio, page, 1, &last_block_in_bio,
 			&map_bh, &first_logical_block, get_block);
 	if (bio)
@@ -435,6 +439,7 @@ EXPORT_SYMBOL(mpage_readpage);
  * written, so it can intelligently allocate a suitably-sized BIO.  For now,
  * just allocate full-size (16-page) BIOs.
  */
+
 struct mpage_data {
 	struct bio *bio;
 	sector_t last_block_in_bio;
@@ -443,7 +448,7 @@ struct mpage_data {
 };
 
 static int __mpage_writepage(struct page *page, struct writeback_control *wbc,
-			     void *data)
+		      void *data)
 {
 	struct mpage_data *mpd = data;
 	struct bio *bio = mpd->bio;

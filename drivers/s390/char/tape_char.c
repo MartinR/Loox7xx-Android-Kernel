@@ -14,6 +14,7 @@
 #include <linux/types.h>
 #include <linux/proc_fs.h>
 #include <linux/mtio.h>
+#include <linux/smp_lock.h>
 
 #include <asm/uaccess.h>
 
@@ -22,8 +23,6 @@
 #include "tape.h"
 #include "tape_std.h"
 #include "tape_class.h"
-
-#define PRINTK_HEADER "TAPE_CHAR: "
 
 #define TAPECHAR_MAJOR		0	/* get dynamic major */
 
@@ -101,14 +100,12 @@ tapechar_check_idalbuffer(struct tape_device *device, size_t block_size)
 	if (block_size > MAX_BLOCKSIZE) {
 		DBF_EVENT(3, "Invalid blocksize (%zd > %d)\n",
 			block_size, MAX_BLOCKSIZE);
-		PRINT_ERR("Invalid blocksize (%zd> %d)\n",
-			block_size, MAX_BLOCKSIZE);
 		return -EINVAL;
 	}
 
 	/* The current idal buffer is not correct. Allocate a new one. */
 	new = idal_buffer_alloc(block_size, 0);
-	if (new == NULL)
+	if (IS_ERR(new))
 		return -ENOMEM;
 
 	if (device->char_data.idal_buf != NULL)
@@ -289,21 +286,26 @@ tapechar_open (struct inode *inode, struct file *filp)
 	if (imajor(filp->f_path.dentry->d_inode) != tapechar_major)
 		return -ENODEV;
 
+	lock_kernel();
 	minor = iminor(filp->f_path.dentry->d_inode);
 	device = tape_get_device(minor / TAPE_MINORS_PER_DEV);
 	if (IS_ERR(device)) {
 		DBF_EVENT(3, "TCHAR:open: tape_get_device() failed\n");
-		return PTR_ERR(device);
+		rc = PTR_ERR(device);
+		goto out;
 	}
 
 
 	rc = tape_open(device);
 	if (rc == 0) {
 		filp->private_data = device;
-		return nonseekable_open(inode, filp);
+		rc = nonseekable_open(inode, filp);
 	}
-	tape_put_device(device);
+	else
+		tape_put_device(device);
 
+out:
+	unlock_kernel();
 	return rc;
 }
 
@@ -479,7 +481,6 @@ tapechar_init (void)
 		return -1;
 
 	tapechar_major = MAJOR(dev);
-	PRINT_INFO("tape gets major %d for character devices\n", MAJOR(dev));
 
 	return 0;
 }
@@ -490,7 +491,5 @@ tapechar_init (void)
 void
 tapechar_exit(void)
 {
-	PRINT_INFO("tape releases major %d for character devices\n",
-		tapechar_major);
 	unregister_chrdev_region(MKDEV(tapechar_major, 0), 256);
 }

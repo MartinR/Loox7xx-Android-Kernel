@@ -29,8 +29,6 @@
  * ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
  * CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
- *
- * $Id: mad_rmpp.c 1921 2005-03-02 22:58:44Z sean.hefty $
  */
 
 #include "mad_priv.h"
@@ -39,7 +37,8 @@
 enum rmpp_state {
 	RMPP_STATE_ACTIVE,
 	RMPP_STATE_TIMEOUT,
-	RMPP_STATE_COMPLETE
+	RMPP_STATE_COMPLETE,
+	RMPP_STATE_CANCELING
 };
 
 struct mad_rmpp_recv {
@@ -89,18 +88,22 @@ void ib_cancel_rmpp_recvs(struct ib_mad_agent_private *agent)
 
 	spin_lock_irqsave(&agent->lock, flags);
 	list_for_each_entry(rmpp_recv, &agent->rmpp_list, list) {
+		if (rmpp_recv->state != RMPP_STATE_COMPLETE)
+			ib_free_recv_mad(rmpp_recv->rmpp_wc);
+		rmpp_recv->state = RMPP_STATE_CANCELING;
+	}
+	spin_unlock_irqrestore(&agent->lock, flags);
+
+	list_for_each_entry(rmpp_recv, &agent->rmpp_list, list) {
 		cancel_delayed_work(&rmpp_recv->timeout_work);
 		cancel_delayed_work(&rmpp_recv->cleanup_work);
 	}
-	spin_unlock_irqrestore(&agent->lock, flags);
 
 	flush_workqueue(agent->qp_info->port_priv->wq);
 
 	list_for_each_entry_safe(rmpp_recv, temp_rmpp_recv,
 				 &agent->rmpp_list, list) {
 		list_del(&rmpp_recv->list);
-		if (rmpp_recv->state != RMPP_STATE_COMPLETE)
-			ib_free_recv_mad(rmpp_recv->rmpp_wc);
 		destroy_rmpp_recv(rmpp_recv);
 	}
 }
@@ -135,7 +138,7 @@ static void ack_recv(struct mad_rmpp_recv *rmpp_recv,
 	msg = ib_create_send_mad(&rmpp_recv->agent->agent, recv_wc->wc->src_qp,
 				 recv_wc->wc->pkey_index, 1, hdr_len,
 				 0, GFP_KERNEL);
-	if (!msg)
+	if (IS_ERR(msg))
 		return;
 
 	format_ack(msg, (struct ib_rmpp_mad *) recv_wc->recv_buf.mad, rmpp_recv);
@@ -262,6 +265,10 @@ static void recv_cleanup_handler(struct work_struct *work)
 	unsigned long flags;
 
 	spin_lock_irqsave(&rmpp_recv->agent->lock, flags);
+	if (rmpp_recv->state == RMPP_STATE_CANCELING) {
+		spin_unlock_irqrestore(&rmpp_recv->agent->lock, flags);
+		return;
+	}
 	list_del(&rmpp_recv->list);
 	spin_unlock_irqrestore(&rmpp_recv->agent->lock, flags);
 	destroy_rmpp_recv(rmpp_recv);
@@ -737,7 +744,7 @@ process_rmpp_data(struct ib_mad_agent_private *agent,
 		goto bad;
 	}
 
-	if (rmpp_hdr->seg_num == __constant_htonl(1)) {
+	if (rmpp_hdr->seg_num == cpu_to_be32(1)) {
 		if (!(ib_get_rmpp_flags(rmpp_hdr) & IB_MGMT_RMPP_FLAG_FIRST)) {
 			rmpp_status = IB_MGMT_RMPP_STATUS_BAD_SEG;
 			goto bad;

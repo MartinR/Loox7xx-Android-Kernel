@@ -9,9 +9,9 @@
 #include <linux/errno.h>
 #include <linux/init.h>
 
-#include <asm/hardware.h>
+#include <mach/hardware.h>
 #include <asm/mach-types.h>
-#include <asm/arch/neponset.h>
+#include <mach/neponset.h>
 #include <asm/hardware/sa1111.h>
 
 #include "sa1111_generic.h"
@@ -123,7 +123,7 @@ static struct pcmcia_low_level neponset_pcmcia_ops = {
 	.socket_suspend 	= sa1111_pcmcia_socket_suspend,
 };
 
-int __init pcmcia_neponset_init(struct sa1111_dev *sadev)
+int pcmcia_neponset_init(struct sa1111_dev *sadev)
 {
 	int ret = -ENODEV;
 

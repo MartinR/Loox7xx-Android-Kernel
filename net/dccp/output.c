@@ -53,8 +53,11 @@ static int dccp_transmit_skb(struct sock *sk, struct sk_buff *skb)
 					  dccp_packet_hdr_len(dcb->dccpd_type);
 		int err, set_ack = 1;
 		u64 ackno = dp->dccps_gsr;
-
-		dccp_inc_seqno(&dp->dccps_gss);
+		/*
+		 * Increment GSS here already in case the option code needs it.
+		 * Update GSS for real only if option processing below succeeds.
+		 */
+		dcb->dccpd_seq = ADD48(dp->dccps_gss, 1);
 
 		switch (dcb->dccpd_type) {
 		case DCCP_PKT_DATA:
@@ -66,6 +69,9 @@ static int dccp_transmit_skb(struct sock *sk, struct sk_buff *skb)
 
 		case DCCP_PKT_REQUEST:
 			set_ack = 0;
+			/* Use ISS on the first (non-retransmitted) Request. */
+			if (icsk->icsk_retransmits == 0)
+				dcb->dccpd_seq = dp->dccps_iss;
 			/* fall through */
 
 		case DCCP_PKT_SYNC:
@@ -84,8 +90,6 @@ static int dccp_transmit_skb(struct sock *sk, struct sk_buff *skb)
 			break;
 		}
 
-		dcb->dccpd_seq = dp->dccps_gss;
-
 		if (dccp_insert_options(sk, skb)) {
 			kfree_skb(skb);
 			return -EPROTO;
@@ -103,7 +107,7 @@ static int dccp_transmit_skb(struct sock *sk, struct sk_buff *skb)
 		/* XXX For now we're using only 48 bits sequence numbers */
 		dh->dccph_x	= 1;
 
-		dp->dccps_awh = dp->dccps_gss;
+		dccp_update_gss(sk, dcb->dccpd_seq);
 		dccp_hdr_set_seq(dh, dp->dccps_gss);
 		if (set_ack)
 			dccp_hdr_set_ack(dccp_hdr_ack_bits(skb), ackno);
@@ -112,6 +116,11 @@ static int dccp_transmit_skb(struct sock *sk, struct sk_buff *skb)
 		case DCCP_PKT_REQUEST:
 			dccp_hdr_request(skb)->dccph_req_service =
 							dp->dccps_service;
+			/*
+			 * Limit Ack window to ISS <= P.ackno <= GSS, so that
+			 * only Responses to Requests we sent are considered.
+			 */
+			dp->dccps_awl = dp->dccps_iss;
 			break;
 		case DCCP_PKT_RESET:
 			dccp_hdr_reset(skb)->dccph_reset_code =
@@ -152,21 +161,27 @@ unsigned int dccp_sync_mss(struct sock *sk, u32 pmtu)
 	struct inet_connection_sock *icsk = inet_csk(sk);
 	struct dccp_sock *dp = dccp_sk(sk);
 	u32 ccmps = dccp_determine_ccmps(dp);
-	int cur_mps = ccmps ? min(pmtu, ccmps) : pmtu;
+	u32 cur_mps = ccmps ? min(pmtu, ccmps) : pmtu;
 
 	/* Account for header lengths and IPv4/v6 option overhead */
 	cur_mps -= (icsk->icsk_af_ops->net_header_len + icsk->icsk_ext_hdr_len +
 		    sizeof(struct dccp_hdr) + sizeof(struct dccp_hdr_ext));
 
 	/*
-	 * FIXME: this should come from the CCID infrastructure, where, say,
-	 * TFRC will say it wants TIMESTAMPS, ELAPSED time, etc, for now lets
-	 * put a rough estimate for NDP + TIMESTAMP + TIMESTAMP_ECHO + ELAPSED
-	 * TIME + TFRC_OPT_LOSS_EVENT_RATE + TFRC_OPT_RECEIVE_RATE + padding to
-	 * make it a multiple of 4
+	 * Leave enough headroom for common DCCP header options.
+	 * This only considers options which may appear on DCCP-Data packets, as
+	 * per table 3 in RFC 4340, 5.8. When running out of space for other
+	 * options (eg. Ack Vector which can take up to 255 bytes), it is better
+	 * to schedule a separate Ack. Thus we leave headroom for the following:
+	 *  - 1 byte for Slow Receiver (11.6)
+	 *  - 6 bytes for Timestamp (13.1)
+	 *  - 10 bytes for Timestamp Echo (13.3)
+	 *  - 8 bytes for NDP count (7.7, when activated)
+	 *  - 6 bytes for Data Checksum (9.3)
+	 *  - %DCCPAV_MIN_OPTLEN bytes for Ack Vector size (11.4, when enabled)
 	 */
-
-	cur_mps -= ((5 + 6 + 10 + 6 + 6 + 6 + 3) / 4) * 4;
+	cur_mps -= roundup(1 + 6 + 10 + dp->dccps_send_ndp_count * 8 + 6 +
+			   (dp->dccps_hc_rx_ackvec ? DCCPAV_MIN_OPTLEN : 0), 4);
 
 	/* And store cached results */
 	icsk->icsk_pmtu_cookie = pmtu;
@@ -181,7 +196,7 @@ void dccp_write_space(struct sock *sk)
 {
 	read_lock(&sk->sk_callback_lock);
 
-	if (sk->sk_sleep && waitqueue_active(sk->sk_sleep))
+	if (sk_has_sleeper(sk))
 		wake_up_interruptible(sk->sk_sleep);
 	/* Should agree with poll, otherwise some programs break */
 	if (sock_writeable(sk))
@@ -261,7 +276,20 @@ void dccp_write_xmit(struct sock *sk, int block)
 			const int len = skb->len;
 
 			if (sk->sk_state == DCCP_PARTOPEN) {
-				/* See 8.1.5.  Handshake Completion */
+				const u32 cur_mps = dp->dccps_mss_cache - DCCP_FEATNEG_OVERHEAD;
+				/*
+				 * See 8.1.5 - Handshake Completion.
+				 *
+				 * For robustness we resend Confirm options until the client has
+				 * entered OPEN. During the initial feature negotiation, the MPS
+				 * is smaller than usual, reduced by the Change/Confirm options.
+				 */
+				if (!list_empty(&dp->dccps_featneg) && len > cur_mps) {
+					DCCP_WARN("Payload too large (%d) for featneg.\n", len);
+					dccp_send_ack(sk);
+					dccp_feat_list_purge(&dp->dccps_featneg);
+				}
+
 				inet_csk_schedule_ack(sk);
 				inet_csk_reset_xmit_timer(sk, ICSK_TIME_DACK,
 						  inet_csk(sk)->icsk_rto,
@@ -284,14 +312,26 @@ void dccp_write_xmit(struct sock *sk, int block)
 	}
 }
 
-int dccp_retransmit_skb(struct sock *sk, struct sk_buff *skb)
+/**
+ * dccp_retransmit_skb  -  Retransmit Request, Close, or CloseReq packets
+ * There are only four retransmittable packet types in DCCP:
+ * - Request  in client-REQUEST  state (sec. 8.1.1),
+ * - CloseReq in server-CLOSEREQ state (sec. 8.3),
+ * - Close    in   node-CLOSING  state (sec. 8.3),
+ * - Acks in client-PARTOPEN state (sec. 8.1.5, handled by dccp_delack_timer()).
+ * This function expects sk->sk_send_head to contain the original skb.
+ */
+int dccp_retransmit_skb(struct sock *sk)
 {
+	WARN_ON(sk->sk_send_head == NULL);
+
 	if (inet_csk(sk)->icsk_af_ops->rebuild_header(sk) != 0)
 		return -EHOSTUNREACH; /* Routing failure or similar. */
 
-	return dccp_transmit_skb(sk, (skb_cloned(skb) ?
-				      pskb_copy(skb, GFP_ATOMIC):
-				      skb_clone(skb, GFP_ATOMIC)));
+	/* this count is used to distinguish original and retransmitted skb */
+	inet_csk(sk)->icsk_retransmits++;
+
+	return dccp_transmit_skb(sk, skb_clone(sk->sk_send_head, GFP_ATOMIC));
 }
 
 struct sk_buff *dccp_make_response(struct sock *sk, struct dst_entry *dst,
@@ -310,7 +350,7 @@ struct sk_buff *dccp_make_response(struct sock *sk, struct dst_entry *dst,
 	/* Reserve space for headers. */
 	skb_reserve(skb, sk->sk_prot->max_header);
 
-	skb->dst = dst_clone(dst);
+	skb_dst_set(skb, dst_clone(dst));
 
 	dreq = dccp_rsk(req);
 	if (inet_rsk(req)->acked)	/* increase ISS upon retransmission */
@@ -318,15 +358,17 @@ struct sk_buff *dccp_make_response(struct sock *sk, struct dst_entry *dst,
 	DCCP_SKB_CB(skb)->dccpd_type = DCCP_PKT_RESPONSE;
 	DCCP_SKB_CB(skb)->dccpd_seq  = dreq->dreq_iss;
 
-	if (dccp_insert_options_rsk(dreq, skb)) {
-		kfree_skb(skb);
-		return NULL;
-	}
+	/* Resolve feature dependencies resulting from choice of CCID */
+	if (dccp_feat_server_ccid_dependencies(dreq))
+		goto response_failed;
+
+	if (dccp_insert_options_rsk(dreq, skb))
+		goto response_failed;
 
 	/* Build and checksum header */
 	dh = dccp_zeroed_hdr(skb, dccp_header_size);
 
-	dh->dccph_sport	= inet_sk(sk)->sport;
+	dh->dccph_sport	= inet_rsk(req)->loc_port;
 	dh->dccph_dport	= inet_rsk(req)->rmt_port;
 	dh->dccph_doff	= (dccp_header_size +
 			   DCCP_SKB_CB(skb)->dccpd_opt_len) / 4;
@@ -342,6 +384,9 @@ struct sk_buff *dccp_make_response(struct sock *sk, struct dst_entry *dst,
 	inet_rsk(req)->acked = 1;
 	DCCP_INC_STATS(DCCP_MIB_OUTSEGS);
 	return skb;
+response_failed:
+	kfree_skb(skb);
+	return NULL;
 }
 
 EXPORT_SYMBOL_GPL(dccp_make_response);
@@ -437,19 +482,7 @@ static inline void dccp_connect_init(struct sock *sk)
 
 	dccp_sync_mss(sk, dst_mtu(dst));
 
-	/*
-	 * SWL and AWL are initially adjusted so that they are not less than
-	 * the initial Sequence Numbers received and sent, respectively:
-	 *	SWL := max(GSR + 1 - floor(W/4), ISR),
-	 *	AWL := max(GSS - W' + 1, ISS).
-	 * These adjustments MUST be applied only at the beginning of the
-	 * connection.
-	 */
-	dccp_update_gss(sk, dp->dccps_iss);
-	dccp_set_seqno(&dp->dccps_awl, max48(dp->dccps_awl, dp->dccps_iss));
-
-	/* S.GAR - greatest valid acknowledgement number received on a non-Sync;
-	 *         initialized to S.ISS (sec. 8.5)                            */
+	/* Initialise GAR as per 8.5; AWL/AWH are set in dccp_transmit_skb() */
 	dp->dccps_gar = dp->dccps_iss;
 
 	icsk->icsk_retransmits = 0;
@@ -459,6 +492,10 @@ int dccp_connect(struct sock *sk)
 {
 	struct sk_buff *skb;
 	struct inet_connection_sock *icsk = inet_csk(sk);
+
+	/* do not connect if feature negotiation setup fails */
+	if (dccp_feat_finalise_settings(dccp_sk(sk)))
+		return -EPROTO;
 
 	dccp_connect_init(sk);
 

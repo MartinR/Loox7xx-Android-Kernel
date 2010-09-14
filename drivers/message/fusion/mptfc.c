@@ -3,7 +3,7 @@
  *      For use with LSI PCI chip/adapter(s)
  *      running LSI Fusion MPT (Message Passing Technology) firmware.
  *
- *  Copyright (c) 1999-2007 LSI Corporation
+ *  Copyright (c) 1999-2008 LSI Corporation
  *  (mailto:DL-MPTFusionLinux@lsi.com)
  *
  */
@@ -231,28 +231,28 @@ static int
 mptfc_abort(struct scsi_cmnd *SCpnt)
 {
 	return
-	    mptfc_block_error_handler(SCpnt, mptscsih_abort, __FUNCTION__);
+	    mptfc_block_error_handler(SCpnt, mptscsih_abort, __func__);
 }
 
 static int
 mptfc_dev_reset(struct scsi_cmnd *SCpnt)
 {
 	return
-	    mptfc_block_error_handler(SCpnt, mptscsih_dev_reset, __FUNCTION__);
+	    mptfc_block_error_handler(SCpnt, mptscsih_dev_reset, __func__);
 }
 
 static int
 mptfc_bus_reset(struct scsi_cmnd *SCpnt)
 {
 	return
-	    mptfc_block_error_handler(SCpnt, mptscsih_bus_reset, __FUNCTION__);
+	    mptfc_block_error_handler(SCpnt, mptscsih_bus_reset, __func__);
 }
 
 static int
 mptfc_host_reset(struct scsi_cmnd *SCpnt)
 {
 	return
-	    mptfc_block_error_handler(SCpnt, mptscsih_host_reset, __FUNCTION__);
+	    mptfc_block_error_handler(SCpnt, mptscsih_host_reset, __func__);
 }
 
 static void
@@ -1251,17 +1251,15 @@ mptfc_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	 * A slightly different algorithm is required for
 	 * 64bit SGEs.
 	 */
-	scale = ioc->req_sz/(sizeof(dma_addr_t) + sizeof(u32));
-	if (sizeof(dma_addr_t) == sizeof(u64)) {
+	scale = ioc->req_sz/ioc->SGE_size;
+	if (ioc->sg_addr_size == sizeof(u64)) {
 		numSGE = (scale - 1) *
 		  (ioc->facts.MaxChainDepth-1) + scale +
-		  (ioc->req_sz - 60) / (sizeof(dma_addr_t) +
-		  sizeof(u32));
+		  (ioc->req_sz - 60) / ioc->SGE_size;
 	} else {
 		numSGE = 1 + (scale - 1) *
 		  (ioc->facts.MaxChainDepth-1) + scale +
-		  (ioc->req_sz - 64) / (sizeof(dma_addr_t) +
-		  sizeof(u32));
+		  (ioc->req_sz - 64) / ioc->SGE_size;
 	}
 
 	if (numSGE < sh->sg_tablesize) {
@@ -1290,30 +1288,6 @@ mptfc_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	dprintk(ioc, printk(MYIOC_s_DEBUG_FMT "ScsiLookup @ %p\n",
 		 ioc->name, ioc->ScsiLookup));
 
-	/* Clear the TM flags
-	 */
-	hd->tmPending = 0;
-	hd->tmState = TM_STATE_NONE;
-	hd->resetPending = 0;
-	hd->abortSCpnt = NULL;
-
-	/* Clear the pointer used to store
-	 * single-threaded commands, i.e., those
-	 * issued during a bus scan, dv and
-	 * configuration pages.
-	 */
-	hd->cmdPtr = NULL;
-
-	/* Initialize this SCSI Hosts' timers
-	 * To use, set the timer expires field
-	 * and add_timer
-	 */
-	init_timer(&hd->timer);
-	hd->timer.data = (unsigned long) hd;
-	hd->timer.function = mptscsih_timer_expired;
-
-	init_waitqueue_head(&hd->scandv_waitq);
-	hd->scandv_wait_done = 0;
 	hd->last_queue_full = 0;
 
 	sh->transportt = mptfc_transport_template;
@@ -1326,8 +1300,8 @@ mptfc_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 
 	/* initialize workqueue */
 
-	snprintf(ioc->fc_rescan_work_q_name, KOBJ_NAME_LEN, "mptfc_wq_%d",
-		sh->host_no);
+	snprintf(ioc->fc_rescan_work_q_name, sizeof(ioc->fc_rescan_work_q_name),
+		 "mptfc_wq_%d", sh->host_no);
 	ioc->fc_rescan_work_q =
 		create_singlethread_workqueue(ioc->fc_rescan_work_q_name);
 	if (!ioc->fc_rescan_work_q)

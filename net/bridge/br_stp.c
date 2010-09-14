@@ -5,14 +5,13 @@
  *	Authors:
  *	Lennert Buytenhek		<buytenh@gnu.org>
  *
- *	$Id: br_stp.c,v 1.4 2000/06/19 10:13:35 davem Exp $
- *
  *	This program is free software; you can redistribute it and/or
  *	modify it under the terms of the GNU General Public License
  *	as published by the Free Software Foundation; either version
  *	2 of the License, or (at your option) any later version.
  */
 #include <linux/kernel.h>
+#include <linux/rculist.h>
 
 #include "br_private.h"
 #include "br_private_stp.h"
@@ -22,7 +21,7 @@
  */
 #define MESSAGE_AGE_INCR	((HZ < 256) ? 1 : (HZ/256))
 
-static const char *br_port_state_names[] = {
+static const char *const br_port_state_names[] = {
 	[BR_STATE_DISABLED] = "disabled",
 	[BR_STATE_LISTENING] = "listening",
 	[BR_STATE_LEARNING] = "learning",
@@ -298,6 +297,9 @@ void br_topology_change_detection(struct net_bridge *br)
 {
 	int isroot = br_is_root_bridge(br);
 
+	if (br->stp_enabled != BR_KERNEL_STP)
+		return;
+
 	pr_info("%s: topology change detected, %s\n", br->dev->name,
 		isroot ? "propagating" : "sending tcn bpdu");
 
@@ -369,14 +371,25 @@ static void br_make_blocking(struct net_bridge_port *p)
 /* called under bridge lock */
 static void br_make_forwarding(struct net_bridge_port *p)
 {
-	if (p->state == BR_STATE_BLOCKING) {
-		if (p->br->stp_enabled == BR_KERNEL_STP)
-			p->state = BR_STATE_LISTENING;
-		else
-			p->state = BR_STATE_LEARNING;
+	struct net_bridge *br = p->br;
 
-		br_log_state(p);
-		mod_timer(&p->forward_delay_timer, jiffies + p->br->forward_delay);	}
+	if (p->state != BR_STATE_BLOCKING)
+		return;
+
+	if (br->forward_delay == 0) {
+		p->state = BR_STATE_FORWARDING;
+		br_topology_change_detection(br);
+		del_timer(&p->forward_delay_timer);
+	}
+	else if (p->br->stp_enabled == BR_KERNEL_STP)
+		p->state = BR_STATE_LISTENING;
+	else
+		p->state = BR_STATE_LEARNING;
+
+	br_log_state(p);
+
+	if (br->forward_delay != 0)
+		mod_timer(&p->forward_delay_timer, jiffies + br->forward_delay);
 }
 
 /* called under bridge lock */

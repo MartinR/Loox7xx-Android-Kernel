@@ -6,7 +6,7 @@
  *  the Free Software Foundation; either version 2 of the License, or
  *  (at your option) any later version.
  *
- *  You need an userspace library to cooperate with this driver. It (and other
+ *  You need a userspace library to cooperate with this driver. It (and other
  *  info) may be obtained here:
  *  http://www.fi.muni.cz/~xslaby/phantom.html
  *  or alternatively, you might use OpenHaptics provided by Sensable.
@@ -22,6 +22,8 @@
 #include <linux/interrupt.h>
 #include <linux/cdev.h>
 #include <linux/phantom.h>
+#include <linux/sched.h>
+#include <linux/smp_lock.h>
 
 #include <asm/atomic.h>
 #include <asm/io.h>
@@ -212,13 +214,17 @@ static int phantom_open(struct inode *inode, struct file *file)
 	struct phantom_device *dev = container_of(inode->i_cdev,
 			struct phantom_device, cdev);
 
+	lock_kernel();
 	nonseekable_open(inode, file);
 
-	if (mutex_lock_interruptible(&dev->open_lock))
+	if (mutex_lock_interruptible(&dev->open_lock)) {
+		unlock_kernel();
 		return -ERESTARTSYS;
+	}
 
 	if (dev->opened) {
 		mutex_unlock(&dev->open_lock);
+		unlock_kernel();
 		return -EINVAL;
 	}
 
@@ -229,7 +235,7 @@ static int phantom_open(struct inode *inode, struct file *file)
 	atomic_set(&dev->counter, 0);
 	dev->opened++;
 	mutex_unlock(&dev->open_lock);
-
+	unlock_kernel();
 	return 0;
 }
 
@@ -266,7 +272,7 @@ static unsigned int phantom_poll(struct file *file, poll_table *wait)
 	return mask;
 }
 
-static struct file_operations phantom_file_ops = {
+static const struct file_operations phantom_file_ops = {
 	.open = phantom_open,
 	.release = phantom_release,
 	.unlocked_ioctl = phantom_ioctl,
@@ -394,8 +400,9 @@ static int __devinit phantom_probe(struct pci_dev *pdev,
 		goto err_irq;
 	}
 
-	if (IS_ERR(device_create(phantom_class, &pdev->dev, MKDEV(phantom_major,
-			minor), "phantom%u", minor)))
+	if (IS_ERR(device_create(phantom_class, &pdev->dev,
+				 MKDEV(phantom_major, minor), NULL,
+				 "phantom%u", minor)))
 		dev_err(&pdev->dev, "can't create device\n");
 
 	pci_set_drvdata(pdev, pht);
@@ -557,6 +564,6 @@ module_init(phantom_init);
 module_exit(phantom_exit);
 
 MODULE_AUTHOR("Jiri Slaby <jirislaby@gmail.com>");
-MODULE_DESCRIPTION("Sensable Phantom driver");
+MODULE_DESCRIPTION("Sensable Phantom driver (PCI devices)");
 MODULE_LICENSE("GPL");
 MODULE_VERSION(PHANTOM_VERSION);

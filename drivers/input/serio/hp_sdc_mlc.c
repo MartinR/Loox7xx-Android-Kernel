@@ -50,7 +50,7 @@ MODULE_AUTHOR("Brian S. Julin <bri@calyx.com>");
 MODULE_DESCRIPTION("Glue for onboard HIL MLC in HP-PARISC machines");
 MODULE_LICENSE("Dual BSD/GPL");
 
-struct hp_sdc_mlc_priv_s {
+static struct hp_sdc_mlc_priv_s {
 	int emtestmode;
 	hp_sdc_transaction trans;
 	u8 tseq[16];
@@ -296,7 +296,7 @@ static void hp_sdc_mlc_out(hil_mlc *mlc)
 	priv->tseq[3] = 0;
 	if (mlc->opacket & HIL_CTRL_APE) {
 		priv->tseq[3] |= HP_SDC_LPC_APE_IPF;
-		down_trylock(&mlc->csem);
+		BUG_ON(down_trylock(&mlc->csem));
 	}
  enqueue:
 	hp_sdc_enqueue_transaction(&priv->trans);

@@ -6,8 +6,28 @@
 #include <asm/page.h>
 #include <asm-generic/vmlinux.lds.h>
 #include <asm/cache.h>
+#include <asm/thread_info.h>
 
 ENTRY(_stext)
+
+PHDRS {
+	kernel PT_LOAD FLAGS(7); /* RWX */
+	notes PT_NOTE FLAGS(0);
+	dummy PT_NOTE FLAGS(0);
+
+	/* binutils < 2.18 has a bug that makes it misbehave when taking an
+	   ELF file with all segments at load address 0 as input.  This
+	   happens when running "strip" on vmlinux, because of the AT() magic
+	   in this linker script.  People using GCC >= 4.2 won't run into
+	   this problem, because the "build-id" support will put some data
+	   into the "notes" segment (at a non-zero load address).
+
+	   To work around this, we force some data into both the "dummy"
+	   segment and the kernel segment, so the dummy segment will get a
+	   non-zero load address.  It's not enough to always create the
+	   "notes" segment, since if nothing gets assigned to it, its load
+	   address will be zero.  */
+}
 
 #ifdef CONFIG_PPC64
 OUTPUT_ARCH(powerpc:common64)
@@ -18,12 +38,6 @@ jiffies = jiffies_64 + 4;
 #endif
 SECTIONS
 {
-	/* Sections to be discarded. */
-	/DISCARD/ : {
-	*(.exitcall.exit)
-	EXIT_DATA
-	}
-
 	. = KERNELBASE;
 
 /*
@@ -33,12 +47,14 @@ SECTIONS
 	/* Text and gots */
 	.text : AT(ADDR(.text) - LOAD_OFFSET) {
 		ALIGN_FUNCTION();
-		*(.text.head)
+		HEAD_TEXT
 		_text = .;
-		*(.text .fixup .text.init.refok .exit.text.refok)
+		/* careful! __ftr_alt_* sections need to be close to .text */
+		*(.text .fixup __ftr_alt_* .ref.text)
 		SCHED_TEXT
 		LOCK_TEXT
 		KPROBES_TEXT
+		IRQENTRY_TEXT
 
 #ifdef CONFIG_PPC32
 		*(.got1)
@@ -47,36 +63,33 @@ SECTIONS
 		__got2_end = .;
 #endif /* CONFIG_PPC32 */
 
-		. = ALIGN(PAGE_SIZE);
-		_etext = .;
-		PROVIDE32 (etext = .);
-	}
+	} :kernel
+
+	. = ALIGN(PAGE_SIZE);
+	_etext = .;
+	PROVIDE32 (etext = .);
 
 	/* Read-only data */
 	RODATA
 
-	/* Exception & bug tables */
-	__ex_table : AT(ADDR(__ex_table) - LOAD_OFFSET) {
-		__start___ex_table = .;
-		*(__ex_table)
-		__stop___ex_table = .;
-	}
+	EXCEPTION_TABLE(0)
 
-	NOTES
+	NOTES :kernel :notes
 
-	BUG_TABLE
+	/* The dummy segment contents for the bug workaround mentioned above
+	   near PHDRS.  */
+	.dummy : AT(ADDR(.dummy) - LOAD_OFFSET) {
+		LONG(0)
+		LONG(0)
+		LONG(0)
+	} :kernel :dummy
 
 /*
  * Init sections discarded at runtime
  */
 	. = ALIGN(PAGE_SIZE);
 	__init_begin = .;
-
-	.init.text : AT(ADDR(.init.text) - LOAD_OFFSET) {
-		_sinittext = .;
-		INIT_TEXT
-		_einittext = .;
-	}
+	INIT_TEXT_SECTION(PAGE_SIZE) :kernel
 
 	/* .exit.text is discarded at runtime, not link time,
 	 * to deal with references from __bug_table
@@ -100,23 +113,16 @@ SECTIONS
 #endif
 	}
 
-	. = ALIGN(16);
 	.init.setup : AT(ADDR(.init.setup) - LOAD_OFFSET) {
-		__setup_start = .;
-		*(.init.setup)
-		__setup_end = .;
+		INIT_SETUP(16)
 	}
 
 	.initcall.init : AT(ADDR(.initcall.init) - LOAD_OFFSET) {
-		__initcall_start = .;
-		INITCALLS
-		__initcall_end = .;
-		}
+		INIT_CALLS
+	}
 
 	.con_initcall.init : AT(ADDR(.con_initcall.init) - LOAD_OFFSET) {
-		__con_initcall_start = .;
-		*(.con_initcall.init)
-		__con_initcall_end = .;
+		CON_INITCALL
 	}
 
 	SECURITY_INIT
@@ -127,6 +133,18 @@ SECTIONS
 		*(__ftr_fixup)
 		__stop___ftr_fixup = .;
 	}
+	. = ALIGN(8);
+	__mmu_ftr_fixup : AT(ADDR(__mmu_ftr_fixup) - LOAD_OFFSET) {
+		__start___mmu_ftr_fixup = .;
+		*(__mmu_ftr_fixup)
+		__stop___mmu_ftr_fixup = .;
+	}
+	. = ALIGN(8);
+	__lwsync_fixup : AT(ADDR(__lwsync_fixup) - LOAD_OFFSET) {
+		__start___lwsync_fixup = .;
+		*(__lwsync_fixup)
+		__stop___lwsync_fixup = .;
+	}
 #ifdef CONFIG_PPC64
 	. = ALIGN(8);
 	__fw_ftr_fixup : AT(ADDR(__fw_ftr_fixup) - LOAD_OFFSET) {
@@ -135,21 +153,11 @@ SECTIONS
 		__stop___fw_ftr_fixup = .;
 	}
 #endif
-#ifdef CONFIG_BLK_DEV_INITRD
-	. = ALIGN(PAGE_SIZE);
 	.init.ramfs : AT(ADDR(.init.ramfs) - LOAD_OFFSET) {
-		__initramfs_start = .;
-		*(.init.ramfs)
-		__initramfs_end = .;
+		INIT_RAM_FS
 	}
-#endif
-	. = ALIGN(PAGE_SIZE);
-	.data.percpu  : AT(ADDR(.data.percpu) - LOAD_OFFSET) {
-		__per_cpu_start = .;
-		*(.data.percpu)
-		*(.data.percpu.shared_aligned)
-		__per_cpu_end = .;
-	}
+
+	PERCPU(PAGE_SIZE)
 
 	. = ALIGN(8);
 	.machine.desc : AT(ADDR(.machine.desc) - LOAD_OFFSET) {
@@ -157,6 +165,23 @@ SECTIONS
 		*(.machine.desc)
 		__machine_desc_end = . ;
 	}
+#ifdef CONFIG_RELOCATABLE
+	. = ALIGN(8);
+	.dynsym : AT(ADDR(.dynsym) - LOAD_OFFSET) { *(.dynsym) }
+	.dynstr : AT(ADDR(.dynstr) - LOAD_OFFSET) { *(.dynstr) }
+	.dynamic : AT(ADDR(.dynamic) - LOAD_OFFSET)
+	{
+		__dynamic_start = .;
+		*(.dynamic)
+	}
+	.hash : AT(ADDR(.hash) - LOAD_OFFSET) { *(.hash) }
+	.interp : AT(ADDR(.interp) - LOAD_OFFSET) { *(.interp) }
+	.rela.dyn : AT(ADDR(.rela.dyn) - LOAD_OFFSET)
+	{
+		__rela_dyn_start = .;
+		*(.rela*)
+	}
+#endif
 
 	/* freed after init ends here */
 	. = ALIGN(PAGE_SIZE);
@@ -194,56 +219,42 @@ SECTIONS
 	}
 #endif
 
-	. = ALIGN(PAGE_SIZE);
-	_edata  =  .;
-	PROVIDE32 (edata = .);
-
 	/* The initial task and kernel stack */
-#ifdef CONFIG_PPC32
-	. = ALIGN(8192);
-#else
-	. = ALIGN(16384);
-#endif
 	.data.init_task : AT(ADDR(.data.init_task) - LOAD_OFFSET) {
-		*(.data.init_task)
+		INIT_TASK_DATA(THREAD_SIZE)
 	}
 
-	. = ALIGN(PAGE_SIZE);
 	.data.page_aligned : AT(ADDR(.data.page_aligned) - LOAD_OFFSET) {
-		*(.data.page_aligned)
+		PAGE_ALIGNED_DATA(PAGE_SIZE)
 	}
 
 	.data.cacheline_aligned : AT(ADDR(.data.cacheline_aligned) - LOAD_OFFSET) {
-		*(.data.cacheline_aligned)
+		CACHELINE_ALIGNED_DATA(L1_CACHE_BYTES)
 	}
 
-	. = ALIGN(L1_CACHE_BYTES);
 	.data.read_mostly : AT(ADDR(.data.read_mostly) - LOAD_OFFSET) {
-		*(.data.read_mostly)
+		READ_MOSTLY_DATA(L1_CACHE_BYTES)
 	}
 
 	. = ALIGN(PAGE_SIZE);
 	.data_nosave : AT(ADDR(.data_nosave) - LOAD_OFFSET) {
-		__nosave_begin = .;
-		*(.data.nosave)
-		. = ALIGN(PAGE_SIZE);
-		__nosave_end = .;
+		NOSAVE_DATA
 	}
+
+	. = ALIGN(PAGE_SIZE);
+	_edata  =  .;
+	PROVIDE32 (edata = .);
 
 /*
  * And finally the bss
  */
 
-	.bss : AT(ADDR(.bss) - LOAD_OFFSET) {
-		__bss_start = .;
-		*(.sbss) *(.scommon)
-		*(.dynbss)
-		*(.bss)
-		*(COMMON)
-		__bss_stop = .;
-	}
+	BSS_SECTION(0, 0, 0)
 
 	. = ALIGN(PAGE_SIZE);
 	_end = . ;
 	PROVIDE32 (end = .);
+
+	/* Sections to be discarded. */
+	DISCARDS
 }

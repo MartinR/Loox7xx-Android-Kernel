@@ -28,9 +28,11 @@
  */
 #include <linux/module.h>
 #include <linux/pci.h>
+#include <linux/sched.h>
 #include <linux/init.h>
 #include <linux/videodev.h>
 #include <media/v4l2-common.h>
+#include <media/v4l2-ioctl.h>
 #include <asm/uaccess.h>
 #include <asm/io.h>
 #include <linux/delay.h>
@@ -116,7 +118,7 @@ static int ptable_alloc(void)
 	memset(meye.mchip_ptable, 0, sizeof(meye.mchip_ptable));
 
 	/* give only 32 bit DMA addresses */
-	if (dma_set_mask(&meye.mchip_dev->dev, DMA_32BIT_MASK))
+	if (dma_set_mask(&meye.mchip_dev->dev, DMA_BIT_MASK(32)))
 		return -1;
 
 	meye.mchip_ptable_toc = dma_alloc_coherent(&meye.mchip_dev->dev,
@@ -840,19 +842,18 @@ again:
 /* video4linux integration                                                  */
 /****************************************************************************/
 
-static int meye_open(struct inode *inode, struct file *file)
+static int meye_open(struct file *file)
 {
-	int i, err;
+	int i;
 
-	err = video_exclusive_open(inode, file);
-	if (err < 0)
-		return err;
+	if (test_and_set_bit(0, &meye.in_use))
+		return -EBUSY;
 
 	mchip_hic_stop();
 
 	if (mchip_dma_alloc()) {
 		printk(KERN_ERR "meye: mchip framebuffer allocation failed\n");
-		video_exclusive_release(inode, file);
+		clear_bit(0, &meye.in_use);
 		return -ENOBUFS;
 	}
 
@@ -863,11 +864,11 @@ static int meye_open(struct inode *inode, struct file *file)
 	return 0;
 }
 
-static int meye_release(struct inode *inode, struct file *file)
+static int meye_release(struct file *file)
 {
 	mchip_hic_stop();
 	mchip_dma_free();
-	video_exclusive_release(inode, file);
+	clear_bit(0, &meye.in_use);
 	return 0;
 }
 
@@ -1017,7 +1018,6 @@ static int meyeioc_stilljcapt(int *len)
 static int vidioc_querycap(struct file *file, void *fh,
 				struct v4l2_capability *cap)
 {
-	memset(cap, 0, sizeof(*cap));
 	strcpy(cap->driver, "meye");
 	strcpy(cap->card, "meye");
 	sprintf(cap->bus_info, "PCI:%s", pci_name(meye.mchip_dev));
@@ -1036,8 +1036,6 @@ static int vidioc_enum_input(struct file *file, void *fh, struct v4l2_input *i)
 	if (i->index != 0)
 		return -EINVAL;
 
-	memset(i, 0, sizeof(*i));
-	i->index = 0;
 	strcpy(i->name, "Camera");
 	i->type = V4L2_INPUT_TYPE_CAMERA;
 
@@ -1253,28 +1251,19 @@ static int vidioc_g_ctrl(struct file *file, void *fh, struct v4l2_control *c)
 	return 0;
 }
 
-static int vidioc_enum_fmt_cap(struct file *file, void *fh,
+static int vidioc_enum_fmt_vid_cap(struct file *file, void *fh,
 				struct v4l2_fmtdesc *f)
 {
 	if (f->index > 1)
 		return -EINVAL;
 
-	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
-
 	if (f->index == 0) {
 		/* standard YUV 422 capture */
-		memset(f, 0, sizeof(*f));
-		f->index = 0;
-		f->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 		f->flags = 0;
 		strcpy(f->description, "YUV422");
 		f->pixelformat = V4L2_PIX_FMT_YUYV;
 	} else {
 		/* compressed MJPEG capture */
-		memset(f, 0, sizeof(*f));
-		f->index = 1;
-		f->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 		f->flags = V4L2_FMT_FLAG_COMPRESSED;
 		strcpy(f->description, "MJPEG");
 		f->pixelformat = V4L2_PIX_FMT_MJPEG;
@@ -1283,12 +1272,9 @@ static int vidioc_enum_fmt_cap(struct file *file, void *fh,
 	return 0;
 }
 
-static int vidioc_try_fmt_cap(struct file *file, void *fh,
+static int vidioc_try_fmt_vid_cap(struct file *file, void *fh,
 				struct v4l2_format *f)
 {
-	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
-
 	if (f->fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV &&
 	    f->fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG)
 		return -EINVAL;
@@ -1316,14 +1302,9 @@ static int vidioc_try_fmt_cap(struct file *file, void *fh,
 	return 0;
 }
 
-static int vidioc_g_fmt_cap(struct file *file, void *fh, struct v4l2_format *f)
+static int vidioc_g_fmt_vid_cap(struct file *file, void *fh,
+				    struct v4l2_format *f)
 {
-	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
-
-	memset(&f->fmt.pix, 0, sizeof(struct v4l2_pix_format));
-	f->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-
 	switch (meye.mchip_mode) {
 	case MCHIP_HIC_MODE_CONT_OUT:
 	default:
@@ -1340,17 +1321,13 @@ static int vidioc_g_fmt_cap(struct file *file, void *fh, struct v4l2_format *f)
 	f->fmt.pix.bytesperline = f->fmt.pix.width * 2;
 	f->fmt.pix.sizeimage = f->fmt.pix.height *
 			       f->fmt.pix.bytesperline;
-	f->fmt.pix.colorspace = 0;
-	f->fmt.pix.priv = 0;
 
 	return 0;
 }
 
-static int vidioc_s_fmt_cap(struct file *file, void *fh, struct v4l2_format *f)
+static int vidioc_s_fmt_vid_cap(struct file *file, void *fh,
+				    struct v4l2_format *f)
 {
-	if (f->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
-
 	if (f->fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV &&
 	    f->fmt.pix.pixelformat != V4L2_PIX_FMT_MJPEG)
 		return -EINVAL;
@@ -1396,9 +1373,6 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 {
 	int i;
 
-	if (req->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
-
 	if (req->memory != V4L2_MEMORY_MMAP)
 		return -EINVAL;
 
@@ -1439,15 +1413,11 @@ static int vidioc_reqbufs(struct file *file, void *fh,
 
 static int vidioc_querybuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 {
-	int index = buf->index;
+	unsigned int index = buf->index;
 
-	if (index < 0 || index >= gbuffers)
+	if (index >= gbuffers)
 		return -EINVAL;
 
-	memset(buf, 0, sizeof(*buf));
-
-	buf->type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	buf->index = index;
 	buf->bytesused = meye.grab_buffer[index].size;
 	buf->flags = V4L2_BUF_FLAG_MAPPED;
 
@@ -1469,13 +1439,10 @@ static int vidioc_querybuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 
 static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 {
-	if (buf->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
-
 	if (buf->memory != V4L2_MEMORY_MMAP)
 		return -EINVAL;
 
-	if (buf->index < 0 || buf->index >= gbuffers)
+	if (buf->index >= gbuffers)
 		return -EINVAL;
 
 	if (meye.grab_buffer[buf->index].state != MEYE_BUF_UNUSED)
@@ -1494,9 +1461,6 @@ static int vidioc_qbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 static int vidioc_dqbuf(struct file *file, void *fh, struct v4l2_buffer *buf)
 {
 	int reqnr;
-
-	if (buf->type != V4L2_BUF_TYPE_VIDEO_CAPTURE)
-		return -EINVAL;
 
 	if (buf->memory != V4L2_MEMORY_MMAP)
 		return -EINVAL;
@@ -1575,7 +1539,7 @@ static int vidioc_streamoff(struct file *file, void *fh, enum v4l2_buf_type i)
 	return 0;
 }
 
-static int vidioc_default(struct file *file, void *fh, int cmd, void *arg)
+static long vidioc_default(struct file *file, void *fh, int cmd, void *arg)
 {
 	switch (cmd) {
 	case MEYEIOC_G_PARAMS:
@@ -1626,7 +1590,7 @@ static void meye_vm_close(struct vm_area_struct *vma)
 	meye.vma_use_count[idx]--;
 }
 
-static struct vm_operations_struct meye_vm_ops = {
+static const struct vm_operations_struct meye_vm_ops = {
 	.open		= meye_vm_open,
 	.close		= meye_vm_close,
 };
@@ -1682,26 +1646,16 @@ static int meye_mmap(struct file *file, struct vm_area_struct *vma)
 	return 0;
 }
 
-static const struct file_operations meye_fops = {
+static const struct v4l2_file_operations meye_fops = {
 	.owner		= THIS_MODULE,
 	.open		= meye_open,
 	.release	= meye_release,
 	.mmap		= meye_mmap,
 	.ioctl		= video_ioctl2,
-#ifdef CONFIG_COMPAT
-	.compat_ioctl	= v4l_compat_ioctl32,
-#endif
 	.poll		= meye_poll,
-	.llseek		= no_llseek,
 };
 
-static struct video_device meye_template = {
-	.owner		= THIS_MODULE,
-	.name		= "meye",
-	.type		= VID_TYPE_CAPTURE,
-	.fops		= &meye_fops,
-	.release	= video_device_release,
-	.minor		= -1,
+static const struct v4l2_ioctl_ops meye_ioctl_ops = {
 	.vidioc_querycap	= vidioc_querycap,
 	.vidioc_enum_input	= vidioc_enum_input,
 	.vidioc_g_input		= vidioc_g_input,
@@ -1709,10 +1663,10 @@ static struct video_device meye_template = {
 	.vidioc_queryctrl	= vidioc_queryctrl,
 	.vidioc_s_ctrl		= vidioc_s_ctrl,
 	.vidioc_g_ctrl		= vidioc_g_ctrl,
-	.vidioc_enum_fmt_cap	= vidioc_enum_fmt_cap,
-	.vidioc_try_fmt_cap	= vidioc_try_fmt_cap,
-	.vidioc_g_fmt_cap	= vidioc_g_fmt_cap,
-	.vidioc_s_fmt_cap	= vidioc_s_fmt_cap,
+	.vidioc_enum_fmt_vid_cap = vidioc_enum_fmt_vid_cap,
+	.vidioc_try_fmt_vid_cap	= vidioc_try_fmt_vid_cap,
+	.vidioc_g_fmt_vid_cap	= vidioc_g_fmt_vid_cap,
+	.vidioc_s_fmt_vid_cap	= vidioc_s_fmt_vid_cap,
 	.vidioc_reqbufs		= vidioc_reqbufs,
 	.vidioc_querybuf	= vidioc_querybuf,
 	.vidioc_qbuf		= vidioc_qbuf,
@@ -1720,6 +1674,14 @@ static struct video_device meye_template = {
 	.vidioc_streamon	= vidioc_streamon,
 	.vidioc_streamoff	= vidioc_streamoff,
 	.vidioc_default		= vidioc_default,
+};
+
+static struct video_device meye_template = {
+	.name		= "meye",
+	.fops		= &meye_fops,
+	.ioctl_ops 	= &meye_ioctl_ops,
+	.release	= video_device_release,
+	.minor		= -1,
 };
 
 #ifdef CONFIG_PM
@@ -1769,6 +1731,7 @@ static int __devinit meye_probe(struct pci_dev *pcidev,
 		goto outnotdev;
 	}
 
+	ret = -ENOMEM;
 	meye.mchip_dev = pcidev;
 	meye.video_dev = video_device_alloc();
 	if (!meye.video_dev) {
@@ -1776,7 +1739,6 @@ static int __devinit meye_probe(struct pci_dev *pcidev,
 		goto outnotdev;
 	}
 
-	ret = -ENOMEM;
 	meye.grab_temp = vmalloc(MCHIP_NB_PAGES_MJPEG * PAGE_SIZE);
 	if (!meye.grab_temp) {
 		printk(KERN_ERR "meye: grab buffer allocation failed\n");
@@ -1799,8 +1761,9 @@ static int __devinit meye_probe(struct pci_dev *pcidev,
 	}
 
 	memcpy(meye.video_dev, &meye_template, sizeof(meye_template));
-	meye.video_dev->dev = &meye.mchip_dev->dev;
+	meye.video_dev->parent = &meye.mchip_dev->dev;
 
+	ret = -EIO;
 	if ((ret = sony_pic_camera_command(SONY_PIC_COMMAND_SETCAMERA, 1))) {
 		printk(KERN_ERR "meye: unable to power on the camera\n");
 		printk(KERN_ERR "meye: did you enable the camera in "
@@ -1808,7 +1771,6 @@ static int __devinit meye_probe(struct pci_dev *pcidev,
 		goto outsonypienable;
 	}
 
-	ret = -EIO;
 	if ((ret = pci_enable_device(meye.mchip_dev))) {
 		printk(KERN_ERR "meye: pci_enable_device failed\n");
 		goto outenabledev;
@@ -1954,8 +1916,7 @@ static void __devexit meye_remove(struct pci_dev *pcidev)
 }
 
 static struct pci_device_id meye_pci_tbl[] = {
-	{ PCI_VENDOR_ID_KAWASAKI, PCI_DEVICE_ID_MCHIP_KL5A72002,
-	  PCI_ANY_ID, PCI_ANY_ID, 0, 0, 0 },
+	{ PCI_VDEVICE(KAWASAKI, PCI_DEVICE_ID_MCHIP_KL5A72002), 0 },
 	{ }
 };
 

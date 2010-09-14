@@ -41,7 +41,7 @@ void tcf_hash_destroy(struct tcf_common *p, struct tcf_hashinfo *hinfo)
 			return;
 		}
 	}
-	BUG_TRAP(0);
+	WARN_ON(1);
 }
 EXPORT_SYMBOL(tcf_hash_destroy);
 
@@ -205,22 +205,23 @@ struct tcf_common *tcf_hash_check(u32 index, struct tc_action *a, int bind,
 {
 	struct tcf_common *p = NULL;
 	if (index && (p = tcf_hash_lookup(index, hinfo)) != NULL) {
-		if (bind) {
+		if (bind)
 			p->tcfc_bindcnt++;
-			p->tcfc_refcnt++;
-		}
+		p->tcfc_refcnt++;
 		a->priv = p;
 	}
 	return p;
 }
 EXPORT_SYMBOL(tcf_hash_check);
 
-struct tcf_common *tcf_hash_create(u32 index, struct nlattr *est, struct tc_action *a, int size, int bind, u32 *idx_gen, struct tcf_hashinfo *hinfo)
+struct tcf_common *tcf_hash_create(u32 index, struct nlattr *est,
+				   struct tc_action *a, int size, int bind,
+				   u32 *idx_gen, struct tcf_hashinfo *hinfo)
 {
 	struct tcf_common *p = kzalloc(size, GFP_KERNEL);
 
 	if (unlikely(!p))
-		return p;
+		return ERR_PTR(-ENOMEM);
 	p->tcfc_refcnt = 1;
 	if (bind)
 		p->tcfc_bindcnt = 1;
@@ -229,9 +230,15 @@ struct tcf_common *tcf_hash_create(u32 index, struct nlattr *est, struct tc_acti
 	p->tcfc_index = index ? index : tcf_hash_new_index(idx_gen, hinfo);
 	p->tcfc_tm.install = jiffies;
 	p->tcfc_tm.lastuse = jiffies;
-	if (est)
-		gen_new_estimator(&p->tcfc_bstats, &p->tcfc_rate_est,
-				  &p->tcfc_lock, est);
+	if (est) {
+		int err = gen_new_estimator(&p->tcfc_bstats, &p->tcfc_rate_est,
+					    &p->tcfc_lock, est);
+		if (err) {
+			kfree(p);
+			return ERR_PTR(err);
+		}
+	}
+
 	a->priv = (void *) p;
 	return p;
 }
@@ -495,7 +502,7 @@ struct tc_action *tcf_action_init_1(struct nlattr *nla, struct nlattr *est,
 
 	a_o = tc_lookup_action_n(act_name);
 	if (a_o == NULL) {
-#ifdef CONFIG_KMOD
+#ifdef CONFIG_MODULES
 		rtnl_unlock();
 		request_module("act_%s", act_name);
 		rtnl_lock();
@@ -752,7 +759,7 @@ static int tca_action_flush(struct nlattr *nla, struct nlmsghdr *n, u32 pid)
 	struct nlattr *tb[TCA_ACT_MAX+1];
 	struct nlattr *kind;
 	struct tc_action *a = create_a(0);
-	int err = -EINVAL;
+	int err = -ENOMEM;
 
 	if (a == NULL) {
 		printk("tca_action_flush: couldnt create tc_action\n");
@@ -763,7 +770,7 @@ static int tca_action_flush(struct nlattr *nla, struct nlmsghdr *n, u32 pid)
 	if (!skb) {
 		printk("tca_action_flush: failed skb alloc\n");
 		kfree(a);
-		return -ENOBUFS;
+		return err;
 	}
 
 	b = skb_tail_pointer(skb);
@@ -791,6 +798,8 @@ static int tca_action_flush(struct nlattr *nla, struct nlmsghdr *n, u32 pid)
 	err = a->ops->walk(skb, &dcb, RTM_DELACTION, a);
 	if (err < 0)
 		goto nla_put_failure;
+	if (err == 0)
+		goto noflush_out;
 
 	nla_nest_end(skb, nest);
 
@@ -808,6 +817,7 @@ nla_put_failure:
 nlmsg_failure:
 	module_put(a->ops->owner);
 err_out:
+noflush_out:
 	kfree_skb(skb);
 	kfree(a);
 	return err;
@@ -825,8 +835,10 @@ tca_action_gd(struct nlattr *nla, struct nlmsghdr *n, u32 pid, int event)
 		return ret;
 
 	if (event == RTM_DELACTION && n->nlmsg_flags&NLM_F_ROOT) {
-		if (tb[0] != NULL && tb[1] == NULL)
-			return tca_action_flush(tb[0], n, pid);
+		if (tb[1] != NULL)
+			return tca_action_flush(tb[1], n, pid);
+		else
+			return -EINVAL;
 	}
 
 	for (i = 1; i <= TCA_ACT_MAX_PRIO && tb[i]; i++) {
@@ -999,7 +1011,7 @@ replay:
 }
 
 static struct nlattr *
-find_dump_kind(struct nlmsghdr *n)
+find_dump_kind(const struct nlmsghdr *n)
 {
 	struct nlattr *tb1, *tb2[TCA_ACT_MAX+1];
 	struct nlattr *tb[TCA_ACT_MAX_PRIO + 1];

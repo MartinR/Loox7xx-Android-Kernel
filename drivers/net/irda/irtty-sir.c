@@ -31,7 +31,6 @@
 #include <linux/tty.h>
 #include <linux/init.h>
 #include <asm/uaccess.h>
-#include <linux/smp_lock.h>
 #include <linux/delay.h>
 #include <linux/mutex.h>
 
@@ -191,7 +190,7 @@ static int irtty_do_write(struct sir_dev *dev, const unsigned char *ptr, size_t 
 	tty = priv->tty;
 	if (!tty->ops->write)
 		return 0;
-	tty->flags |= (1 << TTY_DO_WRITE_WAKEUP);
+	set_bit(TTY_DO_WRITE_WAKEUP, &tty->flags);
 	writelen = tty_write_room(tty);
 	if (writelen > len)
 		writelen = len;
@@ -231,7 +230,7 @@ static void irtty_receive_buf(struct tty_struct *tty, const unsigned char *cp,
 
 	dev = priv->dev;
 	if (!dev) {
-		IRDA_WARNING("%s(), not ready yet!\n", __FUNCTION__);
+		IRDA_WARNING("%s(), not ready yet!\n", __func__);
 		return;
 	}
 
@@ -263,8 +262,7 @@ static void irtty_write_wakeup(struct tty_struct *tty)
 	IRDA_ASSERT(priv != NULL, return;);
 	IRDA_ASSERT(priv->magic == IRTTY_MAGIC, return;);
 
-	tty->flags &= ~(1 << TTY_DO_WRITE_WAKEUP);
-
+	clear_bit(TTY_DO_WRITE_WAKEUP, &tty->flags);
 	if (priv->dev)
 		sirdev_write_complete(priv->dev);
 }
@@ -388,7 +386,7 @@ static int irtty_ioctl(struct tty_struct *tty, struct file *file, unsigned int c
 	IRDA_ASSERT(priv != NULL, return -ENODEV;);
 	IRDA_ASSERT(priv->magic == IRTTY_MAGIC, return -EBADR;);
 
-	IRDA_DEBUG(3, "%s(cmd=0x%X)\n", __FUNCTION__, cmd);
+	IRDA_DEBUG(3, "%s(cmd=0x%X)\n", __func__, cmd);
 
 	dev = priv->dev;
 	IRDA_ASSERT(dev != NULL, return -1;);
@@ -476,7 +474,7 @@ static int irtty_open(struct tty_struct *tty)
 
 	mutex_unlock(&irtty_mutex);
 
-	IRDA_DEBUG(0, "%s - %s: irda line discipline opened\n", __FUNCTION__, tty->name);
+	IRDA_DEBUG(0, "%s - %s: irda line discipline opened\n", __func__, tty->name);
 
 	return 0;
 
@@ -522,18 +520,18 @@ static void irtty_close(struct tty_struct *tty)
 
 	/* Stop tty */
 	irtty_stop_receiver(tty, TRUE);
-	tty->flags &= ~(1 << TTY_DO_WRITE_WAKEUP);
+	clear_bit(TTY_DO_WRITE_WAKEUP, &tty->flags);
 	if (tty->ops->stop)
 		tty->ops->stop(tty);
 
 	kfree(priv);
 
-	IRDA_DEBUG(0, "%s - %s: irda line discipline closed\n", __FUNCTION__, tty->name);
+	IRDA_DEBUG(0, "%s - %s: irda line discipline closed\n", __func__, tty->name);
 }
 
 /* ------------------------------------------------------- */
 
-static struct tty_ldisc irda_ldisc = {
+static struct tty_ldisc_ops irda_ldisc = {
 	.magic		= TTY_LDISC_MAGIC,
  	.name		= "irda",
 	.flags		= 0,
@@ -566,7 +564,7 @@ static void __exit irtty_sir_cleanup(void)
 
 	if ((err = tty_unregister_ldisc(N_IRDA))) {
 		IRDA_ERROR("%s(), can't unregister line discipline (err = %d)\n",
-			   __FUNCTION__, err);
+			   __func__, err);
 	}
 }
 

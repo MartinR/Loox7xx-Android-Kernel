@@ -63,7 +63,7 @@
 #include "vg468.h"
 #include "ricoh.h"
 
-#ifdef DEBUG
+#ifdef CONFIG_PCMCIA_DEBUG
 static const char version[] =
 "i82365.c 1.265 1999/11/10 18:36:21 (David Hinds)";
 
@@ -1053,8 +1053,8 @@ static int i365_set_io_map(u_short sock, struct pccard_io_map *io)
     u_char map, ioctl;
     
     debug(1, "SetIOMap(%d, %d, %#2.2x, %d ns, "
-	  "%#x-%#x)\n", sock, io->map, io->flags,
-	  io->speed, io->start, io->stop);
+	  "%#llx-%#llx)\n", sock, io->map, io->flags, io->speed,
+	  (unsigned long long)io->start, (unsigned long long)io->stop);
     map = io->map;
     if ((map > 1) || (io->start > 0xffff) || (io->stop > 0xffff) ||
 	(io->stop < io->start)) return -EINVAL;
@@ -1238,6 +1238,16 @@ static int pcic_init(struct pcmcia_socket *s)
 	return 0;
 }
 
+static int i82365_drv_pcmcia_suspend(struct platform_device *dev,
+				     pm_message_t state)
+{
+	return pcmcia_socket_dev_suspend(&dev->dev);
+}
+
+static int i82365_drv_pcmcia_resume(struct platform_device *dev)
+{
+	return pcmcia_socket_dev_resume(&dev->dev);
+}
 static struct pccard_operations pcic_operations = {
 	.init			= pcic_init,
 	.get_status		= pcic_get_status,
@@ -1248,11 +1258,13 @@ static struct pccard_operations pcic_operations = {
 
 /*====================================================================*/
 
-static struct device_driver i82365_driver = {
-	.name = "i82365",
-	.bus = &platform_bus_type,
-	.suspend = pcmcia_socket_dev_suspend,
-	.resume = pcmcia_socket_dev_resume,
+static struct platform_driver i82365_driver = {
+	.driver = {
+		.name = "i82365",
+		.owner		= THIS_MODULE,
+	},
+	.suspend 	= i82365_drv_pcmcia_suspend,
+	.resume 	= i82365_drv_pcmcia_resume,
 };
 
 static struct platform_device *i82365_device;
@@ -1261,9 +1273,9 @@ static int __init init_i82365(void)
 {
     int i, ret;
 
-    ret = driver_register(&i82365_driver);
+    ret = platform_driver_register(&i82365_driver);
     if (ret)
-	return ret;
+	goto err_out;
 
     i82365_device = platform_device_alloc("i82365", 0);
     if (i82365_device) {
@@ -1273,10 +1285,8 @@ static int __init init_i82365(void)
     } else
 	    ret = -ENOMEM;
 
-    if (ret) {
-	driver_unregister(&i82365_driver);
-	return ret;
-    }
+    if (ret)
+	goto err_driver_unregister;
 
     printk(KERN_INFO "Intel ISA PCIC probe: ");
     sockets = 0;
@@ -1285,16 +1295,17 @@ static int __init init_i82365(void)
 
     if (sockets == 0) {
 	printk("not found.\n");
-	platform_device_unregister(i82365_device);
-	release_region(i365_base, 2);
-	driver_unregister(&i82365_driver);
-	return -ENODEV;
+	ret = -ENODEV;
+	goto err_dev_unregister;
     }
 
     /* Set up interrupt handler(s) */
     if (grab_irq != 0)
-	request_irq(cs_irq, pcic_interrupt, 0, "i82365", pcic_interrupt);
-    
+	ret = request_irq(cs_irq, pcic_interrupt, 0, "i82365", pcic_interrupt);
+
+    if (ret)
+	goto err_socket_release;
+
     /* register sockets with the pcmcia core */
     for (i = 0; i < sockets; i++) {
 	    socket[i].socket.dev.parent = &i82365_device->dev;
@@ -1324,7 +1335,23 @@ static int __init init_i82365(void)
     }
     
     return 0;
-    
+err_socket_release:
+    for (i = 0; i < sockets; i++) {
+	/* Turn off all interrupt sources! */
+	i365_set(i, I365_CSCINT, 0);
+	release_region(socket[i].ioaddr, 2);
+    }
+err_dev_unregister:
+    platform_device_unregister(i82365_device);
+    release_region(i365_base, 2);
+#ifdef CONFIG_PNP
+    if (i82365_pnpdev)
+	pnp_disable_dev(i82365_pnpdev);
+#endif
+err_driver_unregister:
+    platform_driver_unregister(&i82365_driver);
+err_out:
+    return ret;
 } /* init_i82365 */
 
 static void __exit exit_i82365(void)
@@ -1350,7 +1377,7 @@ static void __exit exit_i82365(void)
     if (i82365_pnpdev)
     		pnp_disable_dev(i82365_pnpdev);
 #endif
-    driver_unregister(&i82365_driver);
+    platform_driver_unregister(&i82365_driver);
 } /* exit_i82365 */
 
 module_init(init_i82365);

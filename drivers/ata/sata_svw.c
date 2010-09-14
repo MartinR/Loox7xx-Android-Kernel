@@ -123,20 +123,22 @@ static int k2_sata_check_atapi_dma(struct ata_queued_cmd *qc)
 	}
 }
 
-static int k2_sata_scr_read(struct ata_port *ap, unsigned int sc_reg, u32 *val)
+static int k2_sata_scr_read(struct ata_link *link,
+			    unsigned int sc_reg, u32 *val)
 {
 	if (sc_reg > SCR_CONTROL)
 		return -EINVAL;
-	*val = readl(ap->ioaddr.scr_addr + (sc_reg * 4));
+	*val = readl(link->ap->ioaddr.scr_addr + (sc_reg * 4));
 	return 0;
 }
 
 
-static int k2_sata_scr_write(struct ata_port *ap, unsigned int sc_reg, u32 val)
+static int k2_sata_scr_write(struct ata_link *link,
+			     unsigned int sc_reg, u32 val)
 {
 	if (sc_reg > SCR_CONTROL)
 		return -EINVAL;
-	writel(val, ap->ioaddr.scr_addr + (sc_reg * 4));
+	writel(val, link->ap->ioaddr.scr_addr + (sc_reg * 4));
 	return 0;
 }
 
@@ -253,21 +255,29 @@ static void k2_bmdma_start_mmio(struct ata_queued_cmd *qc)
 	/* start host DMA transaction */
 	dmactl = readb(mmio + ATA_DMA_CMD);
 	writeb(dmactl | ATA_DMA_START, mmio + ATA_DMA_CMD);
-	/* There is a race condition in certain SATA controllers that can
-	   be seen when the r/w command is given to the controller before the
-	   host DMA is started. On a Read command, the controller would initiate
-	   the command to the drive even before it sees the DMA start. When there
-	   are very fast drives connected to the controller, or when the data request
-	   hits in the drive cache, there is the possibility that the drive returns a part
-	   or all of the requested data to the controller before the DMA start is issued.
-	   In this case, the controller would become confused as to what to do with the data.
-	   In the worst case when all the data is returned back to the controller, the
-	   controller could hang. In other cases it could return partial data returning
-	   in data corruption. This problem has been seen in PPC systems and can also appear
-	   on an system with very fast disks, where the SATA controller is sitting behind a
-	   number of bridges, and hence there is significant latency between the r/w command
-	   and the start command. */
-	/* issue r/w command if the access is to ATA*/
+	/* This works around possible data corruption.
+
+	   On certain SATA controllers that can be seen when the r/w
+	   command is given to the controller before the host DMA is
+	   started.
+
+	   On a Read command, the controller would initiate the
+	   command to the drive even before it sees the DMA
+	   start. When there are very fast drives connected to the
+	   controller, or when the data request hits in the drive
+	   cache, there is the possibility that the drive returns a
+	   part or all of the requested data to the controller before
+	   the DMA start is issued.  In this case, the controller
+	   would become confused as to what to do with the data.  In
+	   the worst case when all the data is returned back to the
+	   controller, the controller could hang. In other cases it
+	   could return partial data returning in data
+	   corruption. This problem has been seen in PPC systems and
+	   can also appear on an system with very fast disks, where
+	   the SATA controller is sitting behind a number of bridges,
+	   and hence there is significant latency between the r/w
+	   command and the start command. */
+	/* issue r/w command if the access is to ATA */
 	if (qc->tf.protocol == ATA_PROT_DMA)
 		ap->ops->sff_exec_command(ap, &qc->tf);
 }
@@ -351,8 +361,8 @@ static const struct ata_port_info k2_port_info[] = {
 	{
 		.flags		= ATA_FLAG_SATA | ATA_FLAG_NO_LEGACY |
 				  ATA_FLAG_MMIO | K2_FLAG_NO_ATAPI_DMA,
-		.pio_mask	= 0x1f,
-		.mwdma_mask	= 0x07,
+		.pio_mask	= ATA_PIO4,
+		.mwdma_mask	= ATA_MWDMA2,
 		.udma_mask	= ATA_UDMA6,
 		.port_ops	= &k2_sata_ops,
 	},
@@ -361,8 +371,8 @@ static const struct ata_port_info k2_port_info[] = {
 		.flags		= ATA_FLAG_SATA | ATA_FLAG_NO_LEGACY |
 				  ATA_FLAG_MMIO | K2_FLAG_NO_ATAPI_DMA |
 				  K2_FLAG_SATA_8_PORTS,
-		.pio_mask	= 0x1f,
-		.mwdma_mask	= 0x07,
+		.pio_mask	= ATA_PIO4,
+		.mwdma_mask	= ATA_MWDMA2,
 		.udma_mask	= ATA_UDMA6,
 		.port_ops	= &k2_sata_ops,
 	},
@@ -370,8 +380,8 @@ static const struct ata_port_info k2_port_info[] = {
 	{
 		.flags		= ATA_FLAG_SATA | ATA_FLAG_NO_LEGACY |
 				  ATA_FLAG_MMIO | K2_FLAG_BAR_POS_3,
-		.pio_mask	= 0x1f,
-		.mwdma_mask	= 0x07,
+		.pio_mask	= ATA_PIO4,
+		.mwdma_mask	= ATA_MWDMA2,
 		.udma_mask	= ATA_UDMA6,
 		.port_ops	= &k2_sata_ops,
 	},
@@ -379,8 +389,8 @@ static const struct ata_port_info k2_port_info[] = {
 	{
 		.flags		= ATA_FLAG_SATA | ATA_FLAG_NO_LEGACY |
 				  ATA_FLAG_MMIO,
-		.pio_mask	= 0x1f,
-		.mwdma_mask	= 0x07,
+		.pio_mask	= ATA_PIO4,
+		.mwdma_mask	= ATA_MWDMA2,
 		.udma_mask	= ATA_UDMA6,
 		.port_ops	= &k2_sata_ops,
 	},

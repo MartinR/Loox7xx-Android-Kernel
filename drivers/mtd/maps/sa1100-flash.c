@@ -1,9 +1,7 @@
 /*
  * Flash memory access on SA11x0 based devices
  *
- * (C) 2000 Nicolas Pitre <nico@cam.org>
- *
- * $Id: sa1100-flash.c,v 1.51 2005/11/07 11:14:28 gleixner Exp $
+ * (C) 2000 Nicolas Pitre <nico@fluxnic.net>
  */
 #include <linux/module.h>
 #include <linux/types.h>
@@ -14,14 +12,14 @@
 #include <linux/slab.h>
 #include <linux/platform_device.h>
 #include <linux/err.h>
+#include <linux/io.h>
 
 #include <linux/mtd/mtd.h>
 #include <linux/mtd/map.h>
 #include <linux/mtd/partitions.h>
 #include <linux/mtd/concat.h>
 
-#include <asm/hardware.h>
-#include <asm/io.h>
+#include <mach/hardware.h>
 #include <asm/sizes.h>
 #include <asm/mach/flash.h>
 
@@ -211,8 +209,8 @@ static int sa1100_probe_subdev(struct sa_subdev_info *subdev, struct resource *r
 	}
 	subdev->mtd->owner = THIS_MODULE;
 
-	printk(KERN_INFO "SA1100 flash: CFI device at 0x%08lx, %dMiB, "
-		"%d-bit\n", phys, subdev->mtd->size >> 20,
+	printk(KERN_INFO "SA1100 flash: CFI device at 0x%08lx, %uMiB, %d-bit\n",
+		phys, (unsigned)(subdev->mtd->size >> 20),
 		subdev->map.bankwidth * 8);
 
 	return 0;
@@ -353,7 +351,7 @@ sa1100_setup_mtd(struct platform_device *pdev, struct flash_platform_data *plat)
 
 static const char *part_probes[] = { "cmdlinepart", "RedBoot", NULL };
 
-static int __init sa1100_mtd_probe(struct platform_device *pdev)
+static int __devinit sa1100_mtd_probe(struct platform_device *pdev)
 {
 	struct flash_platform_data *plat = pdev->dev.platform_data;
 	struct mtd_partition *parts;
@@ -417,25 +415,6 @@ static int __exit sa1100_mtd_remove(struct platform_device *pdev)
 }
 
 #ifdef CONFIG_PM
-static int sa1100_mtd_suspend(struct platform_device *dev, pm_message_t state)
-{
-	struct sa_info *info = platform_get_drvdata(dev);
-	int ret = 0;
-
-	if (info)
-		ret = info->mtd->suspend(info->mtd);
-
-	return ret;
-}
-
-static int sa1100_mtd_resume(struct platform_device *dev)
-{
-	struct sa_info *info = platform_get_drvdata(dev);
-	if (info)
-		info->mtd->resume(info->mtd);
-	return 0;
-}
-
 static void sa1100_mtd_shutdown(struct platform_device *dev)
 {
 	struct sa_info *info = platform_get_drvdata(dev);
@@ -443,19 +422,15 @@ static void sa1100_mtd_shutdown(struct platform_device *dev)
 		info->mtd->resume(info->mtd);
 }
 #else
-#define sa1100_mtd_suspend NULL
-#define sa1100_mtd_resume  NULL
 #define sa1100_mtd_shutdown NULL
 #endif
 
 static struct platform_driver sa1100_mtd_driver = {
 	.probe		= sa1100_mtd_probe,
 	.remove		= __exit_p(sa1100_mtd_remove),
-	.suspend	= sa1100_mtd_suspend,
-	.resume		= sa1100_mtd_resume,
 	.shutdown	= sa1100_mtd_shutdown,
 	.driver		= {
-		.name	= "flash",
+		.name	= "sa1100-mtd",
 		.owner	= THIS_MODULE,
 	},
 };
@@ -476,4 +451,4 @@ module_exit(sa1100_mtd_exit);
 MODULE_AUTHOR("Nicolas Pitre");
 MODULE_DESCRIPTION("SA1100 CFI map driver");
 MODULE_LICENSE("GPL");
-MODULE_ALIAS("platform:flash");
+MODULE_ALIAS("platform:sa1100-mtd");

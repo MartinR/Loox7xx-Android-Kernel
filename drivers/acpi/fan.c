@@ -34,7 +34,8 @@
 #include <acpi/acpi_bus.h>
 #include <acpi/acpi_drivers.h>
 
-#define ACPI_FAN_COMPONENT		0x00200000
+#define PREFIX "ACPI: "
+
 #define ACPI_FAN_CLASS			"fan"
 #define ACPI_FAN_FILE_STATE		"state"
 
@@ -69,31 +70,35 @@ static struct acpi_driver acpi_fan_driver = {
 };
 
 /* thermal cooling device callbacks */
-static int fan_get_max_state(struct thermal_cooling_device *cdev, char *buf)
+static int fan_get_max_state(struct thermal_cooling_device *cdev, unsigned long
+			     *state)
 {
 	/* ACPI fan device only support two states: ON/OFF */
-	return sprintf(buf, "1\n");
+	*state = 1;
+	return 0;
 }
 
-static int fan_get_cur_state(struct thermal_cooling_device *cdev, char *buf)
+static int fan_get_cur_state(struct thermal_cooling_device *cdev, unsigned long
+			     *state)
 {
 	struct acpi_device *device = cdev->devdata;
-	int state;
 	int result;
+	int acpi_state;
 
 	if (!device)
 		return -EINVAL;
 
-	result = acpi_bus_get_power(device->handle, &state);
+	result = acpi_bus_get_power(device->handle, &acpi_state);
 	if (result)
 		return result;
 
-	return sprintf(buf, "%s\n", state == ACPI_STATE_D3 ? "0" :
-			 (state == ACPI_STATE_D0 ? "1" : "unknown"));
+	*state = (acpi_state == ACPI_STATE_D3 ? 0 :
+		 (acpi_state == ACPI_STATE_D0 ? 1 : -1));
+	return 0;
 }
 
 static int
-fan_set_cur_state(struct thermal_cooling_device *cdev, unsigned int state)
+fan_set_cur_state(struct thermal_cooling_device *cdev, unsigned long state)
 {
 	struct acpi_device *device = cdev->devdata;
 	int result;
@@ -148,7 +153,7 @@ acpi_fan_write_state(struct file *file, const char __user * buffer,
 	int result = 0;
 	struct seq_file *m = file->private_data;
 	struct acpi_device *device = m->private;
-	char state_string[12] = { '\0' };
+	char state_string[3] = { '\0' };
 
 	if (count > sizeof(state_string) - 1)
 		return -EINVAL;
@@ -157,6 +162,12 @@ acpi_fan_write_state(struct file *file, const char __user * buffer,
 		return -EFAULT;
 
 	state_string[count] = '\0';
+	if ((state_string[0] < '0') || (state_string[0] > '3'))
+		return -EINVAL;
+	if (state_string[1] == '\n')
+		state_string[1] = '\0';
+	if (state_string[1] != '\0')
+		return -EINVAL;
 
 	result = acpi_bus_set_power(device->handle,
 				    simple_strtoul(state_string, NULL, 0));
@@ -188,7 +199,6 @@ static int acpi_fan_add_fs(struct acpi_device *device)
 						     acpi_fan_dir);
 		if (!acpi_device_dir(device))
 			return -ENODEV;
-		acpi_device_dir(device)->owner = THIS_MODULE;
 	}
 
 	/* 'status' [R/W] */
@@ -257,22 +267,22 @@ static int acpi_fan_add(struct acpi_device *device)
 		goto end;
 	}
 
-	printk(KERN_INFO PREFIX
-		"%s is registered as cooling_device%d\n",
-		device->dev.bus_id, cdev->id);
+	dev_info(&device->dev, "registered as cooling_device%d\n", cdev->id);
 
-	acpi_driver_data(device) = cdev;
+	device->driver_data = cdev;
 	result = sysfs_create_link(&device->dev.kobj,
 				   &cdev->device.kobj,
 				   "thermal_cooling");
 	if (result)
-		printk(KERN_ERR PREFIX "Create sysfs link\n");
+		dev_err(&device->dev, "Failed to create sysfs link "
+			"'thermal_cooling'\n");
 
 	result = sysfs_create_link(&cdev->device.kobj,
 				   &device->dev.kobj,
 				   "device");
 	if (result)
-		printk(KERN_ERR PREFIX "Create sysfs link\n");
+		dev_err(&device->dev, "Failed to create sysfs link "
+			"'device'\n");
 
 	result = acpi_fan_add_fs(device);
 	if (result)
@@ -321,8 +331,8 @@ static int acpi_fan_resume(struct acpi_device *device)
 
 	result = acpi_bus_get_power(device->handle, &power_state);
 	if (result) {
-		ACPI_DEBUG_PRINT((ACPI_DB_ERROR,
-				  "Error reading fan power state\n"));
+		printk(KERN_ERR PREFIX
+				  "Error reading fan power state\n");
 		return result;
 	}
 
@@ -342,7 +352,6 @@ static int __init acpi_fan_init(void)
 	acpi_fan_dir = proc_mkdir(ACPI_FAN_CLASS, acpi_root_dir);
 	if (!acpi_fan_dir)
 		return -ENODEV;
-	acpi_fan_dir->owner = THIS_MODULE;
 #endif
 
 	result = acpi_bus_register_driver(&acpi_fan_driver);

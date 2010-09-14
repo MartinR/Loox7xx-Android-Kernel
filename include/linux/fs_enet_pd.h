@@ -17,6 +17,7 @@
 #define FS_ENET_PD_H
 
 #include <linux/string.h>
+#include <linux/of_mdio.h>
 #include <asm/types.h>
 
 #define FS_ENET_NAME	"fs_enet"
@@ -103,10 +104,6 @@ struct fs_mii_bb_platform_info {
 	struct fs_mii_bit 	mdio_dir;
 	struct fs_mii_bit 	mdio_dat;
 	struct fs_mii_bit	mdc_dat;
-	int mdio_port;	/* port & bit for MDIO */
-	int mdio_bit;
-	int mdc_port;	/* port & bit for MDC  */
-	int mdc_bit;
 	int delay;	/* delay in us         */
 	int irq[32]; 	/* irqs per phy's */
 };
@@ -134,14 +131,7 @@ struct fs_platform_info {
 	
 	u32 device_flags;
 
-	int phy_addr;		/* the phy address (-1 no phy) */
-#ifdef CONFIG_PPC_CPM_NEW_BINDING
-	char bus_id[16];
-#else
-	const char*	bus_id;
-#endif
-	int phy_irq;		/* the phy irq (if it exists)  */
-
+	struct device_node *phy_node;
 	const struct fs_mii_bus_info *bus_info;
 
 	int rx_ring, tx_ring;	/* number of buffers on rx     */

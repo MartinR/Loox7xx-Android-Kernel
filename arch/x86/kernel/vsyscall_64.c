@@ -17,6 +17,9 @@
  *  want per guest time just set the kernel.vsyscall64 sysctl to 0.
  */
 
+/* Disable profiling for userspace code: */
+#define DISABLE_BRANCH_PROFILING
+
 #include <linux/time.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
@@ -42,7 +45,8 @@
 #include <asm/topology.h>
 #include <asm/vgtod.h>
 
-#define __vsyscall(nr) __attribute__ ((unused,__section__(".vsyscall_" #nr)))
+#define __vsyscall(nr) \
+		__attribute__ ((unused, __section__(".vsyscall_" #nr))) notrace
 #define __syscall_clobber "r11","cx","memory"
 
 /*
@@ -83,6 +87,7 @@ void update_vsyscall(struct timespec *wall_time, struct clocksource *clock)
 	vsyscall_gtod_data.wall_time_sec = wall_time->tv_sec;
 	vsyscall_gtod_data.wall_time_nsec = wall_time->tv_nsec;
 	vsyscall_gtod_data.wall_to_monotonic = wall_to_monotonic;
+	vsyscall_gtod_data.wall_time_coarse = __current_kernel_time();
 	write_sequnlock_irqrestore(&vsyscall_gtod_data.lock, flags);
 }
 
@@ -127,6 +132,7 @@ static __always_inline void do_vgettimeofday(struct timeval * tv)
 			gettimeofday(tv,NULL);
 			return;
 		}
+
 		now = vread();
 		base = __vsyscall_gtod_data.clock.cycle_last;
 		mask = __vsyscall_gtod_data.clock.mask;
@@ -222,19 +228,11 @@ static long __vsyscall(3) venosys_1(void)
 }
 
 #ifdef CONFIG_SYSCTL
-
-static int
-vsyscall_sysctl_change(ctl_table *ctl, int write, struct file * filp,
-		       void __user *buffer, size_t *lenp, loff_t *ppos)
-{
-	return proc_dointvec(ctl, write, filp, buffer, lenp, ppos);
-}
-
 static ctl_table kernel_table2[] = {
 	{ .procname = "vsyscall64",
 	  .data = &vsyscall_gtod_data.sysctl_enabled, .maxlen = sizeof(int),
 	  .mode = 0644,
-	  .proc_handler = vsyscall_sysctl_change },
+	  .proc_handler = proc_dointvec },
 	{}
 };
 
@@ -249,7 +247,7 @@ static ctl_table kernel_root_table2[] = {
    doesn't violate that. We'll find out if it does. */
 static void __cpuinit vsyscall_set_cpu(int cpu)
 {
-	unsigned long *d;
+	unsigned long d;
 	unsigned long node = 0;
 #ifdef CONFIG_NUMA
 	node = cpu_to_node(cpu);
@@ -260,11 +258,11 @@ static void __cpuinit vsyscall_set_cpu(int cpu)
 	/* Store cpu number in limit so that it can be loaded quickly
 	   in user space in vgetcpu.
 	   12 bits for the CPU and 8 bits for the node. */
-	d = (unsigned long *)(get_cpu_gdt_table(cpu) + GDT_ENTRY_PER_CPU);
-	*d = 0x0f40000000000ULL;
-	*d |= cpu;
-	*d |= (node & 0xf) << 12;
-	*d |= (node >> 4) << 48;
+	d = 0x0f40000000000ULL;
+	d |= cpu;
+	d |= (node & 0xf) << 12;
+	d |= (node >> 4) << 48;
+	write_gdt_entry(get_cpu_gdt_table(cpu), GDT_ENTRY_PER_CPU, &d, DESCTYPE_S);
 }
 
 static void __cpuinit cpu_vsyscall_init(void *arg)
@@ -278,7 +276,7 @@ cpu_vsyscall_notifier(struct notifier_block *n, unsigned long action, void *arg)
 {
 	long cpu = (long)arg;
 	if (action == CPU_ONLINE || action == CPU_ONLINE_FROZEN)
-		smp_call_function_single(cpu, cpu_vsyscall_init, NULL, 0, 1);
+		smp_call_function_single(cpu, cpu_vsyscall_init, NULL, 1);
 	return NOTIFY_DONE;
 }
 
@@ -301,7 +299,7 @@ static int __init vsyscall_init(void)
 #ifdef CONFIG_SYSCTL
 	register_sysctl_table(kernel_root_table2);
 #endif
-	on_each_cpu(cpu_vsyscall_init, NULL, 0, 1);
+	on_each_cpu(cpu_vsyscall_init, NULL, 1);
 	hotcpu_notifier(cpu_vsyscall_notifier, 0);
 	return 0;
 }

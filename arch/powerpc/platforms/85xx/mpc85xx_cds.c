@@ -26,6 +26,7 @@
 #include <linux/module.h>
 #include <linux/interrupt.h>
 #include <linux/fsl_devices.h>
+#include <linux/of_platform.h>
 
 #include <asm/system.h>
 #include <asm/pgtable.h>
@@ -178,7 +179,6 @@ static irqreturn_t mpc85xx_8259_cascade_action(int irq, void *dev_id)
 static struct irqaction mpc85xxcds_8259_irqaction = {
 	.handler = mpc85xx_8259_cascade_action,
 	.flags = IRQF_SHARED,
-	.mask = CPU_MASK_NONE,
 	.name = "8259 cascade",
 };
 #endif /* PPC_I8259 */
@@ -306,7 +306,6 @@ static void __init mpc85xx_cds_setup_arch(void)
 static void mpc85xx_cds_show_cpuinfo(struct seq_file *m)
 {
 	uint pvid, svid, phid1;
-	uint memsize = total_memory;
 
 	pvid = mfspr(SPRN_PVR);
 	svid = mfspr(SPRN_SVR);
@@ -319,9 +318,6 @@ static void mpc85xx_cds_show_cpuinfo(struct seq_file *m)
 	/* Display cpu Pll setting */
 	phid1 = mfspr(SPRN_HID1);
 	seq_printf(m, "PLL setting\t: 0x%x\n", ((phid1 >> 24) & 0x3f));
-
-	/* Display the amount of memory */
-	seq_printf(m, "Memory\t\t: %d MB\n", memsize / (1024 * 1024));
 }
 
 
@@ -334,6 +330,20 @@ static int __init mpc85xx_cds_probe(void)
 
         return of_flat_dt_is_compatible(root, "MPC85xxCDS");
 }
+
+static struct of_device_id __initdata of_bus_ids[] = {
+	{ .type = "soc", },
+	{ .compatible = "soc", },
+	{ .compatible = "simple-bus", },
+	{ .compatible = "gianfar", },
+	{},
+};
+
+static int __init declare_of_platform_devices(void)
+{
+	return of_platform_bus_probe(NULL, of_bus_ids, NULL);
+}
+machine_device_initcall(mpc85xx_cds, declare_of_platform_devices);
 
 define_machine(mpc85xx_cds) {
 	.name		= "MPC85xx CDS",

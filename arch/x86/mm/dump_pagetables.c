@@ -42,7 +42,7 @@ static struct addr_marker address_markers[] = {
 	{ 0, "User Space" },
 #ifdef CONFIG_X86_64
 	{ 0x8000000000000000UL, "Kernel Space" },
-	{ 0xffff810000000000UL, "Low Kernel Mapping" },
+	{ PAGE_OFFSET,		"Low Kernel Mapping" },
 	{ VMALLOC_START,        "vmalloc() Area" },
 	{ VMEMMAP_START,        "Vmemmap" },
 	{ __START_KERNEL_map,   "High Kernel Mapping" },
@@ -148,8 +148,8 @@ static void note_page(struct seq_file *m, struct pg_state *st,
 	 * we have now. "break" is either changing perms, levels or
 	 * address space marker.
 	 */
-	prot = pgprot_val(new_prot) & ~(PTE_MASK);
-	cur = pgprot_val(st->current_prot) & ~(PTE_MASK);
+	prot = pgprot_val(new_prot) & PTE_FLAGS_MASK;
+	cur = pgprot_val(st->current_prot) & PTE_FLAGS_MASK;
 
 	if (!st->level) {
 		/* First entry */
@@ -161,13 +161,14 @@ static void note_page(struct seq_file *m, struct pg_state *st,
 		   st->current_address >= st->marker[1].start_address) {
 		const char *unit = units;
 		unsigned long delta;
+		int width = sizeof(unsigned long) * 2;
 
 		/*
 		 * Now print the actual finished series
 		 */
-		seq_printf(m, "0x%p-0x%p   ",
-			   (void *)st->start_address,
-			   (void *)st->current_address);
+		seq_printf(m, "0x%0*lx-0x%0*lx   ",
+			   width, st->start_address,
+			   width, st->current_address);
 
 		delta = (st->current_address - st->start_address) >> 10;
 		while (!(delta & 1023) && unit[1]) {
@@ -221,7 +222,7 @@ static void walk_pmd_level(struct seq_file *m, struct pg_state *st, pud_t addr,
 	for (i = 0; i < PTRS_PER_PMD; i++) {
 		st->current_address = normalize_addr(P + i * PMD_LEVEL_MULT);
 		if (!pmd_none(*start)) {
-			pgprotval_t prot = pmd_val(*start) & ~PTE_MASK;
+			pgprotval_t prot = pmd_val(*start) & PTE_FLAGS_MASK;
 
 			if (pmd_large(*start) || !pmd_present(*start))
 				note_page(m, st, __pgprot(prot), 3);
@@ -253,7 +254,7 @@ static void walk_pud_level(struct seq_file *m, struct pg_state *st, pgd_t addr,
 	for (i = 0; i < PTRS_PER_PUD; i++) {
 		st->current_address = normalize_addr(P + i * PUD_LEVEL_MULT);
 		if (!pud_none(*start)) {
-			pgprotval_t prot = pud_val(*start) & ~PTE_MASK;
+			pgprotval_t prot = pud_val(*start) & PTE_FLAGS_MASK;
 
 			if (pud_large(*start) || !pud_present(*start))
 				note_page(m, st, __pgprot(prot), 2);
@@ -288,7 +289,7 @@ static void walk_pgd_level(struct seq_file *m)
 	for (i = 0; i < PTRS_PER_PGD; i++) {
 		st.current_address = normalize_addr(i * PGD_LEVEL_MULT);
 		if (!pgd_none(*start)) {
-			pgprotval_t prot = pgd_val(*start) & ~PTE_MASK;
+			pgprotval_t prot = pgd_val(*start) & PTE_FLAGS_MASK;
 
 			if (pgd_large(*start) || !pgd_present(*start))
 				note_page(m, &st, __pgprot(prot), 1);

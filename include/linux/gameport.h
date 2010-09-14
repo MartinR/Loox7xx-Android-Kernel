@@ -11,6 +11,7 @@
 
 #ifdef __KERNEL__
 #include <asm/io.h>
+#include <linux/types.h>
 #include <linux/list.h>
 #include <linux/mutex.h>
 #include <linux/device.h>
@@ -62,13 +63,12 @@ struct gameport_driver {
 
 	struct device_driver driver;
 
-	unsigned int ignore;
+	bool ignore;
 };
 #define to_gameport_driver(d)	container_of(d, struct gameport_driver, driver)
 
 int gameport_open(struct gameport *gameport, struct gameport_driver *drv, int mode);
 void gameport_close(struct gameport *gameport);
-void gameport_rescan(struct gameport *gameport);
 
 #if defined(CONFIG_GAMEPORT) || (defined(MODULE) && defined(CONFIG_GAMEPORT_MODULE))
 
@@ -147,10 +147,11 @@ static inline void gameport_unpin_driver(struct gameport *gameport)
 	mutex_unlock(&gameport->drv_mutex);
 }
 
-void __gameport_register_driver(struct gameport_driver *drv, struct module *owner);
-static inline void gameport_register_driver(struct gameport_driver *drv)
+int __gameport_register_driver(struct gameport_driver *drv,
+				struct module *owner, const char *mod_name);
+static inline int __must_check gameport_register_driver(struct gameport_driver *drv)
 {
-	__gameport_register_driver(drv, THIS_MODULE);
+	return __gameport_register_driver(drv, THIS_MODULE, KBUILD_MODNAME);
 }
 
 void gameport_unregister_driver(struct gameport_driver *drv);

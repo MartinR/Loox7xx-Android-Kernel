@@ -3,7 +3,7 @@
  *      For use with LSI PCI chip/adapter(s)
  *      running LSI Fusion MPT (Message Passing Technology) firmware.
  *
- *  Copyright (c) 1999-2007 LSI Corporation
+ *  Copyright (c) 1999-2008 LSI Corporation
  *  (mailto:DL-MPTFusionLinux@lsi.com)
  *
  */
@@ -58,6 +58,7 @@
 #define MPT_DEBUG_FC			0x00080000
 #define MPT_DEBUG_SAS			0x00100000
 #define MPT_DEBUG_SAS_WIDE		0x00200000
+#define MPT_DEBUG_36GB_MEM              0x00400000
 
 /*
  * CONFIG_FUSION_LOGGING - enabled in Kconfig
@@ -135,6 +136,8 @@
 #define dsaswideprintk(IOC, CMD)		\
 	MPT_CHECK_LOGGING(IOC, CMD, MPT_DEBUG_SAS_WIDE)
 
+#define d36memprintk(IOC, CMD)		\
+	MPT_CHECK_LOGGING(IOC, CMD, MPT_DEBUG_36GB_MEM)
 
 
 /*

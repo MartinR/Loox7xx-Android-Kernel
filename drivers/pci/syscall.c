@@ -9,15 +9,12 @@
 
 #include <linux/errno.h>
 #include <linux/pci.h>
-#include <linux/smp_lock.h>
 #include <linux/syscalls.h>
 #include <asm/uaccess.h>
 #include "pci.h"
 
-asmlinkage long
-sys_pciconfig_read(unsigned long bus, unsigned long dfn,
-		   unsigned long off, unsigned long len,
-		   void __user *buf)
+SYSCALL_DEFINE5(pciconfig_read, unsigned long, bus, unsigned long, dfn,
+		unsigned long, off, unsigned long, len, void __user *, buf)
 {
 	struct pci_dev *dev;
 	u8 byte;
@@ -86,10 +83,8 @@ error:
 	return err;
 }
 
-asmlinkage long
-sys_pciconfig_write(unsigned long bus, unsigned long dfn,
-		    unsigned long off, unsigned long len,
-		    void __user *buf)
+SYSCALL_DEFINE5(pciconfig_write, unsigned long, bus, unsigned long, dfn,
+		unsigned long, off, unsigned long, len, void __user *, buf)
 {
 	struct pci_dev *dev;
 	u8 byte;

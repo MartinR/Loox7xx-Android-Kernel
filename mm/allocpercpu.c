@@ -5,6 +5,8 @@
  */
 #include <linux/mm.h>
 #include <linux/module.h>
+#include <linux/bootmem.h>
+#include <asm/sections.h>
 
 #ifndef cache_line_size
 #define cache_line_size()	L1_CACHE_BYTES
@@ -18,27 +20,28 @@
  * Depopulating per-cpu data for a cpu going offline would be a typical
  * use case. You need to register a cpu hotplug handler for that purpose.
  */
-void percpu_depopulate(void *__pdata, int cpu)
+static void percpu_depopulate(void *__pdata, int cpu)
 {
 	struct percpu_data *pdata = __percpu_disguise(__pdata);
 
 	kfree(pdata->ptrs[cpu]);
 	pdata->ptrs[cpu] = NULL;
 }
-EXPORT_SYMBOL_GPL(percpu_depopulate);
 
 /**
  * percpu_depopulate_mask - depopulate per-cpu data for some cpu's
  * @__pdata: per-cpu data to depopulate
  * @mask: depopulate per-cpu data for cpu's selected through mask bits
  */
-void __percpu_depopulate_mask(void *__pdata, cpumask_t *mask)
+static void __percpu_depopulate_mask(void *__pdata, const cpumask_t *mask)
 {
 	int cpu;
-	for_each_cpu_mask(cpu, *mask)
+	for_each_cpu_mask_nr(cpu, *mask)
 		percpu_depopulate(__pdata, cpu);
 }
-EXPORT_SYMBOL_GPL(__percpu_depopulate_mask);
+
+#define percpu_depopulate_mask(__pdata, mask) \
+	__percpu_depopulate_mask((__pdata), &(mask))
 
 /**
  * percpu_populate - populate per-cpu data for given cpu
@@ -51,7 +54,7 @@ EXPORT_SYMBOL_GPL(__percpu_depopulate_mask);
  * use case. You need to register a cpu hotplug handler for that purpose.
  * Per-cpu object is populated with zeroed buffer.
  */
-void *percpu_populate(void *__pdata, size_t size, gfp_t gfp, int cpu)
+static void *percpu_populate(void *__pdata, size_t size, gfp_t gfp, int cpu)
 {
 	struct percpu_data *pdata = __percpu_disguise(__pdata);
 	int node = cpu_to_node(cpu);
@@ -68,7 +71,6 @@ void *percpu_populate(void *__pdata, size_t size, gfp_t gfp, int cpu)
 		pdata->ptrs[cpu] = kzalloc(size, gfp);
 	return pdata->ptrs[cpu];
 }
-EXPORT_SYMBOL_GPL(percpu_populate);
 
 /**
  * percpu_populate_mask - populate per-cpu data for more cpu's
@@ -79,14 +81,14 @@ EXPORT_SYMBOL_GPL(percpu_populate);
  *
  * Per-cpu objects are populated with zeroed buffers.
  */
-int __percpu_populate_mask(void *__pdata, size_t size, gfp_t gfp,
-			   cpumask_t *mask)
+static int __percpu_populate_mask(void *__pdata, size_t size, gfp_t gfp,
+				  cpumask_t *mask)
 {
 	cpumask_t populated;
 	int cpu;
 
 	cpus_clear(populated);
-	for_each_cpu_mask(cpu, *mask)
+	for_each_cpu_mask_nr(cpu, *mask)
 		if (unlikely(!percpu_populate(__pdata, size, gfp, cpu))) {
 			__percpu_depopulate_mask(__pdata, &populated);
 			return -ENOMEM;
@@ -94,48 +96,82 @@ int __percpu_populate_mask(void *__pdata, size_t size, gfp_t gfp,
 			cpu_set(cpu, populated);
 	return 0;
 }
-EXPORT_SYMBOL_GPL(__percpu_populate_mask);
+
+#define percpu_populate_mask(__pdata, size, gfp, mask) \
+	__percpu_populate_mask((__pdata), (size), (gfp), &(mask))
 
 /**
- * percpu_alloc_mask - initial setup of per-cpu data
+ * alloc_percpu - initial setup of per-cpu data
  * @size: size of per-cpu object
- * @gfp: may sleep or not etc.
- * @mask: populate per-data for cpu's selected through mask bits
+ * @align: alignment
  *
- * Populating per-cpu data for all online cpu's would be a typical use case,
- * which is simplified by the percpu_alloc() wrapper.
- * Per-cpu objects are populated with zeroed buffers.
+ * Allocate dynamic percpu area.  Percpu objects are populated with
+ * zeroed buffers.
  */
-void *__percpu_alloc_mask(size_t size, gfp_t gfp, cpumask_t *mask)
+void *__alloc_percpu(size_t size, size_t align)
 {
 	/*
 	 * We allocate whole cache lines to avoid false sharing
 	 */
 	size_t sz = roundup(nr_cpu_ids * sizeof(void *), cache_line_size());
-	void *pdata = kzalloc(sz, gfp);
+	void *pdata = kzalloc(sz, GFP_KERNEL);
 	void *__pdata = __percpu_disguise(pdata);
+
+	/*
+	 * Can't easily make larger alignment work with kmalloc.  WARN
+	 * on it.  Larger alignment should only be used for module
+	 * percpu sections on SMP for which this path isn't used.
+	 */
+	WARN_ON_ONCE(align > SMP_CACHE_BYTES);
 
 	if (unlikely(!pdata))
 		return NULL;
-	if (likely(!__percpu_populate_mask(__pdata, size, gfp, mask)))
+	if (likely(!__percpu_populate_mask(__pdata, size, GFP_KERNEL,
+					   &cpu_possible_map)))
 		return __pdata;
 	kfree(pdata);
 	return NULL;
 }
-EXPORT_SYMBOL_GPL(__percpu_alloc_mask);
+EXPORT_SYMBOL_GPL(__alloc_percpu);
 
 /**
- * percpu_free - final cleanup of per-cpu data
+ * free_percpu - final cleanup of per-cpu data
  * @__pdata: object to clean up
  *
  * We simply clean up any per-cpu object left. No need for the client to
  * track and specify through a bis mask which per-cpu objects are to free.
  */
-void percpu_free(void *__pdata)
+void free_percpu(void *__pdata)
 {
 	if (unlikely(!__pdata))
 		return;
-	__percpu_depopulate_mask(__pdata, &cpu_possible_map);
+	__percpu_depopulate_mask(__pdata, cpu_possible_mask);
 	kfree(__percpu_disguise(__pdata));
 }
-EXPORT_SYMBOL_GPL(percpu_free);
+EXPORT_SYMBOL_GPL(free_percpu);
+
+/*
+ * Generic percpu area setup.
+ */
+#ifndef CONFIG_HAVE_SETUP_PER_CPU_AREA
+unsigned long __per_cpu_offset[NR_CPUS] __read_mostly;
+
+EXPORT_SYMBOL(__per_cpu_offset);
+
+void __init setup_per_cpu_areas(void)
+{
+	unsigned long size, i;
+	char *ptr;
+	unsigned long nr_possible_cpus = num_possible_cpus();
+
+	/* Copy section for each CPU (we discard the original) */
+	size = ALIGN(PERCPU_ENOUGH_ROOM, PAGE_SIZE);
+	ptr = alloc_bootmem_pages(size * nr_possible_cpus);
+
+	for_each_possible_cpu(i) {
+		__per_cpu_offset[i] = ptr - __per_cpu_start;
+		memcpy(ptr, __per_cpu_start, __per_cpu_end - __per_cpu_start);
+		ptr += size;
+	}
+}
+#endif /* CONFIG_HAVE_SETUP_PER_CPU_AREA */

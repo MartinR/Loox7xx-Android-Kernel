@@ -19,7 +19,9 @@
 #include <linux/ptrace.h>
 #include <linux/unistd.h>
 #include <linux/compiler.h>
+#include <linux/syscalls.h>
 #include <linux/uaccess.h>
+#include <linux/tracehook.h>
 
 #include <asm/abi.h>
 #include <asm/asm.h>
@@ -338,8 +340,8 @@ asmlinkage int sys_rt_sigsuspend(nabi_no_regargs struct pt_regs regs)
 }
 
 #ifdef CONFIG_TRAD_SIGNALS
-asmlinkage int sys_sigaction(int sig, const struct sigaction __user *act,
-	struct sigaction __user *oact)
+SYSCALL_DEFINE3(sigaction, int, sig, const struct sigaction __user *, act,
+	struct sigaction __user *, oact)
 {
 	struct k_sigaction new_ka, old_ka;
 	int ret;
@@ -699,4 +701,11 @@ asmlinkage void do_notify_resume(struct pt_regs *regs, void *unused,
 	/* deal with pending signal delivery */
 	if (thread_info_flags & (_TIF_SIGPENDING | _TIF_RESTORE_SIGMASK))
 		do_signal(regs);
+
+	if (thread_info_flags & _TIF_NOTIFY_RESUME) {
+		clear_thread_flag(TIF_NOTIFY_RESUME);
+		tracehook_notify_resume(regs);
+		if (current->replacement_session_keyring)
+			key_replace_session_keyring();
+	}
 }

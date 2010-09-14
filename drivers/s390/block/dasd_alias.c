@@ -5,6 +5,8 @@
  * Author(s): Stefan Weinhuber <wein@de.ibm.com>
  */
 
+#define KMSG_COMPONENT "dasd-eckd"
+
 #include <linux/list.h>
 #include <asm/ebcdic.h>
 #include "dasd_int.h"
@@ -91,7 +93,8 @@ static struct alias_pav_group *_find_group(struct alias_lcu *lcu,
 	else
 		search_unit_addr = uid->base_unit_addr;
 	list_for_each_entry(pos, &lcu->grouplist, group) {
-		if (pos->uid.base_unit_addr == search_unit_addr)
+		if (pos->uid.base_unit_addr == search_unit_addr &&
+		    !strncmp(pos->uid.vduit, uid->vduit, sizeof(uid->vduit)))
 			return pos;
 	};
 	return NULL;
@@ -332,6 +335,7 @@ static int _add_device_to_lcu(struct alias_lcu *lcu,
 			group->uid.base_unit_addr = uid->real_unit_addr;
 		else
 			group->uid.base_unit_addr = uid->base_unit_addr;
+		memcpy(group->uid.vduit, uid->vduit, sizeof(uid->vduit));
 		INIT_LIST_HEAD(&group->group);
 		INIT_LIST_HEAD(&group->baselist);
 		INIT_LIST_HEAD(&group->aliaslist);
@@ -375,8 +379,7 @@ static int read_unit_address_configuration(struct dasd_device *device,
 	int rc;
 	unsigned long flags;
 
-	cqr = dasd_kmalloc_request("ECKD",
-				   1 /* PSF */	+ 1 /* RSSD */ ,
+	cqr = dasd_kmalloc_request(DASD_ECKD_MAGIC, 1 /* PSF */	+ 1 /* RSSD */,
 				   (sizeof(struct dasd_psf_prssd_data)),
 				   device);
 	if (IS_ERR(cqr))
@@ -501,7 +504,7 @@ static void lcu_update_work(struct work_struct *work)
 	 */
 	spin_lock_irqsave(&lcu->lock, flags);
 	if (rc || (lcu->flags & NEED_UAC_UPDATE)) {
-		DEV_MESSAGE(KERN_WARNING, device, "could not update"
+		DBF_DEV_EVENT(DBF_WARNING, device, "could not update"
 			    " alias data in lcu (rc = %d), retry later", rc);
 		schedule_delayed_work(&lcu->ruac_data.dwork, 30*HZ);
 	} else {
@@ -644,14 +647,16 @@ static int reset_summary_unit_check(struct alias_lcu *lcu,
 {
 	struct dasd_ccw_req *cqr;
 	int rc = 0;
+	struct ccw1 *ccw;
 
 	cqr = lcu->rsu_cqr;
 	strncpy((char *) &cqr->magic, "ECKD", 4);
 	ASCEBC((char *) &cqr->magic, 4);
-	cqr->cpaddr->cmd_code = DASD_ECKD_CCW_RSCK;
-	cqr->cpaddr->flags = 0 ;
-	cqr->cpaddr->count = 16;
-	cqr->cpaddr->cda = (__u32)(addr_t) cqr->data;
+	ccw = cqr->cpaddr;
+	ccw->cmd_code = DASD_ECKD_CCW_RSCK;
+	ccw->flags = 0 ;
+	ccw->count = 16;
+	ccw->cda = (__u32)(addr_t) cqr->data;
 	((char *)cqr->data)[0] = reason;
 
 	clear_bit(DASD_CQR_FLAGS_USE_ERP, &cqr->flags);
@@ -853,16 +858,25 @@ void dasd_alias_handle_summary_unit_check(struct dasd_device *device,
 	struct alias_lcu *lcu;
 	char reason;
 	struct dasd_eckd_private *private;
+	char *sense;
 
 	private = (struct dasd_eckd_private *) device->private;
 
-	reason = irb->ecw[8];
-	DEV_MESSAGE(KERN_WARNING, device, "%s %x",
-		    "eckd handle summary unit check: reason", reason);
+	sense = dasd_get_sense(irb);
+	if (sense) {
+		reason = sense[8];
+		DBF_DEV_EVENT(DBF_NOTICE, device, "%s %x",
+			    "eckd handle summary unit check: reason", reason);
+	} else {
+		DBF_DEV_EVENT(DBF_WARNING, device, "%s",
+			    "eckd handle summary unit check:"
+			    " no reason code available");
+		return;
+	}
 
 	lcu = private->lcu;
 	if (!lcu) {
-		DEV_MESSAGE(KERN_WARNING, device, "%s",
+		DBF_DEV_EVENT(DBF_WARNING, device, "%s",
 			    "device not ready to handle summary"
 			    " unit check (no lcu structure)");
 		return;
@@ -875,7 +889,7 @@ void dasd_alias_handle_summary_unit_check(struct dasd_device *device,
 	 * the next interrupt on a different device
 	 */
 	if (list_empty(&device->alias_list)) {
-		DEV_MESSAGE(KERN_WARNING, device, "%s",
+		DBF_DEV_EVENT(DBF_WARNING, device, "%s",
 			    "device is in offline processing,"
 			    " don't do summary unit check handling");
 		spin_unlock(&lcu->lock);
@@ -883,7 +897,7 @@ void dasd_alias_handle_summary_unit_check(struct dasd_device *device,
 	}
 	if (lcu->suc_data.device) {
 		/* already scheduled or running */
-		DEV_MESSAGE(KERN_WARNING, device, "%s",
+		DBF_DEV_EVENT(DBF_WARNING, device, "%s",
 			    "previous instance of summary unit check worker"
 			    " still pending");
 		spin_unlock(&lcu->lock);

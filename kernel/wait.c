@@ -10,13 +10,14 @@
 #include <linux/wait.h>
 #include <linux/hash.h>
 
-void init_waitqueue_head(wait_queue_head_t *q)
+void __init_waitqueue_head(wait_queue_head_t *q, struct lock_class_key *key)
 {
 	spin_lock_init(&q->lock);
+	lockdep_set_class(&q->lock, key);
 	INIT_LIST_HEAD(&q->task_list);
 }
 
-EXPORT_SYMBOL(init_waitqueue_head);
+EXPORT_SYMBOL(__init_waitqueue_head);
 
 void add_wait_queue(wait_queue_head_t *q, wait_queue_t *wait)
 {
@@ -72,12 +73,7 @@ prepare_to_wait(wait_queue_head_t *q, wait_queue_t *wait, int state)
 	spin_lock_irqsave(&q->lock, flags);
 	if (list_empty(&wait->task_list))
 		__add_wait_queue(q, wait);
-	/*
-	 * don't alter the task state if this is just going to
-	 * queue an async wait queue callback
-	 */
-	if (is_sync_wait(wait))
-		set_current_state(state);
+	set_current_state(state);
 	spin_unlock_irqrestore(&q->lock, flags);
 }
 EXPORT_SYMBOL(prepare_to_wait);
@@ -91,16 +87,20 @@ prepare_to_wait_exclusive(wait_queue_head_t *q, wait_queue_t *wait, int state)
 	spin_lock_irqsave(&q->lock, flags);
 	if (list_empty(&wait->task_list))
 		__add_wait_queue_tail(q, wait);
-	/*
-	 * don't alter the task state if this is just going to
- 	 * queue an async wait queue callback
-	 */
-	if (is_sync_wait(wait))
-		set_current_state(state);
+	set_current_state(state);
 	spin_unlock_irqrestore(&q->lock, flags);
 }
 EXPORT_SYMBOL(prepare_to_wait_exclusive);
 
+/*
+ * finish_wait - clean up after waiting in a queue
+ * @q: waitqueue waited on
+ * @wait: wait descriptor
+ *
+ * Sets current thread back to running state and removes
+ * the wait descriptor from the given waitqueue if still
+ * queued.
+ */
 void finish_wait(wait_queue_head_t *q, wait_queue_t *wait)
 {
 	unsigned long flags;
@@ -126,6 +126,39 @@ void finish_wait(wait_queue_head_t *q, wait_queue_t *wait)
 	}
 }
 EXPORT_SYMBOL(finish_wait);
+
+/*
+ * abort_exclusive_wait - abort exclusive waiting in a queue
+ * @q: waitqueue waited on
+ * @wait: wait descriptor
+ * @state: runstate of the waiter to be woken
+ * @key: key to identify a wait bit queue or %NULL
+ *
+ * Sets current thread back to running state and removes
+ * the wait descriptor from the given waitqueue if still
+ * queued.
+ *
+ * Wakes up the next waiter if the caller is concurrently
+ * woken up through the queue.
+ *
+ * This prevents waiter starvation where an exclusive waiter
+ * aborts and is woken up concurrently and noone wakes up
+ * the next waiter.
+ */
+void abort_exclusive_wait(wait_queue_head_t *q, wait_queue_t *wait,
+			unsigned int mode, void *key)
+{
+	unsigned long flags;
+
+	__set_current_state(TASK_RUNNING);
+	spin_lock_irqsave(&q->lock, flags);
+	if (!list_empty(&wait->task_list))
+		list_del_init(&wait->task_list);
+	else if (waitqueue_active(q))
+		__wake_up_locked_key(q, mode, key);
+	spin_unlock_irqrestore(&q->lock, flags);
+}
+EXPORT_SYMBOL(abort_exclusive_wait);
 
 int autoremove_wake_function(wait_queue_t *wait, unsigned mode, int sync, void *key)
 {
@@ -187,17 +220,20 @@ int __sched
 __wait_on_bit_lock(wait_queue_head_t *wq, struct wait_bit_queue *q,
 			int (*action)(void *), unsigned mode)
 {
-	int ret = 0;
-
 	do {
+		int ret;
+
 		prepare_to_wait_exclusive(wq, &q->wait, mode);
-		if (test_bit(q->key.bit_nr, q->key.flags)) {
-			if ((ret = (*action)(q->key.flags)))
-				break;
-		}
+		if (!test_bit(q->key.bit_nr, q->key.flags))
+			continue;
+		ret = action(q->key.flags);
+		if (!ret)
+			continue;
+		abort_exclusive_wait(wq, &q->wait, mode, &q->key);
+		return ret;
 	} while (test_and_set_bit(q->key.bit_nr, q->key.flags));
 	finish_wait(wq, &q->wait);
-	return ret;
+	return 0;
 }
 EXPORT_SYMBOL(__wait_on_bit_lock);
 

@@ -219,18 +219,9 @@ static void esp_reset_esp(struct esp *esp)
 	/* Now reset the ESP chip */
 	scsi_esp_cmd(esp, ESP_CMD_RC);
 	scsi_esp_cmd(esp, ESP_CMD_NULL | ESP_CMD_DMA);
+	if (esp->rev == FAST)
+		esp_write8(ESP_CONFIG2_FENAB, ESP_CFG2);
 	scsi_esp_cmd(esp, ESP_CMD_NULL | ESP_CMD_DMA);
-
-	/* Reload the configuration registers */
-	esp_write8(esp->cfact, ESP_CFACT);
-
-	esp->prev_stp = 0;
-	esp_write8(esp->prev_stp, ESP_STP);
-
-	esp->prev_soff = 0;
-	esp_write8(esp->prev_soff, ESP_SOFF);
-
-	esp_write8(esp->neg_defp, ESP_TIMEO);
 
 	/* This is the only point at which it is reliable to read
 	 * the ID-code for a fast ESP chip variants.
@@ -315,6 +306,17 @@ static void esp_reset_esp(struct esp *esp)
 	default:
 		break;
 	}
+
+	/* Reload the configuration registers */
+	esp_write8(esp->cfact, ESP_CFACT);
+
+	esp->prev_stp = 0;
+	esp_write8(esp->prev_stp, ESP_STP);
+
+	esp->prev_soff = 0;
+	esp_write8(esp->prev_soff, ESP_SOFF);
+
+	esp_write8(esp->neg_defp, ESP_TIMEO);
 
 	/* Eat any bitrot in the chip */
 	esp_read8(ESP_INTRPT);
@@ -1451,7 +1453,7 @@ static void esp_msgin_sdtr(struct esp *esp, struct esp_target_data *tp)
 		offset = 0;
 
 	if (offset) {
-		int rounded_up, one_clock;
+		int one_clock;
 
 		if (period > esp->max_period) {
 			period = offset = 0;
@@ -1461,9 +1463,7 @@ static void esp_msgin_sdtr(struct esp *esp, struct esp_target_data *tp)
 			goto do_reject;
 
 		one_clock = esp->ccycle / 1000;
-		rounded_up = (period << 2);
-		rounded_up = (rounded_up + one_clock - 1) / one_clock;
-		stp = rounded_up;
+		stp = DIV_ROUND_UP(period << 2, one_clock);
 		if (stp && esp->rev >= FAS236) {
 			if (stp >= 50)
 				stp--;

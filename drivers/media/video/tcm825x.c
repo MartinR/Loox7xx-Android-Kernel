@@ -50,7 +50,7 @@ struct tcm825x_sensor {
 };
 
 /* list of image formats supported by TCM825X sensor */
-const static struct v4l2_fmtdesc tcm825x_formats[] = {
+static const struct v4l2_fmtdesc tcm825x_formats[] = {
 	{
 		.description = "YUYV (YUV 4:2:2), packed",
 		.pixelformat = V4L2_PIX_FMT_UYVY,
@@ -76,15 +76,15 @@ const static struct v4l2_fmtdesc tcm825x_formats[] = {
  * TCM825X register configuration for all combinations of pixel format and
  * image size
  */
-const static struct tcm825x_reg subqcif	=	{ 0x20, TCM825X_PICSIZ };
-const static struct tcm825x_reg qcif	=	{ 0x18, TCM825X_PICSIZ };
-const static struct tcm825x_reg cif	=	{ 0x14, TCM825X_PICSIZ };
-const static struct tcm825x_reg qqvga	=	{ 0x0c, TCM825X_PICSIZ };
-const static struct tcm825x_reg qvga	=	{ 0x04, TCM825X_PICSIZ };
-const static struct tcm825x_reg vga	=	{ 0x00, TCM825X_PICSIZ };
+static const struct tcm825x_reg subqcif	=	{ 0x20, TCM825X_PICSIZ };
+static const struct tcm825x_reg qcif	=	{ 0x18, TCM825X_PICSIZ };
+static const struct tcm825x_reg cif	=	{ 0x14, TCM825X_PICSIZ };
+static const struct tcm825x_reg qqvga	=	{ 0x0c, TCM825X_PICSIZ };
+static const struct tcm825x_reg qvga	=	{ 0x04, TCM825X_PICSIZ };
+static const struct tcm825x_reg vga	=	{ 0x00, TCM825X_PICSIZ };
 
-const static struct tcm825x_reg yuv422	=	{ 0x00, TCM825X_PICFMT };
-const static struct tcm825x_reg rgb565	=	{ 0x02, TCM825X_PICFMT };
+static const struct tcm825x_reg yuv422	=	{ 0x00, TCM825X_PICFMT };
+static const struct tcm825x_reg rgb565	=	{ 0x02, TCM825X_PICFMT };
 
 /* Our own specific controls */
 #define V4L2_CID_ALC				V4L2_CID_PRIVATE_BASE
@@ -248,10 +248,10 @@ static struct vcontrol {
 };
 
 
-const static struct tcm825x_reg *tcm825x_siz_reg[NUM_IMAGE_SIZES] =
+static const struct tcm825x_reg *tcm825x_siz_reg[NUM_IMAGE_SIZES] =
 { &subqcif, &qqvga, &qcif, &qvga, &cif, &vga };
 
-const static struct tcm825x_reg *tcm825x_fmt_reg[NUM_PIXEL_FORMATS] =
+static const struct tcm825x_reg *tcm825x_fmt_reg[NUM_PIXEL_FORMATS] =
 { &yuv422, &rgb565 };
 
 /*
@@ -523,6 +523,9 @@ static int ioctl_g_ctrl(struct v4l2_int_device *s,
 	if (val < 0)
 		return val;
 
+	if (vc->id == V4L2_CID_HFLIP || vc->id == V4L2_CID_VFLIP)
+		val ^= sensor->platform_data->is_upside_down();
+
 	vc->value = val;
 	return 0;
 }
@@ -555,6 +558,9 @@ static int ioctl_s_ctrl(struct v4l2_int_device *s,
 	lvc = find_vctrl(vc->id);
 	if (lvc == NULL)
 		return -EINVAL;
+
+	if (vc->id == V4L2_CID_HFLIP || vc->id == V4L2_CID_VFLIP)
+		val ^= sensor->platform_data->is_upside_down();
 
 	val = val << lvc->start_bit;
 	if (tcm825x_write_reg_mask(client, lvc->reg, val))
@@ -872,7 +878,7 @@ static int tcm825x_probe(struct i2c_client *client,
 	return rval;
 }
 
-static int __exit tcm825x_remove(struct i2c_client *client)
+static int tcm825x_remove(struct i2c_client *client)
 {
 	struct tcm825x_sensor *sensor = i2c_get_clientdata(client);
 
@@ -896,7 +902,7 @@ static struct i2c_driver tcm825x_i2c_driver = {
 		.name = TCM825X_NAME,
 	},
 	.probe	= tcm825x_probe,
-	.remove	= __exit_p(tcm825x_remove),
+	.remove	= tcm825x_remove,
 	.id_table = tcm825x_id,
 };
 

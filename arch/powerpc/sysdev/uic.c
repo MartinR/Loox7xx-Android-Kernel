@@ -258,11 +258,10 @@ static struct uic * __init uic_init_one(struct device_node *node)
 
 	BUG_ON(! of_device_is_compatible(node, "ibm,uic"));
 
-	uic = alloc_bootmem(sizeof(*uic));
+	uic = kzalloc(sizeof(*uic), GFP_KERNEL);
 	if (! uic)
 		return NULL; /* FIXME: panic? */
 
-	memset(uic, 0, sizeof(*uic));
 	spin_lock_init(&uic->lock);
 	indexp = of_get_property(node, "cell-index", &len);
 	if (!indexp || (len != sizeof(u32))) {
@@ -280,12 +279,10 @@ static struct uic * __init uic_init_one(struct device_node *node)
 	}
 	uic->dcrbase = *dcrreg;
 
-	uic->irqhost = irq_alloc_host(of_node_get(node), IRQ_HOST_MAP_LINEAR,
+	uic->irqhost = irq_alloc_host(node, IRQ_HOST_MAP_LINEAR,
 				      NR_UIC_INTS, &uic_host_ops, -1);
-	if (! uic->irqhost) {
-		of_node_put(node);
+	if (! uic->irqhost)
 		return NULL; /* FIXME: panic? */
-	}
 
 	uic->irqhost->host_data = uic;
 

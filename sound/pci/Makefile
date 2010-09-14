@@ -13,7 +13,7 @@ snd-bt87x-objs := bt87x.o
 snd-cmipci-objs := cmipci.o
 snd-cs4281-objs := cs4281.o
 snd-cs5530-objs := cs5530.o
-snd-ens1370-objs := ens1370.o
+snd-ens1370-objs := ens1370.o ak4531_codec.o
 snd-ens1371-objs := ens1371.o
 snd-es1938-objs := es1938.o
 snd-es1968-objs := es1968.o
@@ -59,9 +59,11 @@ obj-$(CONFIG_SND) += \
 	ali5451/ \
 	au88x0/ \
 	aw2/ \
+	ctxfi/ \
 	ca0106/ \
 	cs46xx/ \
 	cs5535audio/ \
+	lx6464es/ \
 	echoaudio/ \
 	emu10k1/ \
 	hda/ \
