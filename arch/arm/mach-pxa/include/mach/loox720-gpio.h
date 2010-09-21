@@ -28,8 +28,6 @@
 #ifndef _LOOX720_GPIO_H_
 #define _LOOX720_GPIO_H_
 
-#include <asm/arch/pxa-regs.h>
-
 /*
  * GPIOs operating as Application-Specific GPIO
  */

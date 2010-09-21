@@ -19,8 +19,8 @@
 #include <asm/mach-types.h>
 
 #include <linux/gpio_keys.h>
-#include <asm/arch/pxa27x_keypad.h>
-#include <asm/arch/loox720-gpio.h>
+#include <mach/pxa27x_keypad.h>
+#include <mach/loox720-gpio.h>
 
 /****************************************************************
  * Keyboard

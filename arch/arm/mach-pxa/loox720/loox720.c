@@ -24,29 +24,29 @@
 #include <linux/gpio_keys.h>
 
 #include <asm/mach-types.h>
-#include <asm/hardware.h>
+#include <mach/hardware.h>
 #include <asm/setup.h>
 
 #include <asm/mach/arch.h>
 #include <asm/mach/map.h>
 
-#include <asm/arch/pxa-regs.h>
-//#include <asm/arch/ssp.h>
-#include <asm/arch/regs-ssp.h>
-#include <asm/arch/pxa2xx-regs.h>
-#include <asm/arch/pxa2xx_spi.h>
-#include <asm/arch/udc.h>
-#include <asm/arch/audio.h>
-#include <asm/arch/ohci.h>
-#include <asm/arch/irda.h>
-#include <asm/arch/mmc.h>
-#include <asm/arch/irqs.h>
-#include <asm/arch/loox720.h>
-#include <asm/arch/loox720-gpio.h>
-#include <asm/arch/loox720-cpld.h>
-#include <asm/arch/mfp-pxa27x.h>
-#include <asm/arch/i2c.h>
-#include <asm/arch/sharpsl.h>
+#include <mach/pxa27x.h>
+//#include <mach/ssp.h>
+#include <mach/regs-ssp.h>
+#include <mach/pxa2xx-regs.h>
+#include <mach/pxa2xx_spi.h>
+#include <mach/udc.h>
+#include <mach/audio.h>
+#include <mach/ohci.h>
+#include <mach/irda.h>
+#include <mach/mmc.h>
+#include <mach/irqs.h>
+#include <mach/loox720.h>
+#include <mach/loox720-gpio.h>
+#include <mach/loox720-cpld.h>
+#include <mach/mfp-pxa27x.h>
+#include <plat/i2c.h>
+#include <mach/sharpsl.h>
 #include <linux/spi/spi.h>
 
 #include "../generic.h"
@@ -381,22 +381,10 @@ static struct pxa2xx_udc_mach_info loox720_udc_info __initdata = {
  * USB Host
  */
 
-static int loox720_ohci_init(struct device *dev)
-{
-	/* missing GPIO setup here */
-
-	/* no idea what this does, got the values from haret
-	UHCHR = (UHCHR | UHCHR_SSEP2 | UHCHR_PCPL | UHCHR_CGR) &
-			    ~(UHCHR_SSEP1 | UHCHR_SSEP3 | UHCHR_SSE);
-		we don't know yet how to init.. */
-	UHCHR = (UHCHR | UHCHR_SSEP3 | UHCHR_PSPL | UHCHR_CGR) &
-			    ~(UHCHR_SSEP1 | UHCHR_SSEP2 | UHCHR_SSE);
-	return 0;
-}
-
 static struct pxaohci_platform_data loox720_ohci_info = {
 	        .port_mode = PMM_PERPORT_MODE,
-		.init = loox720_ohci_init,
+	        .flags = ENABLE_PORT1 | ENABLE_PORT3 | POWER_CONTROL_LOW | POWER_SENSE_LOW,
+		.power_budget = 0
 };
 
 /*--------------------------------------------------------------------------------*/
@@ -477,6 +465,9 @@ static struct pxamci_platform_data loox7xx_mci_info = {
 	.get_ro   	= loox7xx_mci_get_ro,
 	.setpower 	= loox7xx_mci_setpower,
 	.exit     	= loox7xx_mci_exit,
+	.gpio_card_detect	= -1,
+	.gpio_card_ro	= -1,
+	.gpio_power	= -1,
 };
 
 /*--------------------------------------------------------------------------------*/

@@ -18,7 +18,7 @@
 #ifndef _LOOX720_CPLD_H_
 #define _LOOX720_CPLD_H_
 
-#include <asm/arch/pxa-regs.h>
+#include <mach/pxa2xx-regs.h>
 
 #define LOOX720_CPLD_PHYS	PXA_CS4_PHYS
 #define LOOX720_CPLD_SIZE	32

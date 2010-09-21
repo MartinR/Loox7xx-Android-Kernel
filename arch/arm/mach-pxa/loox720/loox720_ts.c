@@ -17,19 +17,18 @@
 
 #include <linux/spi/spi.h>
 #include <linux/spi/ads7846.h>
-#include <asm/arch/pxa2xx_spi.h>
+#include <mach/pxa2xx_spi.h>
 
 //#include <linux/touchscreen-adc.h>
 #include <asm/irq.h>
 #include <asm/mach-types.h>
-#include <asm/hardware.h>
+#include <mach/hardware.h>
 #include <asm/setup.h>
 #include <asm/mach/irq.h>
 #include <asm/mach/arch.h>
-#include <asm/arch/bitfield.h>
-#include <asm/arch/pxa-regs.h>
-#include <asm/arch/loox720-gpio.h>
-#include <asm/arch/irqs.h>
+#include <mach/bitfield.h>
+#include <mach/loox720-gpio.h>
+#include <mach/irqs.h>
 #include "../generic.h"
 
 /* borrowed from lubbock.c */

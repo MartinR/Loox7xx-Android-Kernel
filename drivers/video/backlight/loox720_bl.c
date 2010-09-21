@@ -15,8 +15,8 @@
 #include <linux/backlight.h>
 #include <linux/err.h>
 
-#include <asm/arch/loox720-gpio.h>
-#include <asm/arch/loox720-cpld.h>
+#include <mach/loox720-gpio.h>
+#include <mach/loox720-cpld.h>
 #include <linux/fb.h>
 #include <asm/mach-types.h>
 #include <linux/platform_device.h>

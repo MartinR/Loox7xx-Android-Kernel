@@ -1,8 +1,8 @@
 #include <linux/module.h>
 #include <linux/platform_device.h>
 #include <linux/delay.h>
-#include <asm/arch/loox720-cpld.h>
-#include <asm/arch/loox720.h>
+#include <mach/loox720-cpld.h>
+#include <mach/loox720.h>
 
 //extern void loox720_cpld_write_masked(int regno,u32 mask, u32 value);
 //extern void loox720_cpld_reg_write(int regno, u32 value);

@@ -8,15 +8,15 @@
 #include <asm/mach/arch.h>
 #include <asm/mach/map.h>
 #include <asm/mach-types.h>
-#include <asm/hardware.h>
+#include <mach/hardware.h>
 #include <linux/sched.h>
 #include <linux/workqueue.h>
-#include <asm/arch/pxa-regs.h>
-#include <asm/arch/irqs.h>
+#include <mach/irqs.h>
 #include <asm/uaccess.h>
+#include <mach/gpio.h>
 
 #ifdef CONFIG_MACH_T3XSCALE
-#include <asm/arch/tps65010.h>
+#include <mach/tps65010.h>
 #endif
 
 #include <linux/debugfs.h>
@@ -160,7 +160,7 @@ static int __init gpioed_init(void)
 	
 //	proc_intf->read_proc = procfile_read;
 	proc_intf->write_proc = procfile_write;
-	proc_intf->owner     = THIS_MODULE;
+//	proc_intf->owner     = THIS_MODULE;
 	proc_intf->mode      = S_IFREG | S_IRUGO;
 	proc_intf->uid       = 0;
 	proc_intf->gid       = 0;

@@ -18,10 +18,11 @@
 #include <linux/ctype.h>
 #include <linux/leds.h>
 #include <linux/gpio.h>
-#include <asm/hardware.h>
-#include <asm/arch/loox720.h>
-#include <asm/arch/loox720-gpio.h>
-#include <asm/arch/loox720-cpld.h>
+#include <mach/hardware.h>
+#include <mach/loox720.h>
+#include <mach/loox720-gpio.h>
+#include <mach/loox720-cpld.h>
+#include <mach/regs-uart.h>
 
 #define DRV_NAME              "loox720-bt"
 
@@ -124,7 +125,7 @@ static int loox720_bt_suspend(struct platform_device *pdev, pm_message_t mstate)
 	return 0;
 }
 
-static int loox720_bt_resume(struct platform_device *pdev, pm_message_t mstate)
+static int loox720_bt_resume(struct platform_device *pdev)
 {
 	if (state == BT_PRE_SUSPEND_ON)
 	  loox720_bt_enable(1);

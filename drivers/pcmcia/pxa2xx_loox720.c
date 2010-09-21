@@ -20,18 +20,18 @@
 #include <linux/interrupt.h>
 #include <linux/device.h>
 #include <linux/gpio.h>
+#include <linux/delay.h>
 
 #include <pcmcia/ss.h>
 
-#include <asm/hardware.h>
+#include <mach/hardware.h>
 #include <asm/irq.h>
 
-#include <asm/arch/pxa-regs.h>
-#include <asm/arch/pxa2xx-gpio.h>
-#include <asm/arch/loox720-gpio.h>
-#include <asm/arch/loox720-cpld.h>
-#include <asm/arch/loox720.h>
-#include <asm/arch/irqs.h>
+#include <mach/pxa2xx-gpio.h>
+#include <mach/loox720-gpio.h>
+#include <mach/loox720-cpld.h>
+#include <mach/loox720.h>
+#include <mach/irqs.h>
 #include <linux/platform_device.h>
 
 #include "soc_common.h"
@@ -190,7 +190,7 @@ static void __exit loox720_pcmcia_exit(void)
 	platform_device_unregister(&loox720_pcmcia_device);
 }
 
-module_init(loox720_pcmcia_init);
+fs_initcall(loox720_pcmcia_init);
 module_exit(loox720_pcmcia_exit);
 
 MODULE_AUTHOR("Richard Purdie <richard@o-hand.com>");

@@ -21,11 +21,10 @@
 
 #include <asm/mach/irq.h>
 
-#include <asm/arch/pxa-regs.h>
-#include <asm/arch/loox720-gpio.h>
-#include <asm/arch/loox720-cpld.h>
-#include <asm/arch/loox720.h>
-#include <asm/arch/irqs.h>
+#include <mach/loox720-gpio.h>
+#include <mach/loox720-cpld.h>
+#include <mach/loox720.h>
+#include <mach/irqs.h>
 
 #include <linux/power_supply.h>
 

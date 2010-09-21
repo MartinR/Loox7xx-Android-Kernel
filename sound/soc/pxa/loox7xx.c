@@ -22,24 +22,22 @@
 #include <linux/moduleparam.h>
 #include <linux/device.h>
 #include <linux/i2c.h>
-#include <sound/driver.h>
 #include <sound/core.h>
 #include <sound/pcm.h>
 #include <sound/soc.h>
 #include <sound/soc-dapm.h>
 
-#include <asm/arch/pxa-regs.h>
-#include <asm/arch/audio.h>
-#include <asm/hardware.h>
+#include <mach/audio.h>
+#include <mach/hardware.h>
 
 #include "../codecs/wm8750.h"
 #include "pxa2xx-pcm.h"
 #include "pxa2xx-i2s.h"
 
-#include <asm/arch/loox720-cpld.h>
-#include <asm/arch/loox720-gpio.h>
+#include <mach/loox720-cpld.h>
+#include <mach/loox720-gpio.h>
 
-#include <asm/arch/gpio.h>
+#include <mach/gpio.h>
 #include <linux/interrupt.h>
 #include <linux/irq.h>
 #include <linux/workqueue.h>
@@ -50,7 +48,7 @@ static int loox_hw_params(struct snd_pcm_substream *substream,
 	struct snd_pcm_hw_params *params);
 static int loox_wm8750_init(struct snd_soc_codec *codec);
 
-static struct snd_soc_machine loox;
+static struct snd_soc_card loox;
 
 
 static struct snd_soc_ops loox_ops = {
@@ -75,11 +73,12 @@ static int loox_wm8780_resume(struct platform_device *pdev) {
   return 0;
 }
 
-static struct snd_soc_machine loox = {
+static struct snd_soc_card loox = {
 	.name = "Loox Audio",
 	.dai_link = &loox_dai,
 	.num_links = 1,
 	.resume_post = loox_wm8780_resume,
+	.platform = &pxa2xx_soc_platform,
 };
 
 static struct wm8750_setup_data loox_wm8750_setup = {
@@ -88,8 +87,7 @@ static struct wm8750_setup_data loox_wm8750_setup = {
 
 
 static struct snd_soc_device loox_snd_devdata = {
-	.machine = &loox,
-	.platform = &pxa2xx_soc_platform,
+	.card = &loox,
 	.codec_dev = &soc_codec_dev_wm8750,
 	.codec_data = &loox_wm8750_setup,
 };
@@ -110,8 +108,8 @@ static int loox_hw_params(struct snd_pcm_substream *substream,
 	struct snd_pcm_hw_params *params)
 {
 	struct snd_soc_pcm_runtime *rtd = substream->private_data;
-	struct snd_soc_codec_dai *codec_dai = rtd->dai->codec_dai;
-	struct snd_soc_cpu_dai *cpu_dai = rtd->dai->cpu_dai;
+	struct snd_soc_dai *codec_dai = rtd->dai->codec_dai;
+	struct snd_soc_dai *cpu_dai = rtd->dai->cpu_dai;
 	unsigned int clk = 0;
 	int ret = 0;
 
@@ -131,25 +129,25 @@ static int loox_hw_params(struct snd_pcm_substream *substream,
 	}
 
 	/* set codec DAI configuration */
-	ret = codec_dai->dai_ops.set_fmt(codec_dai, SND_SOC_DAIFMT_I2S |
+	ret = snd_soc_dai_set_fmt(codec_dai, SND_SOC_DAIFMT_I2S |
 		SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_CBS_CFS);
 	if (ret < 0)
 		return ret;
 
 	/* set cpu DAI configuration */
-	ret = cpu_dai->dai_ops.set_fmt(cpu_dai, SND_SOC_DAIFMT_I2S |
-		SND_SOC_DAIFMT_NB_NF | SND_SOC_DAIFMT_CBS_CFS);
+	ret = snd_soc_dai_set_fmt(cpu_dai, SND_SOC_DAIFMT_I2S |
+		SND_SOC_DAIFMT_NB_IF | SND_SOC_DAIFMT_CBS_CFS);
 	if (ret < 0)
 		return ret;
 
 	/* set the codec system clock for DAC and ADC */
-	ret = codec_dai->dai_ops.set_sysclk(codec_dai, WM8750_SYSCLK, clk,
+	ret = snd_soc_dai_set_sysclk(codec_dai, WM8750_SYSCLK, clk,
 		SND_SOC_CLOCK_IN);
 	if (ret < 0)
 		return ret;
 
 	/* set the I2S system clock as input (unused) */
-	ret = cpu_dai->dai_ops.set_sysclk(cpu_dai, PXA2XX_I2S_SYSCLK, 0,
+	ret = snd_soc_dai_set_sysclk(cpu_dai, PXA2XX_I2S_SYSCLK, 0,
 		SND_SOC_CLOCK_IN);
 	if (ret < 0)
 		return ret;
@@ -168,18 +166,17 @@ static void loox_wm8750_hp_switch()
 	if (loox_snd_devdata.dev != NULL) {
 	    hp_in = gpio_get_value(GPIO_NR_LOOX720_HEADPHONE_DET);
 	    if (hp_in) {
-		snd_soc_dapm_set_endpoint(loox_snd_devdata.codec,"OUT3",0);
-		snd_soc_dapm_set_endpoint(loox_snd_devdata.codec,"LOUT1",1);
+		snd_soc_dapm_disable_pin(loox_snd_devdata.card->codec,"OUT3");
+		snd_soc_dapm_enable_pin(loox_snd_devdata.card->codec,"LOUT1");
 	    } else {
-		snd_soc_dapm_set_endpoint(loox_snd_devdata.codec,"OUT3",1);
-		snd_soc_dapm_set_endpoint(loox_snd_devdata.codec,"LOUT1",0);
+		snd_soc_dapm_enable_pin(loox_snd_devdata.card->codec,"OUT3");
+		snd_soc_dapm_disable_pin(loox_snd_devdata.card->codec,"LOUT1");
 	    }
-	    snd_soc_dapm_sync_endpoints(loox_snd_devdata.codec);
 	    enable_irq(IRQ_GPIO(GPIO_NR_LOOX720_HEADPHONE_DET));
 	}
 }
 
-static int loox_wm8750_hp_switch_isr(int irq, void *data)
+static irqreturn_t loox_wm8750_hp_switch_isr(int irq, void *data)
 {
 	disable_irq(IRQ_GPIO(GPIO_NR_LOOX720_HEADPHONE_DET));
 	PREPARE_WORK(&hp_switch_task, loox_wm8750_hp_switch);
@@ -262,10 +259,10 @@ static int loox_wm8750_init(struct snd_soc_codec *codec)
 		 return 0;
 	}
 /* deactivating VoIP speaker */
-        snd_soc_dapm_set_endpoint(loox_snd_devdata.codec,"LOUT2",0);
-        snd_soc_dapm_set_endpoint(loox_snd_devdata.codec,"ROUT2",0);
+        snd_soc_dapm_disable_pin(codec,"LOUT2");
+        snd_soc_dapm_disable_pin(codec,"ROUT2");
 /* ROUT1 is always on */
-        snd_soc_dapm_set_endpoint(loox_snd_devdata.codec,"ROUT1",1);
+        snd_soc_dapm_enable_pin(codec,"ROUT1");
 	hp_switch_wq = create_workqueue("HP_SWITCH_WQ");
 	disable_irq(IRQ_GPIO(GPIO_NR_LOOX720_HEADPHONE_DET));
 	INIT_WORK(&hp_switch_task, loox_wm8750_hp_switch);

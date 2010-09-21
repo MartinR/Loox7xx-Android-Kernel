@@ -7,9 +7,9 @@
 #include <asm/mach-types.h>
 #include <asm/irq.h>
 #include <asm/io.h>
-#include <asm/arch/irqs.h>
-#include <asm/arch/loox720-gpio.h>
-#include <asm/arch/loox720-cpld.h>
+#include <mach/irqs.h>
+#include <mach/loox720-gpio.h>
+#include <mach/loox720-cpld.h>
 
 static u32 reg_cache[16]={
     0, 0, 0, 0, 0, 0, 0, 0,
@@ -371,7 +371,7 @@ static int __init loox720_cpld_init(void)
     }
     
     set_irq_data(IRQ_GPIO(GPIO_NR_LOOX720_CPLD_INT), loox720_cpld_irq_data);
-    set_irq_type(IRQ_GPIO(GPIO_NR_LOOX720_CPLD_INT), IRQT_RISING);
+    set_irq_type(IRQ_GPIO(GPIO_NR_LOOX720_CPLD_INT), IRQ_TYPE_EDGE_RISING);
     set_irq_chained_handler(IRQ_GPIO(GPIO_NR_LOOX720_CPLD_INT), loox720_cpld_irq_demux);
     
     cpld_mem[0] = 0x3FF; // clear interrupts
