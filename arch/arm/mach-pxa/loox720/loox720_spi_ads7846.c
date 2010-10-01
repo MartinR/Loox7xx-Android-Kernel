@@ -15,11 +15,11 @@
 #include <linux/spi/spi.h>
 #include <linux/input.h>
 
-#include <asm/hardware.h>
-#include <asm/arch/loox720.h>
-#include <asm/arch/loox720-gpio.h>
-#include <asm/arch/loox720-cpld.h>
-#include <asm/arch/loox720_spi_ads7846.h>
+#include <mach/hardware.h>
+#include <mach/loox720.h>
+#include <mach/loox720-gpio.h>
+#include <mach/loox720-cpld.h>
+#include <mach/loox720_spi_ads7846.h>
 
 #define TS_POLL_DELAY(x)	(((x) - 1) * 1000000) // sample rate = +/- 5Hz with 200kHz spi bus
 

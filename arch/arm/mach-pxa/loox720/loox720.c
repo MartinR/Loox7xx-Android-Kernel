@@ -225,9 +225,7 @@ static void loox_irda_shutdown(struct device *dev)
 
 static struct pxaficp_platform_data loox_ficp_info = {
 	.transceiver_cap  = IR_SIRMODE | IR_FIRMODE | IR_OFF,
-	.transceiver_mode = loox_irda_transceiver_mode,
-	.startup = loox_irda_startup,
-	.shutdown = loox_irda_shutdown,
+	.gpio_pwdown = GPIO_NR_LOOX720_IR_ON_N,
 };
 
 /*--------------------------------------------------------------------------------*/
@@ -371,8 +369,10 @@ udc_command(int cmd)
 }
 
 static struct pxa2xx_udc_mach_info loox720_udc_info __initdata = {
-	.udc_is_connected = udc_detect,
-	.udc_command      = udc_command,
+	.udc_is_connected     = udc_detect,
+	.udc_command          = udc_command,
+	.gpio_pullup          = -1,
+	.gpio_vbus            = -1,
 };
 
 /*--------------------------------------------------------------------------------*/
@@ -425,15 +425,9 @@ static int loox7xx_mci_init(struct device *dev,
 				"SD card detect", data);
 	if (err)
 		goto err_request_irq;
-	err = gpio_request(GPIO_NR_LOOX720_MMC_RO, "SD_READONLY");
-	if (err)
-		goto err_request_readonly;
-	gpio_direction_input(GPIO_NR_LOOX720_MMC_RO);
 
 	return 0;
 
-err_request_readonly:
-	free_irq(IRQ_GPIO(GPIO_NR_LOOX720_MMC_DETECT_N), data);
 err_request_irq:
 	gpio_free(GPIO_NR_LOOX720_MMC_DETECT_N);
 err_request_detect:
@@ -447,11 +441,6 @@ static void loox7xx_mci_setpower(struct device *dev, unsigned int vdd)
 	loox720_egpio_set_bit(LOOX720_CPLD_SD_BIT, (1 << vdd) & pdata->ocr_mask);
 }
 
-static int loox7xx_mci_get_ro(struct device *dev)
-{
-	return gpio_get_value(GPIO_NR_LOOX720_MMC_RO);
-}
-
 static void loox7xx_mci_exit(struct device *dev, void *data)
 {
 	gpio_free(GPIO_NR_LOOX720_MMC_RO);
@@ -462,11 +451,10 @@ static void loox7xx_mci_exit(struct device *dev, void *data)
 static struct pxamci_platform_data loox7xx_mci_info = {
 	.ocr_mask 	= MMC_VDD_32_33|MMC_VDD_33_34,
 	.init     	= loox7xx_mci_init,
-	.get_ro   	= loox7xx_mci_get_ro,
 	.setpower 	= loox7xx_mci_setpower,
 	.exit     	= loox7xx_mci_exit,
 	.gpio_card_detect	= -1,
-	.gpio_card_ro	= -1,
+	.gpio_card_ro	= GPIO_NR_LOOX720_MMC_RO,
 	.gpio_power	= -1,
 };
 

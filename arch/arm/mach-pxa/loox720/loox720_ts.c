@@ -33,18 +33,14 @@
 
 /* borrowed from lubbock.c */
 
-static int loox720_ads7846_pendown_state(void)
-{
-	return ((gpio_get_value(GPIO_NR_LOOX720_TOUCHPANEL_IRQ_N)) ? 0 : 1);
-}
-
 static struct ads7846_platform_data ads_info = {
 	.model			= 7845,
-	.get_pendown_state	= loox720_ads7846_pendown_state,
+	.gpio_pendown		= GPIO_NR_LOOX720_TOUCHPANEL_IRQ_N,
 	.debounce_max		= 12,
 	.debounce_tol		= 4,
 	.debounce_rep		= 1,
 	.penirq_recheck_delay_usecs = 20,
+	.vref_mv		= 2500
 };
 
 static struct pxa2xx_spi_chip ads_hw = {
@@ -62,7 +58,7 @@ static struct spi_board_info spi_board_info[] __initdata = {
 		.platform_data		= &ads_info,
 		.controller_data 	= &ads_hw,
 		.irq			= IRQ_GPIO(GPIO_NR_LOOX720_TOUCHPANEL_IRQ_N),
-		.max_speed_hz		= 100000,
+		.max_speed_hz		= 200000,
 		.bus_num		= 1,
 		.chip_select		= 0,
 		.mode			= SPI_MODE_0,
@@ -118,8 +114,8 @@ static int __devinit loox720_ts_probe(struct platform_device *dev)
 	//platform_device_register(&loox720_ts);
 
 	// commented out since this currently hangs the kernel.
-	if (gpio_request(GPIO_NR_LOOX720_TOUCHPANEL_IRQ_N, "Touchscreen IRQ") != 0)
-		return -ENODEV;
+	/*if (gpio_request(GPIO_NR_LOOX720_TOUCHPANEL_IRQ_N, "Touchscreen IRQ") != 0)
+		return -ENODEV;*/
 	spi_register_board_info(spi_board_info, ARRAY_SIZE(spi_board_info));
 	return 0;
 }
@@ -152,7 +148,7 @@ static void __exit loox720_ts_exit(void)
 }
 
 
-module_init(loox720_ts_init);
+arch_initcall(loox720_ts_init);
 module_exit(loox720_ts_exit);
 
 MODULE_AUTHOR ("Pierre Gaufillet");
