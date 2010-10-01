@@ -39,7 +39,7 @@ static struct ads7846_platform_data ads_info = {
 	.debounce_max		= 12,
 	.debounce_tol		= 4,
 	.debounce_rep		= 1,
-	.penirq_recheck_delay_usecs = 20,
+	.penirq_recheck_delay_usecs = 1000,
 	.vref_mv		= 2500
 };
 
@@ -50,6 +50,7 @@ static struct pxa2xx_spi_chip ads_hw = {
 //	.timeout		= 1200,
 	.enable_loopback	= 0,
 	.dma_burst_size		= 0,
+	.gpio_cs		= -1
 };
 
 static struct spi_board_info spi_board_info[] __initdata = {
