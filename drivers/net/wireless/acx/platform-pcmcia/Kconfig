@@ -1,0 +1,5 @@
+config ACX_MAC80211_PCMCIA
+	tristate "TI acx100/acx111 802.11b/g PCMCIA"
+	depends on ACX_MAC80211_MEM
+	---help---
+	PCMCIA support for acx.

@@ -1,47 +1,174 @@
-/** (legal) claimer in README
-** Copyright (C) 2003  ACX100 Open Source Project
-*/
+/*
+ * Copyright (C) 2003, 2004, 2005, 2006, 2007, 2008
+ * The ACX100 Open Source Project <acx100-devel@lists.sourceforge.net>
+ *
+ * This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 2 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+#ifndef _ACX_FUNC_H_
+#define _ACX_FUNC_H_
 
 #include <linux/version.h>
 
-/***********************************************************************
-** LOGGING
-**
-** - Avoid SHOUTING needlessly. Avoid excessive verbosity.
-**   Gradually remove messages which are old debugging aids.
-**
-** - Use printk() for messages which are to be always logged.
-**   Supply either 'acx:' or '<devname>:' prefix so that user
-**   can figure out who's speaking among other kernel chatter.
-**   acx: is for general issues (e.g. "acx: no firmware image!")
-**   while <devname>: is related to a particular device
-**   (think about multi-card setup). Double check that message
-**   is not confusing to the average user.
-**
-** - use printk KERN_xxx level only if message is not a WARNING
-**   but is INFO, ERR etc.
-**
-** - Use printk_ratelimited() for messages which may flood
-**   (e.g. "rx DUP pkt!").
-**
-** - Use log() for messages which may be omitted (and they
-**   _will_ be omitted in non-debug builds). Note that
-**   message levels may be disabled at compile-time selectively,
-**   thus select them wisely. Example: L_DEBUG is the lowest
-**   (most likely to be compiled out) -> use for less important stuff.
-**
-** - Do not print important stuff with log(), or else people
-**   will never build non-debug driver.
-**
-** Style:
-** hex: capital letters, zero filled (e.g. 0x02AC)
-** str: dont start from capitals, no trailing periods ("tx: queue is stopped")
-*/
-#if ACX_DEBUG > 1
+/*
+ * BOM Config
+ * ==================================================
+ */
+#define CMD_TIMEOUT_MS(n)	(n)
+#define ACX_CMD_TIMEOUT_DEFAULT	CMD_TIMEOUT_MS(50)
+
+// CONFIG_ACX_MAC80211_VERSION allows to specify the version of the used
+// wireless mac80211 api, in case it is different of the used kernel.
+// OpenWRT e.g. uses a version of compat-wireless, which is ahead of
+// the used kernel.
+//
+// CONFIG_ACX_MAC80211_VERSION can be defined on the make command line by
+// passing EXTRA_CFLAGS="-DCONFIG_ACX_MAC80211_VERSION=\"KERNEL_VERSION(2,6,34)\""
+
+#ifndef CONFIG_ACX_MAC80211_VERSION
+	#define CONFIG_ACX_MAC80211_VERSION LINUX_VERSION_CODE
+#endif
+
+// Define ACX_GIT_VERSION with "undef" value, if undefined for some reason
+#ifndef ACX_GIT_VERSION
+        #define ACX_GIT_VERSION "unknown"
+#endif
+
+/*
+ * BOM Common
+ * ==================================================
+ */
+
+// BOM Locking (Common)
+// -----
+
+/*
+ * Locking is done mainly using the adev->sem.
+ *
+ * The locking rule is: All external entry paths are protected by the sem.
+ *
+ * The adev->spinlock is still kept for the irq top-half, although even there it
+ * wouldn't be really required. It's just to not get interrupted during irq
+ * handling itself. For this we don't need the acx_lock macros anymore.
+ * 
+ */
+
+/* These functions *must* be inline or they will break horribly on SPARC, due
+ * to its weird semantics for save/restore flags */
+
+#define acx_sem_lock(adev)		mutex_lock(&(adev)->mutex)
+#define acx_sem_unlock(adev)	mutex_unlock(&(adev)->mutex)
+
+#ifdef OW_20100613_OBSELETE_ACXLOCK_REMOVE
+#if defined(PARANOID_LOCKING) /* Lock debugging */
+
+void acx_lock_debug(acx_device_t *adev, const char* where);
+void acx_unlock_debug(acx_device_t *adev, const char* where);
+void acx_lock_unhold(void);
+void acx_sem_unhold(void);
+
+static inline void
+acx_lock_helper(acx_device_t *adev, unsigned long *fp, const char* where)
+{
+	acx_lock_debug(adev, where);
+	spin_lock_irqsave(&adev->spinlock, *fp);
+}
+static inline void
+acx_unlock_helper(acx_device_t *adev, unsigned long *fp, const char* where)
+{
+	acx_unlock_debug(adev, where);
+	spin_unlock_irqrestore(&adev->spinlock, *fp);
+}
+#ifdef OBSELETE_OW20100613
+#define acx_lock(adev, flags)	acx_lock_helper(adev, &(flags), __FILE__ ":" STRING(__LINE__))
+#define acx_unlock(adev, flags)	acx_unlock_helper(adev, &(flags), __FILE__ ":" STRING(__LINE__))
+#endif
+
+#elif defined(DO_LOCKING)
+
+//#define acx_lock(adev, flags)	spin_lock_irqsave(&adev->spinlock, flags)
+//#define acx_unlock(adev, flags)	spin_unlock_irqrestore(&adev->spinlock, flags)
+#define acx_lock(adev, flags)	((void)0)
+#define acx_unlock(adev, flags)	((void)0)
+
+#define acx_sem_lock(adev)	mutex_lock(&(adev)->mutex)
+#define acx_sem_unlock(adev)	mutex_unlock(&(adev)->mutex)
+#define acx_lock_unhold()	((void)0)
+#define acx_sem_unhold()	((void)0)
+
+#else /* no locking! :( */
+
+#define acx_lock(adev, flags)	((void)0)
+#define acx_unlock(adev, flags)	((void)0)
+#define acx_sem_lock(adev)	((void)0)
+#define acx_sem_unlock(adev)	((void)0)
+#define acx_lock_unhold()	((void)0)
+#define acx_sem_unhold()	((void)0)
+
+#endif
+#endif
+
+
+// BOM Logging (Common)
+// -----
+
+/*
+ * LOGGING
+ *
+ * - Avoid SHOUTING needlessly. Avoid excessive verbosity.
+ *   Gradually remove messages which are old debugging aids.
+ *
+ * - Use printk() for messages which are to be always logged.
+ *   Supply either 'acx:' or '<devname>:' prefix so that user
+ *   can figure out who's speaking among other kernel chatter.
+ *   acx: is for general issues (e.g. "acx: no firmware image!")
+ *   while <devname>: is related to a particular device
+ *   (think about multi-card setup). Double check that message
+ *   is not confusing to the average user.
+ *
+ * - use printk KERN_xxx level only if message is not a WARNING
+ *   but is INFO, ERR etc.
+ *
+ * - Use printk_ratelimited() for messages which may flood
+ *   (e.g. "rx DUP pkt!").
+ *
+ * - Use log() for messages which may be omitted (and they
+ *   _will_ be omitted in non-debug builds). Note that
+ *   message levels may be disabled at compile-time selectively,
+ *   thus select them wisely. Example: L_DEBUG is the lowest
+ *   (most likely to be compiled out) -> use for less important stuff.
+ *
+ * - Do not print important stuff with log(), or else people
+ *   will never build non-debug driver.
+ *
+ * Style:
+ * hex: capital letters, zero filled (e.g. 0x02AC)
+ * str: dont start from capitals, no trailing periods ("tx: queue is stopped")
+ */
+
+// Debug build
+#if ACX_DEBUG
 
 void log_fn_enter(const char *funcname);
 void log_fn_exit(const char *funcname);
 void log_fn_exit_v(const char *funcname, int v);
+
+char *acx_print_mac(char *buf, const u8 *mac);
+void acx_print_mac2(const char *head, const u8 *mac, const char *tail);
+void acxlog_mac(int level, const char *head, const u8 *mac, const char *tail);
+
+void acx_dump_bytes(const void *data, int num);
+const char *acx_cmd_status_str(unsigned int state);
 
 #define FN_ENTER \
 	do { \
@@ -63,25 +190,35 @@ void log_fn_exit_v(const char *funcname, int v);
 		} \
 	} while (0)
 
-#else
-
-#define FN_ENTER
-#define FN_EXIT1(v)
-#define FN_EXIT0
-
-#endif /* ACX_DEBUG > 1 */
-
-
-#if ACX_DEBUG
-
 #define log(chan, args...) \
 	do { \
 		if (acx_debug & (chan)) \
 			printk(args); \
 	} while (0)
-#define printk_ratelimited(args...) printk(args)
 
-#else /* Non-debug build: */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(2, 6, 33)
+
+#define printk_ratelimited(args...) \
+do { \
+	if (printk_ratelimit()) \
+		printk(args); \
+} while (0)
+
+#endif
+
+// Log with prefix "acx: __func__
+#define logf0(chan, msg) \
+		log(chan, "acx: %s: " msg, __func__);
+#define logf1(chan, msg, args...) \
+		log(chan, "acx: %s: " msg, __func__, args);
+
+// None-Debug build
+// OW 20100405: An none-debug build is currently probably broken
+#else
+
+#define FN_ENTER do {} while(0)
+#define FN_EXIT1(v) do {} while(0)
+#define FN_EXIT0 do {} while(0)
 
 #define log(chan, args...)
 /* Standard way of log flood prevention */
@@ -91,23 +228,168 @@ do { \
 		printk(args); \
 } while (0)
 
-#endif /* ACX_DEBUG */
+#endif 
+//---
 
-void acx_print_mac(const char *head, const u8 *mac, const char *tail);
+#define TODO()  \
+        do {                                                                            \
+                printk(KERN_INFO "TODO: Incomplete code in %s() at %s:%d\n",        \
+                       __FUNCTION__, __FILE__, __LINE__);                               \
+        } while (0)
 
-/* Optimized out to nothing in non-debug build */
-static inline void
-acxlog_mac(int level, const char *head, const u8 *mac, const char *tail)
-{
-	if (acx_debug & level) {
-		acx_print_mac(head, mac, tail);
-	}
-}
+#define FIXME()  \
+        do {                                                                            \
+                printk(KERN_INFO "FIXME: Possibly broken code in %s() at %s:%d\n",  \
+                       __FUNCTION__, __FILE__, __LINE__);                               \
+        } while (0)
+
+// BOM Data Access (Common)
+// -----
+
+// BOM Firmware, EEPROM, Phy (Common)
+// -----
+void acx_get_firmware_version(acx_device_t * adev);
+void acx_display_hardware_details(acx_device_t * adev);
+firmware_image_t *acx_read_fw(struct device *dev, const char *file, u32 * size);
+void acx_parse_configoption(acx_device_t * adev, const acx111_ie_configoption_t * pcfg);
+int acx_read_phy_reg(acx_device_t *adev, u32 reg, u8 *charbuf);
+int acx_write_phy_reg(acx_device_t *adev, u32 reg, u8 value);
+
+// BOM CMDs (Common:Control Path)
+// -----
+
+int acx_issue_cmd_timeo_debug(acx_device_t *adev, unsigned cmd, void *param, unsigned len, unsigned timeout, const char* cmdstr);
+#define acx_issue_cmd(adev,cmd,param,len) \
+	acx_issue_cmd_timeo_debug(adev,cmd,param,len,ACX_CMD_TIMEOUT_DEFAULT,#cmd)
+#define acx_issue_cmd_timeo(adev,cmd,param,len,timeo) \
+	acx_issue_cmd_timeo_debug(adev,cmd,param,len,timeo,#cmd)
+
+int acx_configure_debug(acx_device_t *adev, void *pdr, int type, const char* str);
+#define acx_configure(adev,pdr,type) \
+	acx_configure_debug(adev,pdr,type,#type)
+
+int acx_interrogate_debug(acx_device_t *adev, void *pdr, int type, const char* str);
+#define acx_interrogate(adev,pdr,type) \
+	acx_interrogate_debug(adev,pdr,type,#type)
+
+void acx_cmd_join_bssid(acx_device_t *adev, const u8 *bssid);
+
+// BOM Configuration (Common:Control Path)
+// -----
+void acx_set_defaults(acx_device_t * adev);
+void acx_update_card_settings(acx_device_t *adev);
+void acx_start(acx_device_t * adev);
+int acx_net_reset(struct ieee80211_hw *ieee);
+int acx_init_mac(acx_device_t * adev);
+int acx_setup_modes(acx_device_t *adev);
+int acx_selectchannel(acx_device_t *adev, u8 channel, int freq);
+// void acx_update_capabilities(acx_device_t *adev);
+
+// BOM Template (Common:Control Path)
+// -----
+
+// BOM Recalibration (Common:Control Path)
+// -----
+
+// BOM Other (Common:Control Path)
+// -----
+
+// BOM Proc, Debug (Common)
+// -----
+#ifdef CONFIG_PROC_FS
+int acx_proc_register_entries(struct ieee80211_hw *ieee, int num);
+int acx_proc_unregister_entries(struct ieee80211_hw *ieee, int num);
+#else
+static inline int
+acx_proc_register_entries(const struct ieee80211_hw *ieee) { return OK; }
+static inline int
+acx_proc_unregister_entries(const struct ieee80211_hw *ieee) { return OK; }
+#endif
+
+// BOM Rx Path (Common)
+// -----
+void acx_process_rxbuf(acx_device_t *adev, rxbuffer_t *rxbuf);
 
 
-/***********************************************************************
-** MAC address helpers
-*/
+// BOM Tx Path (Common)
+// -----
+int acx_op_tx(struct ieee80211_hw *hw, struct sk_buff *skb);
+void acx_tx_work(struct work_struct *work);
+void acx_tx_queue_go(acx_device_t *adev);
+int acx_tx_frame(acx_device_t *adev, struct sk_buff *skb);
+void acx_tx_queue_flush(acx_device_t *adev);
+void acx_stop_queue(struct ieee80211_hw *hw, const char *msg);
+int acx_queue_stopped(struct ieee80211_hw *ieee);
+void acx_wake_queue(struct ieee80211_hw *hw, const char *msg);
+tx_t* acx_alloc_tx(acx_device_t *adev, unsigned int len);
+void acxpcimem_handle_tx_error(acx_device_t *adev, u8 error, unsigned int finger, struct ieee80211_tx_info *info);
+
+//void acx_l_handle_txrate_auto(acx_device_t *adev, struct client *txc,
+//		u16 intended_rate, u8 rate100, u16 rate111, u8 error,
+//		int pkts_to_ignore);
+
+
+// BOM Crypto (Common)
+// -----
+int acx_clear_keys(acx_device_t * adev);
+int acx_key_write(acx_device_t *adev, u16 index, u8 algorithm, const struct ieee80211_key_conf *key, const u8 *mac_addr);
+
+// BOM Irq Handling, Timer (Common)
+// -----
+void acx_init_task_scheduler(acx_device_t *adev);
+void acx_after_interrupt_task(acx_device_t *adev);
+void acx_schedule_task(acx_device_t *adev, unsigned int set_flag);
+void acx_log_irq(u16 irqtype);
+void acx_timer(unsigned long address);
+void acx_set_timer(acx_device_t * adev, int timeout_us);
+
+// BOM Mac80211 Ops (Common)
+// -----
+
+#if CONFIG_ACX_MAC80211_VERSION < KERNEL_VERSION(2, 6, 34)
+int acx_e_op_add_interface(struct ieee80211_hw* ieee,
+		struct ieee80211_if_init_conf *conf);
+void acx_e_op_remove_interface(struct ieee80211_hw* ieee,
+		struct ieee80211_if_init_conf *conf);
+#else
+int acx_e_op_add_interface(struct ieee80211_hw* ieee,
+		struct ieee80211_vif *vif);
+void acx_e_op_remove_interface(struct ieee80211_hw* ieee,
+		struct ieee80211_vif *vif);
+#endif
+
+int acx_op_set_key(struct ieee80211_hw *hw, enum set_key_cmd cmd,
+		struct ieee80211_vif *vif, struct ieee80211_sta *sta,
+		struct ieee80211_key_conf *key);
+int acx_op_config(struct ieee80211_hw *hw, u32 changed);
+void acx_op_bss_info_changed(struct ieee80211_hw *hw,
+		struct ieee80211_vif *vif, struct ieee80211_bss_conf *info, u32 changed);
+
+void acx_op_configure_filter(struct ieee80211_hw *hw,
+		unsigned int changed_flags, unsigned int *total_flags, u64 multicast);
+int acx_conf_tx(struct ieee80211_hw* ieee, u16 queue,
+		const struct ieee80211_tx_queue_params *params);
+int acx_op_get_stats(struct ieee80211_hw *hw, struct ieee80211_low_level_stats *stats);
+
+#if CONFIG_ACX_MAC80211_VERSION < KERNEL_VERSION(2, 6, 34)
+int acx_e_op_get_tx_stats(struct ieee80211_hw* ieee, struct ieee80211_tx_queue_stats *stats);
+#endif
+
+// BOM Helpers (Common)
+// -----
+
+void acx_mwait(int ms);
+u8 acx_signal_determine_quality(u8 signal, u8 noise);
+// void great_inquisitor(acx_device_t *adev);
+
+#if !ACX_DEBUG
+static inline const char *acx_get_packet_type_string(u16 fc) { return ""; }
+#else
+const char *acx_get_packet_type_string(u16 fc);
+#endif
+
+// MAC address helpers
+// ---
 static inline void
 MAC_COPY(u8 *mac, const u8 *src)
 {
@@ -175,9 +457,8 @@ mac_is_mcast(const u8 *mac)
 	((unsigned char *)bytevector)[5]
 
 
-/***********************************************************************
-** Random helpers
-*/
+// Random helpers
+// ---
 #define TO_STRING(x)	#x
 #define STRING(x)	TO_STRING(x)
 
@@ -220,438 +501,175 @@ is_hidden_essid(char *essid)
 		((' ' == essid[0]) && ('\0' == essid[1])));
 }
 
-/***********************************************************************
-** LOCKING
-** We have adev->sem and adev->lock.
-**
-** We employ following naming convention in order to get locking right:
-**
-** acx_e_xxxx - external entry points called from process context.
-**	It is okay to sleep. adev->sem is to be taken on entry.
-** acx_i_xxxx - external entry points possibly called from atomic context.
-**	Sleeping is not allowed (and thus down(sem) is not legal!)
-** acx_s_xxxx - potentially sleeping functions. Do not ever call under lock!
-** acx_l_xxxx - functions which expect lock to be already taken.
-** rest       - non-sleeping functions which do not require locking
-**		but may be run under lock
-**
-** A small number of local helpers do not have acx_[eisl]_ prefix.
-** They are always close to caller and are to be reviewed locally.
-**
-** Theory of operation:
-**
-** All process-context entry points (_e_ functions) take sem
-** immediately. IRQ handler and other 'atomic-context' entry points
-** (_i_ functions) take lock immediately on entry, but dont take sem
-** because that might sleep.
-**
-** Thus *all* code is either protected by sem or lock, or both.
-**
-** Code which must not run concurrently with IRQ takes lock.
-** Such code is marked with _l_.
-**
-** This results in the following rules of thumb useful in code review:
-**
-** + If a function calls _s_ fn, it must be an _s_ itself.
-** + You can call _l_ fn only (a) from another _l_ fn
-**   or (b) from _s_, _e_ or _i_ fn by taking lock, calling _l_,
-**   and dropping lock.
-** + All IRQ code runs under lock.
-** + Any _s_ fn is running under sem.
-** + Code under sem can race only with IRQ code.
-** + Code under sem+lock cannot race with anything.
-*/
-
-/* These functions *must* be inline or they will break horribly on SPARC, due
- * to its weird semantics for save/restore flags */
-
-#if defined(PARANOID_LOCKING) /* Lock debugging */
-
-void acx_lock_debug(acx_device_t *adev, const char* where);
-void acx_unlock_debug(acx_device_t *adev, const char* where);
-void acx_down_debug(acx_device_t *adev, const char* where);
-void acx_up_debug(acx_device_t *adev, const char* where);
-void acx_lock_unhold(void);
-void acx_sem_unhold(void);
-
-static inline void
-acx_lock_helper(acx_device_t *adev, unsigned long *fp, const char* where)
-{
-	acx_lock_debug(adev, where);
-	spin_lock_irqsave(&adev->lock, *fp);
-}
-static inline void
-acx_unlock_helper(acx_device_t *adev, unsigned long *fp, const char* where)
-{
-	acx_unlock_debug(adev, where);
-	spin_unlock_irqrestore(&adev->lock, *fp);
-}
-#define acx_lock(adev, flags)	acx_lock_helper(adev, &(flags), __FILE__ ":" STRING(__LINE__))
-#define acx_unlock(adev, flags)	acx_unlock_helper(adev, &(flags), __FILE__ ":" STRING(__LINE__))
-#define acx_sem_lock(adev)	mutex_lock(&(adev)->mutex)
-#define acx_sem_unlock(adev)	mutex_unlock(&(adev)->mutex)
-
-#elif defined(DO_LOCKING)
-
-#define acx_lock(adev, flags)	spin_lock_irqsave(&adev->lock, flags)
-#define acx_unlock(adev, flags)	spin_unlock_irqrestore(&adev->lock, flags)
-#define acx_sem_lock(adev)	mutex_lock(&(adev)->mutex)
-#define acx_sem_unlock(adev)	mutex_unlock(&(adev)->mutex)
-#define acx_lock_unhold()	((void)0)
-#define acx_sem_unhold()	((void)0)
-
-#else /* no locking! :( */
-
-#define acx_lock(adev, flags)	((void)0)
-#define acx_unlock(adev, flags)	((void)0)
-#define acx_sem_lock(adev)	((void)0)
-#define acx_sem_unlock(adev)	((void)0)
-#define acx_lock_unhold()	((void)0)
-#define acx_sem_unhold()	((void)0)
-
-#endif
-
-
-/***********************************************************************
-*/
-
-/* Can race with rx path (which is not protected by sem):
-** rx -> process_[re]assocresp() -> set_status(ASSOCIATED) -> wake_queue()
-** Can race with tx_complete IRQ:
-** IRQ -> acxpci_l_clean_txdesc -> acx_wake_queue
-** Review carefully all callsites */
-static inline void
-acx_stop_queue(struct ieee80211_hw *hw, const char *msg)
-{/*
-	if (netif_queue_stopped(ndev))
-		return;
-*/
-	ieee80211_stop_queues(hw);
-	if (msg)
-		log(L_BUFT, "tx: stop queue %s\n", msg);
-}
-
-/*static inline int
-acx_queue_stopped(struct ieee80211_hw *ieee)
-{
-	return netif_queue_stopped(ieee);
-}
-
-
-static inline void
-acx_start_queue(struct ieee80211_hw *hw, const char *msg)
-{
-	ieee80211_start_queues(hw);
-	if (msg)
-		log(L_BUFT, "tx: start queue %s\n", msg);
-}
-*/
-static inline void
-acx_wake_queue(struct ieee80211_hw *hw, const char *msg)
-{
-	ieee80211_wake_queues(hw);
-	if (msg)
-		log(L_BUFT, "tx: wake queue %s\n", msg);
-}
-/*
-static inline void
-acx_carrier_off(struct net_device *ndev, const char *msg)
-{
-	netif_carrier_off(ndev);
-	if (msg)
-		log(L_BUFT, "tx: carrier off %s\n", msg);
-}
-
-static inline void
-acx_carrier_on(struct net_device *ndev, const char *msg)
-{
-	netif_carrier_on(ndev);
-	if (msg)
-		log(L_BUFT, "tx: carrier on %s\n", msg);
-}
-
-*/
-
-
-/***********************************************************************
-** Communication with firmware
-*/
-#define CMD_TIMEOUT_MS(n)	(n)
-#define ACX_CMD_TIMEOUT_DEFAULT	CMD_TIMEOUT_MS(50)
-
-#if ACX_DEBUG
-
-/* We want to log cmd names */
-//int acxpci_s_issue_cmd_timeo_debug(acx_device_t *adev, unsigned cmd, void *param, unsigned len, unsigned timeout, const char* cmdstr);
-//int acxusb_s_issue_cmd_timeo_debug(acx_device_t *adev, unsigned cmd, void *param, unsigned len, unsigned timeout, const char* cmdstr);
-static inline int
-acx_s_issue_cmd_timeo_debug(acx_device_t *adev, unsigned cmd, void *param, unsigned len, unsigned timeout, const char* cmdstr)
-{
-	if (adev->ops->s_issue_cmd_timeo_debug)
-	    return adev->ops->s_issue_cmd_timeo_debug(adev, cmd, param, len, timeout, cmdstr);
-}
-#define acx_s_issue_cmd(adev,cmd,param,len) \
-	acx_s_issue_cmd_timeo_debug(adev,cmd,param,len,ACX_CMD_TIMEOUT_DEFAULT,#cmd)
-#define acx_s_issue_cmd_timeo(adev,cmd,param,len,timeo) \
-	acx_s_issue_cmd_timeo_debug(adev,cmd,param,len,timeo,#cmd)
-int acx_s_configure_debug(acx_device_t *adev, void *pdr, int type, const char* str);
-#define acx_s_configure(adev,pdr,type) \
-	acx_s_configure_debug(adev,pdr,type,#type)
-int acx_s_interrogate_debug(acx_device_t *adev, void *pdr, int type, const char* str);
-#define acx_s_interrogate(adev,pdr,type) \
-	acx_s_interrogate_debug(adev,pdr,type,#type)
-
-#else
-
-//int acxpci_s_issue_cmd_timeo(acx_device_t *adev, unsigned cmd, void *param, unsigned len, unsigned timeout);
-//int acxusb_s_issue_cmd_timeo(acx_device_t *adev, unsigned cmd, void *param, unsigned len, unsigned timeout);
-static inline int
-acx_s_issue_cmd_timeo(acx_device_t *adev, unsigned cmd,	void *param, unsigned len, unsigned timeout)
-{
-	return adev->ops->s_issue_cmd_timeo(adev, cmd, param, len, timeout);
-}
-static inline int
-acx_s_issue_cmd(acx_device_t *adev, unsigned cmd, void *param, unsigned len)
-{
-	return adev->ops->s_issue_cmd_timeo(adev, cmd, param, len, ACX_CMD_TIMEOUT_DEFAULT);
-}
-int acx_s_configure(acx_device_t *adev, void *pdr, int type);
-int acx_s_interrogate(acx_device_t *adev, void *pdr, int type);
-
-#endif
-
-void acx_s_cmd_start_scan(acx_device_t *adev);
-
-
-/***********************************************************************
-** Ioctls
-*/
-/*int
-acx111pci_ioctl_info(
-	struct net_device *ndev,
-	struct iw_request_info *info,
-	struct iw_param *vwrq,
-	char *extra);
-int
-acx100pci_ioctl_set_phy_amp_bias(
-	struct net_device *ndev,
-	struct iw_request_info *info,
-	struct iw_param *vwrq,
-	char *extra);
-*/
-
-/***********************************************************************
-** /proc
-*/
-#ifdef CONFIG_PROC_FS
-int acx_proc_register_entries(struct ieee80211_hw *ieee);
-int acx_proc_unregister_entries(struct ieee80211_hw *ieee);
-#else
-static inline int
-acx_proc_register_entries(const struct ieee80211_hw *ieee) { return OK; }
-static inline int
-acx_proc_unregister_entries(const struct ieee80211_hw *ieee) { return OK; }
-#endif
-
-
-/***********************************************************************
-*/
-firmware_image_t *acx_s_read_fw(acx_device_t *adev, const char *file, u32 *size);
-int acxpci_s_upload_radio(acx_device_t *adev);
-
-
-/***********************************************************************
-** Unsorted yet :)
-*/
-//int acxpci_s_read_phy_reg(acx_device_t *adev, u32 reg, u8 *charbuf);
-//int acxusb_s_read_phy_reg(acx_device_t *adev, u32 reg, u8 *charbuf);
-int acxgen_s_read_phy_reg(acx_device_t *adev, u32 reg, u8 *charbuf);
-static inline int
-acx_s_read_phy_reg(acx_device_t *adev, u32 reg, u8 *charbuf)
-{
-//	return adev->ops->s_read_phy_reg(adev, reg, charbuf);
-	return acxgen_s_read_phy_reg(adev, reg, charbuf);
-}
-
-//int acxpci_s_write_phy_reg(acx_device_t *adev, u32 reg, u8 value);
-//int acxusb_s_write_phy_reg(acx_device_t *adev, u32 reg, u8 value);
-
-int acxgen_s_write_phy_reg(acx_device_t *adev, u32 reg, u8 value);
-static inline int
-acx_s_write_phy_reg(acx_device_t *adev, u32 reg, u8 value)
-{
-//	return adev->ops->s_write_phy_reg(adev, reg, value);
-	return acxgen_s_write_phy_reg(adev, reg, value);
-}
-
-//tx_t* acxpci_l_alloc_tx(acx_device_t *adev);
-//tx_t* acxusb_l_alloc_tx(acx_device_t *adev);
-tx_t* acxgen_l_alloc_tx(acx_device_t *adev);
-static inline tx_t*
-acx_l_alloc_tx(acx_device_t *adev)
-{
-//	return adev->ops->l_alloc_tx(adev);
-	return acxgen_l_alloc_tx(adev);
-}
-
-//void acxusb_l_dealloc_tx(tx_t *tx_opaque);
-static inline void
-acx_l_dealloc_tx(acx_device_t *adev, tx_t *tx_opaque)
-{
-	if (adev->ops->l_dealloc_tx)
-		adev->ops->l_dealloc_tx(tx_opaque);
-}
-
-//void* acxpci_l_get_txbuf(acx_device_t *adev, tx_t *tx_opaque);
-//void* acxusb_l_get_txbuf(acx_device_t *adev, tx_t *tx_opaque);
-static inline void*
-acx_l_get_txbuf(acx_device_t *adev, tx_t *tx_opaque)
-{
-	return adev->ops->l_get_txbuf(adev, tx_opaque);
-}
-
-//void acxpci_l_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len,
-//			struct ieee80211_tx_control *ieeectl, struct sk_buff *skb);
-//void acxusb_l_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len, struct ieee80211_tx_control *ieeectl,
-//			struct sk_buff *skb);
-static inline void
-acx_l_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len,
-			struct ieee80211_tx_control *ieeectl, struct sk_buff *skb)
-{
-	return adev->ops->l_tx_data(adev, tx_opaque, len, ieeectl,skb);
-}
-
-static inline struct ieee80211_hdr *
+// More random helpers
+// ---
+static inline struct ieee80211_hdr*
 acx_get_wlan_hdr(acx_device_t *adev, const rxbuffer_t *rxbuf)
 {
 	return (struct ieee80211_hdr *)((u8 *)&rxbuf->hdr_a3 + adev->phy_header_len);
 }
-//void acxpci_put_devname(acx_device_t *adev, struct ethtool_drvinfo *info);
-//void acxusb_put_devname(acx_device_t *adev, struct ethtool_drvinfo *info);
-static inline void acx_put_devname(acx_device_t *adev, struct ethtool_drvinfo *info)
-{
-        adev->ops->put_devname(adev,info);
-}
+
+// BOM Driver, Module (Common)
+// -----
 
 
-void acxpci_l_power_led(acx_device_t *adev, int enable);
-int acxpci_read_eeprom_byte(acx_device_t *adev, u32 addr, u8 *charbuf);
-unsigned int acxpci_l_clean_txdesc(acx_device_t *adev);
-void acxpci_l_clean_txdesc_emergency(acx_device_t *adev);
-int acxpci_s_create_hostdesc_queues(acx_device_t *adev);
-void acxpci_create_desc_queues(acx_device_t *adev, u32 tx_queue_start, u32 rx_queue_start);
-void acxpci_free_desc_queues(acx_device_t *adev);
-char* acxpci_s_proc_diag_output(char *p, acx_device_t *adev);
-int acxpci_proc_eeprom_output(char *p, acx_device_t *adev);
-void acxpci_set_interrupt_mask(acx_device_t *adev);
-//int acx100pci_s_set_tx_level(acx_device_t *adev, u8 level_dbm);
+/*
+ * BOM PCI prototypes
+ * ==================================================
+ */
 
-void acx_s_mwait(int ms);
-int acx_s_init_mac(acx_device_t *adev);
-void acx_set_reg_domain(acx_device_t *adev, unsigned char reg_dom_id);
-void acx_update_capabilities(acx_device_t *adev);
-void acx_s_start(acx_device_t *adev);
+// Data Access
 
-void acx_s_update_card_settings(acx_device_t *adev);
-void acx_s_parse_configoption(acx_device_t *adev, const acx111_ie_configoption_t *pcfg);
-void acx_l_update_ratevector(acx_device_t *adev);
+int acxpci_create_hostdesc_queues(acx_device_t * adev);
+void acxpci_create_desc_queues(acx_device_t * adev, u32 tx_queue_start, u32 rx_queue_start);
+void acxpci_free_desc_queues(acx_device_t * adev);
 
-void acx_init_task_scheduler(acx_device_t *adev);
-void acx_schedule_task(acx_device_t *adev, unsigned int set_flag);
+// Firmware, EEPROM, Phy
+int acxpci_upload_radio(acx_device_t * adev);
+int acxpci_read_eeprom_byte(acx_device_t * adev, u32 addr, u8 * charbuf);
+// int acxpci_s_write_eeprom(acx_device_t * adev, u32 addr, u32 len, const u8 * charbuf);
+int acxpci_read_phy_reg(acx_device_t * adev, u32 reg, u8 * charbuf);
+int acxpci_write_phy_reg(acx_device_t * adev, u32 reg, u8 value);
 
-int acx_e_ioctl_old(struct net_device *ndev, struct ifreq *ifr, int cmd);
+// CMDs (Control Path)
+int acxpci_issue_cmd_timeo_debug(acx_device_t * adev, unsigned cmd, void *buffer, unsigned buflen, unsigned cmd_timeout, const char *cmdstr);
 
-client_t *acx_l_sta_list_get(acx_device_t *adev, const u8 *address);
-void acx_l_sta_list_del(acx_device_t *adev, client_t *clt);
+// Init, Configuration (Control Path)
+int acxpci_reset_dev(acx_device_t * adev);
 
-void acx_i_timer(unsigned long a);
+// Other (Control Path)
 
-struct sk_buff *acx_rxbuf_to_ether(acx_device_t *adev, rxbuffer_t *rxbuf);
-int acx_ether_to_txbuf(acx_device_t *adev, void *txbuf, const struct sk_buff *skb);
+// Proc, Debug
+int acxpci_proc_diag_output(struct seq_file *file, acx_device_t *adev);
+int acxpci_proc_eeprom_output(char *buf, acx_device_t * adev);
 
-u8 acx_signal_determine_quality(u8 signal, u8 noise);
+// Rx Path
 
-void acx_l_process_rxbuf(acx_device_t *adev, rxbuffer_t *rxbuf);
-void acx_l_handle_txrate_auto(acx_device_t *adev, struct client *txc,
-			u16 intended_rate, u8 rate100, u16 rate111, u8 error,
-			int pkts_to_ignore);
+// Tx Path
+tx_t *acxpci_alloc_tx(acx_device_t * adev);
+void *acxpci_get_txbuf(acx_device_t * adev, tx_t * tx_opaque);
+void acxpci_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len, struct ieee80211_tx_info *ieeectl, struct sk_buff *skb);
+unsigned int acxpci_clean_txdesc(acx_device_t * adev);
+void acxpci_clean_txdesc_emergency(acx_device_t * adev);
+int acx100pci_set_tx_level(acx_device_t * adev, u8 level_dbm);
 
-void acx_dump_bytes(const void *, int);
+// Irq Handling, Timer
+void acxpci_irq_work(struct work_struct *work);
+void acxpci_set_interrupt_mask(acx_device_t * adev);
 
-u8 acx_rate111to100(u16);
+// Mac80211 Ops
 
-void acx_s_set_defaults(acx_device_t *adev);
+// Helpers
+void acxpci_power_led(acx_device_t * adev, int enable);
 
-#if !ACX_DEBUG
-static inline const char* acx_get_packet_type_string(u16 fc) { return ""; }
-#else
-const char* acx_get_packet_type_string(u16 fc);
+// Ioctls
+int acx111pci_ioctl_info(struct net_device *ndev, struct iw_request_info *info, struct iw_param *vwrq, char *extra);
+int acx100pci_ioctl_set_phy_amp_bias(struct net_device *ndev, struct iw_request_info *info, struct iw_param *vwrq, char *extra);
+
+// Driver, Module
+
+int __init acxpci_init_module(void);
+void __exit acxpci_cleanup_module(void);
+
+/*
+ * BOM USB prototypes
+ * ==================================================
+ */
+
+// Logging
+
+// Data Access
+
+// Firmware, EEPROM, Phy
+int acxusb_read_phy_reg(acx_device_t * adev, u32 reg, u8 * charbuf);
+int acxusb_write_phy_reg(acx_device_t * adev, u32 reg, u8 value);
+
+// CMDs (Control Path)
+int acxusb_issue_cmd_timeo_debug(acx_device_t * adev, unsigned cmd, void *buffer, unsigned buflen, unsigned timeout, const char *cmdstr);
+
+// Init, Configure (Control Path)
+
+// Other (Control Path)
+
+// Proc, Debug
+
+// Rx Path
+
+// Tx Path
+tx_t *acxusb_alloc_tx(acx_device_t *adev);
+void acxusb_dealloc_tx(tx_t * tx_opaque);
+void *acxusb_get_txbuf(acx_device_t * adev, tx_t * tx_opaque);
+void acxusb_tx_data(acx_device_t *adev, tx_t *tx_opaque, int wlanpkt_len, struct ieee80211_tx_info *ieeectl, struct sk_buff *skb);
+
+// Irq Handling, Timer
+void acxusb_irq_work(struct work_struct *work);
+
+// Mac80211 Ops
+
+// Helpers
+
+// Driver, Module
+int __init acxusb_init_module(void);
+void __exit acxusb_cleanup_module(void);
+
+/*
+ * BOM Mem prototypes
+ * ==================================================
+ */
+// Data Access
+int acxmem_create_hostdesc_queues(acx_device_t *adev);
+void acxmem_create_desc_queues(acx_device_t *adev, u32 tx_queue_start, u32 rx_queue_start);
+void acxmem_free_desc_queues(acx_device_t *adev);
+
+// Firmware, EEPROM, Phy
+int acxmem_upload_radio(acx_device_t *adev);
+int acxmem_read_eeprom_byte(acx_device_t *adev, u32 addr, u8 *charbuf);
+#ifdef UNUSED
+int acxmem_s_write_eeprom(acx_device_t *adev, u32 addr, u32 len, const u8 *charbuf);
 #endif
-const char* acx_cmd_status_str(unsigned int state);
+int acxmem_read_phy_reg(acx_device_t *adev, u32 reg, u8 *charbuf);
+int acxmem_write_phy_reg(acx_device_t *adev, u32 reg, u8 value);
 
-/*** Devicescape functions ***/
-int acx_setup_modes(acx_device_t *adev);
-void acx_free_modes(acx_device_t *adev);
-int acx_i_start_xmit(struct ieee80211_hw* ieee,
-			struct sk_buff *skb,
-			struct ieee80211_tx_control *ctl);
-int acx_add_interface(struct ieee80211_hw* ieee,
-		struct ieee80211_if_init_conf *conf);
-void acx_remove_interface(struct ieee80211_hw* ieee,
-		struct ieee80211_if_init_conf *conf);
-int acx_net_reset(struct ieee80211_hw* ieee);
-int acx_net_set_key(struct ieee80211_hw *hw,
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,24)
-		set_key_cmd cmd,
-		u8 *addr,
-		struct ieee80211_key_conf *key,
-		int aid);
-#else
-		enum set_key_cmd cmd,
-		const u8 *local_addr, const u8 *addr,
-		struct ieee80211_key_conf *key);
-#endif
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,24)
-int acx_config_interface(struct ieee80211_hw* ieee, int if_id,
-			 struct ieee80211_if_conf *conf);
-#else
-extern int acx_config_interface(struct ieee80211_hw* ieee,
-				struct ieee80211_vif *vif,
-				struct ieee80211_if_conf *conf);
-#endif
-int acx_net_config(struct ieee80211_hw* ieee, struct ieee80211_conf *conf);
-int acx_net_get_tx_stats(struct ieee80211_hw* ieee, struct ieee80211_tx_queue_stats *stats);
-int acx_net_conf_tx(struct ieee80211_hw* ieee, int queue,
-		const struct ieee80211_tx_queue_params *params);
-//int acx_passive_scan(struct net_device *net_dev, int state, struct ieee80211_scan_conf *conf);
-//static void acx_netdev_init(struct net_device *ndev);
-int acxpci_s_reset_dev(acx_device_t *adev);
-void acx_e_after_interrupt_task(struct work_struct* work);
-#if LINUX_VERSION_CODE < KERNEL_VERSION(2,6,24)
-void acx_i_set_multicast_list(struct ieee80211_hw *hw,
-			    unsigned short netflags, int mc_count);
-#else
-void acx_i_set_multicast_list(struct ieee80211_hw *hw,
-			    unsigned int changed_flags,
-			    unsigned int *total_flags,
-			    int mc_count, struct dev_addr_list *mc_list);
-#endif
+// CMDs (Control Path)
+int acxmem_issue_cmd_timeo_debug(acx_device_t *adev, unsigned cmd, void *buffer, unsigned buflen, unsigned cmd_timeout, const char* cmdstr);
 
-/*** End DeviceScape Functions **/
+// Init, Configure (Control Path)
+int acxmem_reset_dev(acx_device_t *adev);
 
-void great_inquisitor(acx_device_t *adev);
+// Other (Control Path)
 
-void acx_s_get_firmware_version(acx_device_t *adev);
-void acx_display_hardware_details(acx_device_t *adev);
+// Proc, Debug
+int acxmem_proc_diag_output(struct seq_file *file, acx_device_t *adev);
+int acxmem_proc_eeprom_output(char *buf, acx_device_t *adev);
 
-int acx_e_change_mtu(struct ieee80211_hw *hw, int mtu);
-int acx_e_get_stats(struct ieee80211_hw *hw, struct ieee80211_low_level_stats *stats);
-struct iw_statistics* acx_e_get_wireless_stats(struct ieee80211_hw *hw);
-void acx_interrupt_tasklet(struct work_struct *work);
+// Rx Path
 
-int __init acxpci_e_init_module(void);
-int __init acxusb_e_init_module(void);
-void __exit acxpci_e_cleanup_module(void);
-void __exit acxusb_e_cleanup_module(void);
-int __init acx_cs_init(void);
-void __exit acx_cs_cleanup(void);
+// Tx Path
+tx_t *acxmem_alloc_tx(acx_device_t *adev, unsigned int len);
+void acxmem_dealloc_tx(acx_device_t *adev, tx_t *tx_opaque);
+
+void *acxmem_get_txbuf(acx_device_t *adev, tx_t *tx_opaque);
+void acxmem_init_acx_txbuf2(acx_device_t *adev);
+
+void acxmem_tx_data(acx_device_t *adev, tx_t *tx_opaque, int len, struct ieee80211_tx_info *ieeectl, struct sk_buff *skb);
+unsigned int acxmem_clean_txdesc(acx_device_t *adev);
+void acxmem_clean_txdesc_emergency(acx_device_t *adev);
+
+void acxmem_update_queue_indicator(acx_device_t *adev, int txqueue);
+int acx100mem_set_tx_level(acx_device_t *adev, u8 level_dbm);
+
+// Irq Handling, Timer
+void acxmem_irq_work(struct work_struct *work);
+void acxmem_set_interrupt_mask(acx_device_t *adev);
+
+// Helpers
+void acxmem_power_led(acx_device_t *adev, int enable);
+
+// Ioctls
+//int acx111pci_ioctl_info(struct ieee80211_hw *hw, struct iw_request_info *info, struct iw_param *vwrq, char *extra);
+//int acx100mem_ioctl_set_phy_amp_bias(struct ieee80211_hw *hw, struct iw_request_info *info, struct iw_param *vwrq, char *extra);
+
+int __init acxmem_init_module(void);
+void __exit acxmem_cleanup_module(void);
+
+#endif /* _ACX_FUNC_H_ */

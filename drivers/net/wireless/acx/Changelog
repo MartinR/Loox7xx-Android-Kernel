@@ -1,127 +1,189 @@
-TODO:
-e100.c: pci_dma_sync_single_for_cpu(nic->pdev, rx->dma_addr, sizeof(struct rfd), PCI_DMA_FROMDEVICE);
-do we need to do something like above for rxhostdescs/rxbufs?
+2010-07 > 04 Oliver Winker <oliver@oli1170.net>
+	* Fix sw-scan during if up problem on mem
+	* Fix sporadic WPA assoc problems in AP 
+	* Add rate-handling based on mac80211
+	* Refactor locking based on sem-lock and irq handling
+	* Introduce skb tx_queue in tx-path
+	* Fix ADHOC support
+	* Add AP support to pci,vlynq
 
-TODO: from Efthym <efthym@gmx.net>:
-13:12:42 wlan0: rx: 31 DUPs in 551 packets received in 10 sec
-13:12:48 wlan0: tx error 0x20, buf 20! (excessive Tx retries
-13:12:48 wlan0: tx error 0x20, buf 21! (excessive Tx retries
-13:12:48 wlan0: several excessive Tx retry errors occurred, a
-13:12:48 wlan0: tx error 0x20, buf 22! (excessive Tx retries
-13:12:48 wlan0: tx error 0x20, buf 23! (excessive Tx retries
-13:12:48 wlan0: tx error 0x20, buf 24! (excessive Tx retries
-13:12:48 wlan0: recalibrating radio
-13:12:48 wlan0: successfully recalibrated radio
-13:12:52 wlan0: tx error 0x20, buf 25! (excessive Tx retries
-13:12:52 wlan0: several excessive Tx retry errors occurred, a
-13:12:52 wlan0: tx error 0x20, buf 26! (excessive Tx retries
-13:12:52 wlan0: tx error 0x20, buf 27! (excessive Tx retries
-13:12:52 wlan0: tx error 0x20, buf 28! (excessive Tx retries
-13:12:52 wlan0: tx error 0x20, buf 29! (excessive Tx retries
-13:12:52 wlan0: several excessive Tx retry errors occurred, a
-13:12:52 wlan0: tx error 0x20, buf 30! (excessive Tx retries
-13:12:52 wlan0: tx error 0x20, buf 31! (excessive Tx retries
-13:12:52 wlan0: tx error 0x20, buf 00! (excessive Tx retries
-13:12:52 wlan0: less than 5 minutes since last radio recalibr
-13:12:58 wlan0: tx error 0x20, buf 01! (excessive Tx retries
-13:12:58 wlan0: several excessive Tx retry errors occurred, a
-13:12:58 wlan0: tx error 0x20, buf 02! (excessive Tx retries
-13:12:58 wlan0: tx error 0x20, buf 03! (excessive Tx retries
-13:12:58 wlan0: tx error 0x20, buf 04! (excessive Tx retries
-13:12:58 wlan0: tx error 0x20, buf 05! (excessive Tx retries
-13:12:58 wlan0: several excessive Tx retry errors occurred, a
-13:12:58 disabling above notification message
-13:12:58 wlan0: tx error 0x20, buf 06! (excessive Tx retries
-13:12:58 wlan0: tx error 0x20, buf 07!
-13:12:58 wlan0: tx error 0x20, buf 08!
-13:12:58 wlan0: less than 5 minutes since last radio recalibr
-13:13:06 wlan0: tx error 0x20, buf 09!
-13:13:06 wlan0: tx error 0x20, buf 10!
-13:13:06 wlan0: tx error 0x20, buf 11!
-13:13:06 wlan0: tx error 0x20, buf 12!
-13:13:06 wlan0: tx error 0x20, buf 13!
-13:13:06 wlan0: tx error 0x20, buf 14!
-13:13:06 wlan0: tx error 0x20, buf 15!
-13:13:06 wlan0: tx error 0x20, buf 16!
-13:13:06 wlan0: less than 5 minutes since last radio recalibr
-13:13:18 wlan0: tx error 0x20, buf 17!
-13:13:18 wlan0: tx error 0x20, buf 18!
-13:13:18 wlan0: tx error 0x20, buf 19!
-13:13:18 wlan0: tx error 0x20, buf 20!
-13:13:18 wlan0: tx error 0x20, buf 21!
-13:13:18 wlan0: tx error 0x20, buf 22!
-13:13:18 wlan0: tx error 0x20, buf 23!
-13:13:18 wlan0: tx error 0x20, buf 24!
-13:13:18 wlan0: less than 5 minutes since last radio recalibr
-13:13:25 wlan0: tx error 0x20, buf 25!
-13:13:25 wlan0: tx error 0x20, buf 26!
-13:13:25 wlan0: tx error 0x20, buf 27!
-13:13:25 wlan0: tx error 0x20, buf 28!
-13:13:25 wlan0: tx error 0x20, buf 29!
-13:13:25 wlan0: tx error 0x20, buf 30!
-13:13:25 wlan0: tx error 0x20, buf 31!
-13:13:25 wlan0: tx error 0x20, buf 00!
-13:13:25 wlan0: less than 5 minutes since last radio recalibr
-13:13:25 disabling above message
-13:13:32 wlan0: tx error 0x20, buf 01!
-13:13:32 wlan0: tx error 0x20, buf 02!
-13:13:32 wlan0: tx error 0x20, buf 03!
-13:13:32 wlan0: tx error 0x20, buf 04!
-13:13:32 wlan0: tx error 0x20, buf 05!
-13:13:32 wlan0: tx error 0x20, buf 06!
-13:13:32 wlan0: tx error 0x20, buf 07!
-13:13:32 wlan0: tx error 0x20, buf 08!
-13:13:41 wlan0: tx error 0x20, buf 09!
-13:13:41 wlan0: tx error 0x20, buf 10!
-13:13:41 wlan0: tx error 0x20, buf 11!
-13:13:41 wlan0: tx error 0x20, buf 12!
-13:13:41 wlan0: tx error 0x20, buf 13!
-13:13:41 wlan0: tx error 0x20, buf 14!
-13:13:41 wlan0: tx error 0x20, buf 15!
-13:13:41 wlan0: tx error 0x20, buf 16!
-13:13:51 wlan0: tx error 0x20, buf 17!
-13:13:51 wlan0: tx error 0x20, buf 18!
-13:13:51 wlan0: tx error 0x20, buf 19!
-13:13:51 wlan0: tx error 0x20, buf 20!
-13:13:51 wlan0: tx error 0x20, buf 21!
-13:13:51 wlan0: tx error 0x20, buf 22!
-13:13:51 wlan0: tx error 0x20, buf 23!
-13:13:51 wlan0: tx error 0x20, buf 24!
-13:14:02 wlan0: tx error 0x20, buf 25!
-13:14:02 wlan0: tx error 0x20, buf 26!
-13:14:02 wlan0: tx error 0x20, buf 27!
-13:14:02 wlan0: tx error 0x20, buf 28!
-13:14:02 wlan0: tx error 0x20, buf 29!
-13:14:02 wlan0: tx error 0x20, buf 30!
-13:14:02 wlan0: tx error 0x20, buf 31!
-13:14:02 wlan0: tx error 0x20, buf 00!
-13:14:13 wlan0: tx error 0x20, buf 01!
-13:14:13 wlan0: tx error 0x20, buf 02!
-13:14:13 wlan0: tx error 0x20, buf 03!
-13:14:13 wlan0: tx error 0x20, buf 04!
-13:14:13 wlan0: tx error 0x20, buf 05!
-13:14:13 wlan0: tx error 0x20, buf 06!
-13:14:13 wlan0: tx error 0x20, buf 07!
-13:14:13 wlan0: tx error 0x20, buf 08!
-[20061217]
-* Sync with acxsm 0.4.9
- - Moved some #includes (were sitting in the middle of the file)
- - from Andreas Mohr: ioremap -> ioremap_nocache,
-   more desriptive error message on firmware upload failure
+2010-05-08 Bernhard Loos <bernhardloos@googlemail.com>
+	* pci: Vlynq fixes
+
+2010-04-22 Vasily Khoruzhick <anarsoul@gmail.com>
+	* mem: Add platform module for iPAQ rx1950
+
+2010-03-14 Florian Fainelli <florian@openwrt.org>
+	* 2.6.34 mac80211 API adaptations
+
+2010-04-19 Oliver Winker <oliver@oli1170.net>
+	* DKMS support added
+	* Fix module unload on ifup
+	* hx4700: Fix platform device cleanup, when device registered 
+	  without driver.
+	* Fixed pci possible dropping of interrupts 
+	* Cleanups and refactoring common.c, pci.c, mem.c, usb.c
+
+2010-02-01 Andreas Mohr <andi@lisas.de>	
+	* Add more specific radio type descriptions	
+	* Fix uninitialized radio_type variable bug in USB driver part
+
+2010-01-31 Oliver Winker <oliver@oli1170.net>
+	* Slave memory interface updates:
+
+	- Update to 2.6.32 mac80211
+	- Workqueue tasklet for Rx, Tx processing
+	- Load stability improvements
+	- Various other bits and pieces
+    
+2010-01-03 Oliver Winker <oli1417@hallo.ms>
+	* Mac80211 2.6.32 API changes
+	* acx111 support with for mac80211 (WPA, WPA2)
+	* Issue_cmd fixed correctly. Timeout back to 50ms.
+
+2009-12-31 Oliver Winker <oli1417@hallo.ms>
+
+	This wraps up current usb.c updates: mac80211 API updates for 2.6.31, compiles. Limited device support.
 	
-[20060707]
-* Jeff Williams
-  Fixed Kconfig CONFIG_ACX_MAC80211_* in common.c and acx_struct.h
+	* Mac80211 API updates for 2.6.31, compiles. 
+	
+	* Device support:
+	
+	- ACX100 (TNETW1100): 
+	. Possibly working, but couldn't be tested. Required test device: D-Link DWL-120+
+	
+	- TNETW1450 support:
+	. Test device: Fritz! WLAN Stick, SI version, PRODUCT_ID 0x6201
+	. Firmware loads, device shows activity, however RX and TX paths are broken. 
+	. The RX path problem possibly related to urb,rxbuffer handling 
+	(in acxusb_i_complete_rx). Observed as followed: 
+	---
+	(Too) big packet to mac80211 and subsequent machine crash (e.g. double faults, etc.)
+	acx: rx: CTL/UNKNOWN time:620888198 len:65528 signal:20 SNR:100 macstat:AB phystat:44 phyrate:134 status:0
+	---
+	
+	* Logging changes
+	* Old kernel support #ifdefs removed
 
-[20060707]
-* Matthias Meyer
-  Moved GPL license to README
+2009-11-25 Oliver Winker <oli1417@hallo.ms>
 
-[20060605-20060706]
-* Jeff Williams <jeff@wdwconsulting.net>
-  Added DeviceScape 80211 stack support to PCI
-  Works with wpa_supplicant and hostapd
-  Removed excess homegrown/linux-wlan 80211 stack
+	* 2.6.31 fixes and pci.c WPA working basically
+	
+	- pci.c: 
+	. WPA assoc and data transfer working basically, tested on 
+	  DWL-650+, Acx100
+	. Load condition not stable yet
+	
+	- mem.c: update 2.6.31 TODO
+	- usb.c: TODO
+
+2009-11-13,4 Oliver Winker <oli1417@hallo.ms>
+
+	* Part4) Proc-FS fixes
+	
+	Proc-Fs fixes and improvements. Uses now seq_file for output. 
+	Avoids buffer overflows. 
+
+	=> This is the last commit of this series. This gives the new baseline
+	for the git repo with this branch.
+
+2009-11-13,3 Oliver Winker <oli1417@hallo.ms>
+
+	* Part3) mac80211 SW crypto support for WPA(2)
+
+	Doing the crypto by mac80211 requires that the acx is not doing any 
+	WEP crypto himself. Otherwise TX "WEP key not found" errors occur.
+
+	This change disables the WEP crypto by not configuring the WEP cache and 
+	leaving	WEPCacheStart=WEPCacheEnd.
+ 
+	By disabling WEP using WEPCacheStart=WEPCacheStart the is acx not trying any
+	own crypto anymore. All crypto (including WEP) is pushed to mac80211 for the
+	moment.
+
+	=> This allows successful WPA(2) association and data transfers (Tx,Rx) on
+	the hx4700 using the slave-mem interface (mem.c).
+	
+	TODO: Under load condition with slave-mem on hx4700 Rx path still stalls 
+	after some time.
+
+2009-11-13,2 Oliver Winker <oli1417@hallo.ms>
+
+	* Part2) Miscellaneous changes (common.c ...)
+	
+	- mac80211 API changes
+
+	- Start/stop queue handling
+
+	- Removed #ifdef of older kernel versions
+
+	- pci.c, usb.c: TODO 
+
+	- Misc, smaller changes:
+		. struct ieee80211_tx_info *ctl = IEEE80211_SKB_CB(skb);
+		. Included free irq in e_remove. Avoids crash when modules is removed.
+		. ieee80211_get_tx_rate(adev->ieee, ieeectl)->hw_value changed to 
+			ieee80211_get_tx_rate(adev->ieee, ieeectl)->bitrate
+		. acx_key_write: Fix on default key 
+		. Fixed productid, etc. in acx_s_parse_configoption
+		. Removed ieee80211_tx_info, since contained in sk_buff *skb
+		. Added ieee80211 queue status to diag output 
+
+2009-11-13,1 Oliver Winker <oli1417@hallo.ms>
+	* First part of a series of commits. These commits roughly group together 
+	changes	in different areas of the acx code. The grouping is done to have 
+	at least some basic split of the changes. Each single commit however is not 
+	working	stand-alone. 
+	
+	=> The end of this series will define a new baseline, from where single 
+	commits	should be well outlined and workable. 
+	
+	* Part1) Add slave memory support (mem.c)
+	
+		- Add mem.c from linux-handhelds-2.6-2.6.21-hh20-r16
+		
+		- Port diffs from pci.c to mem.c 
+		
+		- Interrupt handling is currently basic. Need to put back the workqueue.
+	
+		- acxmem_l_alloc_tx: Make a detailed check of required tx_buf block, to 
+		avoid a 'out of tx_buf' situation. The empty tx_buf and reuse trick in 
+		acxmem_l_tx_data didn't work so well. If not enough, we stop the queues 
+		and report to max80211 NOT_OK (which seems to work, although we 
+		shouldn't ...)
+		  
+		- Include for debugging: #include "wlan_compat.h", #include "wlan_hdr.h"
+	
+		- acxmem_l_alloc_tx(acx_device_t *adev): 
+		Fix if (unlikely(DESC_CTL_HOSTOWN != (ctl8 & DESC_CTL_HOSTOWN)))
+	
+		- Uncoupled code dependency between hx4700_acx.c (hx4700_acx.ko) and 
+		mem.c (acx_mac80211.ko) via "struct acx_hardware_data" (start_hw, 
+		stop_hw). Start/stop of HW done using module functions called in 
+		corresponding sequence.
+		
+2008-02-10 Matteo Croce <rootkit85@users.sf.net>
+	* Makefile: add support for out-of-kernel module compilation.
+	* Dropped support for kernel versions older than 2.6.19.
+	* Small code refactoring and cleanup changes.
+
+2008-01-12 Matteo Croce <rootkit85@users.sf.net>
+	* 0.3.37 release.
+	* Added VLYNQ support. This allows the driver to support TNETW1130 and
+	TNETW1350 devices on ar7-based routers. The chipsets can apparently
+	work with either PCI (miniPCI) or VLYNQ, but the boards containing
+	them usually only implement VLYNQ.
+	See http://acx100.sourceforge.net/wiki/VLYNQ for further information.
+	Changes contributed from the openwrt project.
+
+2007-10-03 Matteo Croce <rootkit85@users.sf.net>
+	* Added some endiannes-related functions. Changes contributed from the
+	openwrt project.
+	* Disabled the power management on PCI devices through the CONFIG_PM
+	definition.
+
+2007-06-10 Matteo Croce <rootkit85@users.sf.net>
+	* Added support for the 2.6.22 kernel.
 
 [20070101] 0.3.36
 * Andreas Mohr <andi@lisas.de>
@@ -135,8 +197,9 @@ TODO: from Efthym <efthym@gmx.net>:
     (supported ones, that is: >= 2.6.10), then please yell immediately!
     Those people *REALLY* want me to concentrate on getting this stuff ready for
     mainline, it seems...
-  - MAC address change fix (contributed by Carlos Martín Nieto/Luis Padilla)
-  - fix iwlist wlan0 scan output (updated wrong pointer variable --> only one single rate value listed, doh!)
+  - MAC address change fix (contributed by Carlos Martï¿½n Nieto/Luis Padilla)
+  - fix iwlist wlan0 scan output (updated wrong pointer variable --> only one
+    single rate value listed, doh!)
   - fix buggy hidden ESSID handling (didn't cover all variants in all places)
   - corrected(?) duration/sequence values in assoc steps handling
   - use ioremap_nocache() instead of ioremap() (safer)
@@ -147,6 +210,26 @@ TODO: from Efthym <efthym@gmx.net>:
   - updated format of main hardware status log message
   - slightly enhanced Reason Code log messages
   - minor cleanup
+
+[20061217]
+* Sync with acxsm 0.4.9
+ - Moved some #includes (were sitting in the middle of the file)
+ - from Andreas Mohr: ioremap -> ioremap_nocache,
+   more descriptive error message on firmware upload failure
+
+[20060707]
+* Jeff Williams
+  Fixed Kconfig CONFIG_ACX_MAC80211_* in common.c and acx_struct.h
+
+[20060707]
+* Matthias Meyer
+  Moved GPL license to README
+
+[20060605-20060706]
+* Jeff Williams <jeff@wdwconsulting.net>
+  Added DeviceScape 80211 stack support to PCI
+  Works with wpa_supplicant and hostapd
+  Removed excess homegrown/linux-wlan 80211 stack
 
 [20060518]
 * Fix warnings about packed structs and printf format mismatches.
