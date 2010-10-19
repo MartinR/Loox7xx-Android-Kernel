@@ -57,17 +57,17 @@ static unsigned int loox720_key_matrix[] = {
 	// KEY( row , column , KEY_CODE )
 
 	// row 0
-	KEY( 0,0,KEY_CAMERA),KEY( 0,1,KEY_UP), KEY( 0,2,KEY_OK),
+	KEY( 0,0,KEY_CAMERA),KEY( 0,1,KEY_UP), KEY( 0,2,KEY_ENTER),
 	// row 1
-	KEY( 1,0,_KEY_RECORD),KEY( 1,1,KEY_DOWN), KEY( 1,2,KEY_SCROLLDOWN),
+	KEY( 1,0,_KEY_RECORD),KEY( 1,1,KEY_DOWN), KEY( 1,2,KEY_VOLUMEDOWN),
 	// row 2
-	KEY( 2,0,_KEY_CALENDAR),KEY( 2,1,KEY_RIGHT), KEY( 2,2,KEY_SCROLLUP),
+	KEY( 2,0,KEY_F2),KEY( 2,1,KEY_RIGHT), KEY( 2,2,KEY_VOLUMEUP),
 	// row 3
-	KEY( 3,0,_KEY_APP3),KEY( 3,1,KEY_LEFT),
+	KEY( 3,0,KEY_BACK),KEY( 3,1,KEY_LEFT),
 	// row 4
-	KEY( 4,0,_KEY_CONTACTS),KEY( 4,1,KEY_ENTER), 
+	KEY( 4,0,KEY_MENU),KEY( 4,1,KEY_REPLY),
 	// row 5
-	KEY( 5,0,_KEY_HOMEPAGE),
+	KEY( 5,0,KEY_HOME),
 };
 
 struct pxa27x_keypad_platform_data loox720_keypad_info = {
