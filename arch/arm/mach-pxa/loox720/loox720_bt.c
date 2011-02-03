@@ -23,6 +23,7 @@
 #include <mach/loox720-gpio.h>
 #include <mach/loox720-cpld.h>
 #include <mach/regs-uart.h>
+#include <linux/rfkill.h>
 
 #define DRV_NAME              "loox720-bt"
 
@@ -35,10 +36,10 @@ BT_PRE_SUSPEND_ON,
 static enum loox_bt_state state;
 
 /* Bluetooth control */
-static void loox720_bt_enable(int on)
+static int loox720_bt_set_block(void *data, bool blocked)
 {
 	int tries;
-	if (on) {
+	if (!blocked) {
 		/* pre-serial-up hardware configuration */
 		loox720_egpio_set_bit( LOOX720_CPLD_BLUETOOTH_POWER, 1 );
 		loox720_egpio_set_bit( LOOX720_CPLD_BLUETOOTH_RADIO, 1 );
@@ -46,23 +47,6 @@ static void loox720_bt_enable(int on)
 		gpio_set_value( GPIO_NR_LOOX720_CPU_BT_RESET_N, 0 );
 		mdelay(1);
 		gpio_set_value( GPIO_NR_LOOX720_CPU_BT_RESET_N, 1 );
-
-		/*
-		 * BRF6150's RTS goes low when firmware is ready
-		 * so check for CTS=1 (nCTS=0 -> CTS=1). Typical 150ms
-		 */
-		printk( KERN_NOTICE "loox720_bt.c: Waiting for firmware...\n");
-		tries = 0;
-		
-		do {
-			mdelay(10);
-		} while ((BTMSR & MSR_CTS) == 0 && tries++ < 50);
-		
-		if(tries>49)
-		{
-			printk( KERN_NOTICE "loox720_bt.c: Firmware timeout!\n");
-		}
-
 		state = BT_ON;
 	}
 	else {
@@ -73,40 +57,51 @@ static void loox720_bt_enable(int on)
 		if (state != BT_PRE_SUSPEND_ON)
 		  state = BT_OFF;
 	}
+
+	return 0;
 }
 
-static ssize_t loox720_bt_show(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	return snprintf(buf, PAGE_SIZE, "%d\n", !(state == BT_OFF));
-}
-
-static ssize_t loox720_bt_store(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-	int new_state;
-	char *endp;
-
-	new_state = simple_strtoul(buf, &endp, 0);
-	if (*endp && !isspace(*endp))
-		return -EINVAL;
-
-	loox720_bt_enable(new_state);
-
-	return count;
-}
-static DEVICE_ATTR(enable, 0644,
-		loox720_bt_show,
-		loox720_bt_store);
+static const struct rfkill_ops loox720_bt_rfkill_ops = {
+	.set_block = loox720_bt_set_block,
+};
 
 static int __init loox720_bt_probe(struct platform_device *pdev)
 {
+	int r;
+	struct rfkill *rfk;
+
 	if(gpio_request(GPIO_NR_LOOX720_CPU_BT_RESET_N, "BT_RESET_N") != 0) {
 		printk(KERN_ERR "Failed to request BT_RESET_N GPIO\n");
 		return -ENODEV;
 	}
-	/* disable BT by default */
-	loox720_bt_enable(0);
 
-	return device_create_file(&pdev->dev, &dev_attr_enable);
+	rfk = rfkill_alloc("loox720-bt", &pdev->dev, RFKILL_TYPE_BLUETOOTH, &loox720_bt_rfkill_ops, NULL);
+	if (!rfk)
+	{
+		gpio_free(GPIO_NR_LOOX720_CPU_BT_RESET_N);
+		printk(KERN_ERR "Failed to allocate rfkill.\n");
+		return -ENOMEM;
+	}
+
+	rfkill_set_hw_state(rfk, true);
+
+	/*rfkill_set_led_trigger_name(rfk, "loox720-bt");*/
+
+	r = rfkill_register(rfk);
+	if (r)
+	{
+		gpio_free(GPIO_NR_LOOX720_CPU_BT_RESET_N);
+		rfkill_destroy(rfk);
+		printk(KERN_ERR "Failed to register rfkill.\n");
+		return r;
+	}
+
+	platform_set_drvdata(pdev, rfk);
+
+	/* disable BT by default */
+	loox720_bt_set_block(NULL, true);
+
+	return 0;
 }
 
 static int loox720_bt_remove(struct platform_device *pdev)
@@ -120,7 +115,7 @@ static int loox720_bt_suspend(struct platform_device *pdev, pm_message_t mstate)
 {
 	if (state == BT_ON) {
 	  state = BT_PRE_SUSPEND_ON;
-	  loox720_bt_enable(0);
+	  loox720_bt_set_block(NULL, true);
 	}
 	return 0;
 }
@@ -128,7 +123,7 @@ static int loox720_bt_suspend(struct platform_device *pdev, pm_message_t mstate)
 static int loox720_bt_resume(struct platform_device *pdev)
 {
 	if (state == BT_PRE_SUSPEND_ON)
-	  loox720_bt_enable(1);
+	  loox720_bt_set_block(NULL, false);
 	return 0;
 }
 #else
