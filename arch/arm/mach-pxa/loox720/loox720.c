@@ -363,7 +363,7 @@ static struct pxa2xx_udc_mach_info loox720_udc_info __initdata = {
 
 static struct pxaohci_platform_data loox720_ohci_info = {
 	        .port_mode = PMM_PERPORT_MODE,
-	        .flags = ENABLE_PORT1 | ENABLE_PORT3 | POWER_CONTROL_LOW | POWER_SENSE_LOW,
+	        .flags = ENABLE_PORT1 | ENABLE_PORT2 /*| POWER_CONTROL_LOW*/ | POWER_SENSE_LOW,
 		.power_budget = 0
 };
 
