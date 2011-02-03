@@ -177,17 +177,70 @@ EXPORT_SYMBOL(loox720_ads7846_battery_temp);
 	input layer reporting interface
    ========================================================== */
 
+static void transform(unsigned int *x, unsigned int *y)
+{
+    static int a[7] = {-9904, -97, 35864388, 176, 12671, -5268952, 65536};
+    /*static s32 a[7] = {1, 0, 0, 0, 1, 0, 1};*/
+
+    int xtemp = (a[2] + a[0] * ((s32)(*x)) + a[1] * ((s32)(*y))) / a[6];
+    int ytemp = (a[5] + a[3] * ((s32)(*x)) + a[4] * ((s32)(*y))) / a[6];
+
+    if (xtemp < 0)
+        xtemp = 0;
+    else if (xtemp > 479)
+        xtemp = 479;
+
+    if (ytemp < 0)
+        ytemp = 0;
+    else if (ytemp > 639)
+        xtemp = 639;
+
+    *x = xtemp;
+    *y = ytemp;
+}
+
 void loox720_ads7846_report(loox720_ads7846_device_info * dev, unsigned int Rt, unsigned int x, unsigned int y)
 {
+	static unsigned int lastx = UINT_MAX, lasty = UINT_MAX;
+	static unsigned int sumx = 0, sumy = 0, sumr = 0;
+	static unsigned int count = 0;
+
+	if ((abs(lastx - x) >= 64) || (abs(lasty - y) >= 64))
+	{
+		sumx = lastx = x;
+		sumy = lasty = y;
+		sumr = Rt;
+		count = 1;
+		return;
+	}
+
+	sumx+= x;
+	sumy+= y;
+	sumr+= Rt;
+
+	lastx = x;
+	lasty = y;
+
+	if (++count >= 4)
+	{
 		if (dev->report_button)
 		{
 			input_report_key(dev->input, BTN_TOUCH, 1);
 			dev->report_button=0;
 		}
+		x = sumx / count;
+		y = sumy / count;
+
+		transform(&x, &y);
+
 		input_report_abs(dev->input, ABS_X, x);
 		input_report_abs(dev->input, ABS_Y, y);
-		input_report_abs(dev->input, ABS_PRESSURE, Rt);
+		input_report_abs(dev->input, ABS_PRESSURE, Rt / count);
 		input_sync(dev->input);
+
+		sumx = sumy = Rt = 0;
+		count = 0;
+	}
 }
 
 /* ==========================================================
