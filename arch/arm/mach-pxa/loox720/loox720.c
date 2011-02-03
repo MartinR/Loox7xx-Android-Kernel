@@ -471,6 +471,7 @@ static struct pxa2xx_spi_chip loox720_spi_ads7846_hw = {
 	.timeout		= 1000,
 	.enable_loopback	= 0,
 	.dma_burst_size		= 0,
+	.gpio_cs		= -1
 };
 static struct spi_board_info spi_board_info[] __initdata = {
 	{
