@@ -5,7 +5,7 @@ config LOOX720_LCD
     bool "FSC Loox 720 LCD"
     select FB
     select FB_BACKLIGHT
-    select BACKLIGHT_LOOX720
+    select BACKLIGHT_PWM
     select LCD_CLASS_DEVICE
     select LCD_LOOX720
     depends on MACH_LOOX720

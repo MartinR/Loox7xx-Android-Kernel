@@ -34,6 +34,7 @@
 #include <mach/pxafb.h>
 #include <linux/pwm_backlight.h>
 #include <linux/platform_device.h>
+#include <video/platform_lcd.h>
 
 #include "../devices.h"
 
@@ -75,7 +76,7 @@ static struct pxafb_mach_info loox720_fb_info =
 	.modes			= &loox720_lcd_mode_info,
 	.num_modes		= 1,
 	.lcd_conn		= LCD_COLOR_TFT_16BPP,
-	.pxafb_lcd_power	= loox720_lcd_power
+	//.pxafb_lcd_power	= loox720_lcd_power
 	//.lccr0			= LCCR0_Act | LCCR0_Sngl | LCCR0_Color ,
 	//.lccr3			= LCCR3_OutEnH | LCCR3_PixRsEdg, // | LCCR3_DPC,
 };
@@ -115,10 +116,18 @@ static struct platform_pwm_backlight_data loox720_bl_data = {
 
 static struct platform_device loox720_bl_device = {
 	.name		= "pwm-backlight",
+	.id		= -1,
 	.dev		= {
 		.parent = &pxa27x_device_pwm0.dev,
 		.platform_data = &loox720_bl_data},
 };
+
+// lcd on/off is now handled by the lcd device
+static struct platform_device loox720_lcd_device = {
+	.name		= "loox720-lcd",
+	.id		= -1,
+};
+
 
 static int __init
 loox720_lcd_init (void)
@@ -128,7 +137,7 @@ loox720_lcd_init (void)
 
 	set_pxa_fb_info(&loox720_fb_info);
 	platform_device_register(&loox720_bl_device);
-	/*platform_device_register(&loox720_lcd_device);*/
+	platform_device_register(&loox720_lcd_device);
 	return 0;
 }
 
@@ -136,7 +145,7 @@ static void __exit
 loox720_lcd_exit (void)
 {
 	platform_device_unregister(&loox720_bl_device);
-	/*platform_device_unregister(&loox720_lcd_device);*/
+	platform_device_unregister(&loox720_lcd_device);
 }
 
 module_init (loox720_lcd_init);
