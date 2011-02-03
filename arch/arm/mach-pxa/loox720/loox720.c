@@ -299,10 +299,11 @@ static struct platform_device pxa_ssp = {
  * Touchscreen
  */
 
+#ifdef CONFIG_LOOX720_TS
 static struct platform_device loox720_ts = {
 	.name = "loox720-ts",
 };
-
+#endif
 
 /*
  * Buttons

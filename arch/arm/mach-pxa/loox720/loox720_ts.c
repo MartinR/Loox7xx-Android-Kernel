@@ -36,11 +36,13 @@
 static struct ads7846_platform_data ads_info = {
 	.model			= 7845,
 	.gpio_pendown		= GPIO_NR_LOOX720_TOUCHPANEL_IRQ_N,
-	.debounce_max		= 12,
-	.debounce_tol		= 4,
-	.debounce_rep		= 1,
-	.penirq_recheck_delay_usecs = 1000,
-	.vref_mv		= 2500
+	.debounce_max		= 4,
+	.debounce_tol		= 8,
+	.debounce_rep		= 16,
+	.penirq_recheck_delay_usecs = 20000,
+	.vref_mv		= 2500,
+	.x_max			= 480,
+	.y_max			= 640
 };
 
 static struct pxa2xx_spi_chip ads_hw = {
