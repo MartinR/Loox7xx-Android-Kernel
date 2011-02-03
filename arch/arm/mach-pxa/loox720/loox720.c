@@ -232,7 +232,11 @@ static struct platform_device loox720_bt = {
 static struct gpio_keys_button loox720_button_table[] = {
 	[0] = {
 		.desc	= "wakeup",
+#ifdef CONFIG_ANDROID
+		.code	= KEY_POWER,
+#else
 		.code	= KEY_SUSPEND,
+#endif
 		.type	= EV_KEY,
 		.gpio	= GPIO_NR_LOOX720_KEY_ON,
 		.wakeup	= 1,

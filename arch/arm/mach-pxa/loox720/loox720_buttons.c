@@ -57,15 +57,40 @@ static unsigned int loox720_key_matrix[] = {
 	// KEY( row , column , KEY_CODE )
 
 	// row 0
-	KEY( 0,0,KEY_CAMERA),KEY( 0,1,KEY_UP), KEY( 0,2,KEY_ENTER),
+	KEY( 0,0,KEY_CAMERA),KEY( 0,1,KEY_UP),
+#ifdef CONFIG_ANDROID
+	KEY( 0,2,KEY_ENTER),
+#else
+	KEY( 0,2,KEY_OK),
+#endif
 	// row 1
-	KEY( 1,0,_KEY_RECORD),KEY( 1,1,KEY_DOWN), KEY( 1,2,KEY_VOLUMEDOWN),
+#ifdef CONFIG_ANDROID
+	KEY( 1,0,_KEY_RECORD),
+#else
+	KEY( 1,0,KEY_LEFTSHIFT),
+#endif
+	KEY( 1,1,KEY_DOWN),
+#ifdef CONFIG_ANDROID
+	KEY( 1,2,KEY_VOLUMEDOWN),
+#else
+	KEY( 1,2,KEY_PAGEDOWN),
+#endif
 	// row 2
-	KEY( 2,0,KEY_F2),KEY( 2,1,KEY_RIGHT), KEY( 2,2,KEY_VOLUMEUP),
+	KEY( 2,0,KEY_F2),KEY( 2,1,KEY_RIGHT),
+#ifdef CONFIG_ANDROID
+	KEY( 2,2,KEY_VOLUMEUP),
+#else
+	KEY( 2,2,KEY_PAGEUP),
+#endif
 	// row 3
 	KEY( 3,0,KEY_BACK),KEY( 3,1,KEY_LEFT),
 	// row 4
-	KEY( 4,0,KEY_MENU),KEY( 4,1,KEY_REPLY),
+	KEY( 4,0,KEY_MENU),
+#ifdef CONFIG_ANDROID
+	KEY( 4,1,KEY_REPLY),
+#else
+	KEY( 0,2,KEY_ENTER),
+#endif
 	// row 5
 	KEY( 5,0,KEY_HOME),
 };
