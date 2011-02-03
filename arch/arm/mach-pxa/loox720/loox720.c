@@ -202,27 +202,6 @@
  * IRDA
  */
 
-static void loox_irda_transceiver_mode(struct device *dev, int mode)
-{
-	unsigned long flags;
-
-	local_irq_save(flags);
-
-	gpio_set_value(GPIO_NR_LOOX720_IR_ON_N, mode & IR_OFF);
-
-	local_irq_restore(flags);
-}
-
-static int loox_irda_startup(struct device *dev)
-{
-	return gpio_request(GPIO_NR_LOOX720_IR_ON_N, "IrDA enable");
-}
-
-static void loox_irda_shutdown(struct device *dev)
-{
-	gpio_free(GPIO_NR_LOOX720_IR_ON_N);
-}
-
 static struct pxaficp_platform_data loox_ficp_info = {
 	.transceiver_cap  = IR_SIRMODE | IR_FIRMODE | IR_OFF,
 	.gpio_pwdown = GPIO_NR_LOOX720_IR_ON_N,
