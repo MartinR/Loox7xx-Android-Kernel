@@ -48,6 +48,7 @@
 #include <plat/i2c.h>
 #include <mach/sharpsl.h>
 #include <linux/spi/spi.h>
+#include <linux/usb/android_composite.h>
 
 #include "../generic.h"
 #include "loox720_core.h"
@@ -355,6 +356,146 @@ static struct pxa2xx_udc_mach_info loox720_udc_info __initdata = {
 	.gpio_vbus            = -1,
 };
 
+#ifdef CONFIG_USB_ANDROID
+
+#ifdef CONFIG_USB_ANDROID_MASS_STORAGE
+static struct usb_mass_storage_platform_data mass_storage_pdata = {
+    .nluns		= 1,
+    .vendor		= "Siemens",
+    .product		= "Pocket Loox 720",
+    .release		= 0x0100,
+};
+
+static struct platform_device usb_mass_storage_device = {
+    .name = "usb_mass_storage",
+    .id = -1,
+    .dev = {
+	.platform_data = &mass_storage_pdata,
+	},
+};
+#endif
+
+#ifdef CONFIG_USB_ANDROID_RNDIS
+static struct usb_ether_platform_data rndis_pdata = {
+    .ethaddr		= {0x02, 0x00, 0x40, 0x00, 0x00, 0x01},
+    .vendorID		= 0x0BF8,
+    .vendorDescr	= "Siemens",
+};
+
+static struct platform_device rndis_device = {
+    .name	= "rndis",
+    .id	= -1,
+    .dev	= {
+	.platform_data = &rndis_pdata,
+    },
+};
+#endif
+
+#ifdef CONFIG_USB_ANDROID_MASS_STORAGE
+#ifndef CONFIG_USB_ANDROID_ADB
+static char *usb_functions_ums[] = {
+    "usb_mass_storage",
+};
+#else
+static char *usb_functions_ums_adb[] = {
+    "usb_mass_storage",
+    "adb",
+};
+#endif
+#endif
+#ifdef CONFIG_USB_ANDROID_RNDIS
+#ifndef CONFIG_USB_ANDROID_ADB
+static char *usb_functions_rndis[] = {
+    "rndis",
+};
+#else
+static char *usb_functions_rndis_adb[] = {
+    "rndis",
+    "adb",
+};
+#endif
+#endif
+#if defined CONFIG_USB_ANDROID_ADB && !defined CONFIG_USB_ANDROID_MASS_STORAGE && !defined CONFIG_USB_ANDROID_RNDIS
+static char *usb_functions_adb[] = {
+    "adb",
+};
+#endif
+
+static struct android_usb_product usb_products[] = {
+#ifdef CONFIG_USB_ANDROID_MASS_STORAGE
+#ifndef CONFIG_USB_ANDROID_ADB
+    {
+	.product_id	= 0x1001,
+	.num_functions	= ARRAY_SIZE(usb_functions_ums),
+	.functions	= usb_functions_ums,
+    },
+#else
+    {
+	.product_id	= 0x1001,
+	.num_functions	= ARRAY_SIZE(usb_functions_ums_adb),
+	.functions	= usb_functions_ums_adb,
+    },
+#endif
+#endif
+#ifdef CONFIG_USB_ANDROID_RNDIS
+#ifndef CONFIG_USB_ANDROID_ADB
+    {
+	.product_id	= 0x1001,
+	.num_functions	= ARRAY_SIZE(usb_functions_rndis),
+	.functions	= usb_functions_rndis,
+    },
+#else
+    {
+	.product_id	= 0x1001,
+	.num_functions	= ARRAY_SIZE(usb_functions_rndis_adb),
+	.functions	= usb_functions_rndis_adb,
+    },
+#endif
+#endif
+#if defined CONFIG_USB_ANDROID_ADB && !defined CONFIG_USB_ANDROID_MASS_STORAGE && !defined CONFIG_USB_ANDROID_RNDIS
+    {
+	.product_id	= 0x1001,
+	.num_functions	= ARRAY_SIZE(usb_functions_adb),
+	.functions	= usb_functions_adb,
+    },
+#endif
+};
+
+static char *usb_functions_all[] = {
+#ifdef CONFIG_USB_ANDROID_RNDIS
+    "rndis",
+#endif
+#ifdef CONFIG_USB_ANDROID_MASS_STORAGE
+    "usb_mass_storage",
+#endif
+#ifdef CONFIG_USB_ANDROID_ADB
+    "adb",
+#endif
+#ifdef CONFIG_USB_ANDROID_ACM
+    "acm",
+#endif
+};
+
+static struct android_usb_platform_data android_usb_platform_info = {
+	.vendor_id            = 0x0BB4,
+	.product_id           = 0x1001,
+	.product_name         = "Pocket Loox 720",
+	.num_products         = ARRAY_SIZE(usb_products),
+	.products             = usb_products,
+	.num_functions        = ARRAY_SIZE(usb_functions_all),
+	.functions            = usb_functions_all,
+};
+
+static struct platform_device android_usb_device = {
+	.name                 = "android_usb",
+	.id                   = -1,
+	.dev                  = {
+		.platform_data        = &android_usb_platform_info,
+	}
+};
+
+#endif /* CONFIG_USB_ANDROID */
+
 /*--------------------------------------------------------------------------------*/
 
 /*
@@ -461,6 +602,15 @@ static struct platform_device *devices[] __initdata = {
 	&loox7xx_flash,
 #endif
 	&loox720_pm,
+#ifdef CONFIG_USB_ANDROID
+#ifdef CONFIG_USB_ANDROID_RNDIS
+	&rndis_device,
+#endif
+#ifdef CONFIG_USB_ANDROID_MASS_STORAGE
+	&usb_mass_storage_device,
+#endif
+	&android_usb_device
+#endif
 };
 
 #ifdef CONFIG_LOOX720_ADS7846
