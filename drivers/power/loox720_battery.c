@@ -15,6 +15,7 @@
 #include <linux/platform_device.h>
 #include <linux/pm.h>
 #include <linux/gpio.h>
+#include <linux/timer.h>
 
 #include <asm/irq.h>
 #include <asm/io.h>
@@ -39,6 +40,9 @@ static unsigned int battery_irq = 0xffffffff;
 static unsigned int usb_irq = 0xffffffff;
 
 #ifdef CONFIG_POWER_SUPPLY
+
+static struct timer_list battery_timer;
+
 /* one property function for battery, AC and USB power */
 static int loox720_power_get_property(struct power_supply *psy,
 				  enum power_supply_property psp,
@@ -82,7 +86,7 @@ static int loox720_power_get_property(struct power_supply *psy,
 				  no division by 1000 since value is expected to be in uV*/
 	break;
 	case POWER_SUPPLY_PROP_CURRENT_NOW:
-      	  val->intval = loox720_ads7846_battery_current(); /* we assume that ADS delivers correct mA value (Vref 2500mV!) */
+	  val->intval = loox720_ads7846_battery_current(); /* we assume that ADS delivers correct mA value (Vref 2500mV!) */
 	  if (val->intval < 0)
 	    return -1;
 	  val->intval *= 1000; /* value is expected to be in uA */
@@ -94,7 +98,22 @@ static int loox720_power_get_property(struct power_supply *psy,
 	  val->intval *= 325; /* scaling with 0.325 (assumed ADS Vref 2500mV!), */
 	  val->intval /= 1000; /* multimeter val + ~10% (to HaRET values), value in 1/10 C */ 
 	break;
+	case POWER_SUPPLY_PROP_CAPACITY:
+	  val->intval = (loox720_ads7846_battery_voltage() * 1760 - 3635000) * 100 / (4158000 - 3635000);
+	  if (val->intval > 100)
+	    val->intval = 100;
+	break;
+#else
+	case POWER_SUPPLY_PROP_VOLTAGE_NOW:
+	  val->intval = 4000000;
+	break;
+	case POWER_SUPPLY_PROP_CAPACITY:
+	  val->intval = (4000000 - 3635000) * 100 / (4158000 - 3635000);
+	break;
 #endif
+	case POWER_SUPPLY_PROP_PRESENT:
+	  val->intval = 1;
+	break;
 	default:
 		return -EINVAL;
 	}
@@ -112,8 +131,10 @@ static enum power_supply_property loox720_power_battery_props[] = {
 	POWER_SUPPLY_PROP_TECHNOLOGY,
 	POWER_SUPPLY_PROP_VOLTAGE_MAX,
 	POWER_SUPPLY_PROP_VOLTAGE_MIN,
-#ifdef CONFIG_LOOX720_ADS7846
 	POWER_SUPPLY_PROP_VOLTAGE_NOW,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_PRESENT,
+#ifdef CONFIG_LOOX720_ADS7846
 	POWER_SUPPLY_PROP_CURRENT_NOW,
 	POWER_SUPPLY_PROP_TEMP,
 #endif
@@ -188,18 +209,28 @@ static void update_battery_chip(void)
 	loox720_egpio_set_bit(LOOX720_CPLD_BATTERY_BIT, connected);
 }
 
-static int
+#ifdef CONFIG_POWER_SUPPLY
+static void loox720_battery_timer_func(unsigned long unused)
+{
+	power_supply_changed(&loox720_psy_battery);
+	mod_timer(&battery_timer, jiffies + HZ * 60);
+}
+#endif
+
+
+static irqreturn_t
 battery_isr(int irq, void *data)
 {
 	int full = gpio_get_value(GPIO_NR_LOOX720_BATTERY_FULL_N) == 0;
 	printk( KERN_INFO "battery_isr: battery_full=%d\n", full);
 
 	update_battery_charging();
+	mod_timer(&battery_timer, jiffies + 1);
 
 	return IRQ_HANDLED;
 }
 
-static int
+static irqreturn_t
 ac_isr(int irq, void *data)
 {
 	int connected;
@@ -212,11 +243,12 @@ ac_isr(int irq, void *data)
 
 	update_battery_charging();
 	update_battery_chip();
+	power_supply_changed(&loox720_psy_ac);
 
 	return IRQ_HANDLED;
 }
 
-static int
+static irqreturn_t
 usb_isr(int irq, void *data)
 {
 	int connected;
@@ -229,6 +261,7 @@ usb_isr(int irq, void *data)
 
 	update_battery_charging();
 	update_battery_chip();
+	power_supply_changed(&loox720_psy_usb);
 
 	return IRQ_HANDLED;
 }
@@ -268,16 +301,19 @@ loox720_battery_probe( struct platform_device *pdev)
 		return -ENODEV;
 	}
 
-	update_battery_chip();
-	update_battery_charging();
 #ifdef CONFIG_POWER_SUPPLY
+	setup_timer(&battery_timer, loox720_battery_timer_func, 0);
 	if (power_supply_register(&pdev->dev, &loox720_psy_ac) != 0)
 	  dev_err(&pdev->dev, "failed to register %s power supply\n",loox720_psy_ac.name);
 	if (power_supply_register(&pdev->dev, &loox720_psy_usb) != 0)
 	  dev_err(&pdev->dev, "failed to register %s power supply\n",loox720_psy_usb.name);
 	if (power_supply_register(&pdev->dev, &loox720_psy_battery) != 0)
 	  dev_err(&pdev->dev, "failed to register %s power supply\n",loox720_psy_battery.name);
+	mod_timer(&battery_timer, jiffies + HZ * 60);
 #endif
+	update_battery_chip();
+	update_battery_charging();
+
 	return 0;
 }
 
@@ -291,6 +327,7 @@ loox720_battery_remove( struct platform_device *dev )
 	if (usb_irq != 0xffffffff)
 		free_irq( usb_irq, NULL );
 #ifdef CONFIG_POWER_SUPPLY
+	del_timer_sync(&battery_timer);
 	power_supply_unregister(&loox720_psy_ac);
 	power_supply_unregister(&loox720_psy_usb);
 	power_supply_unregister(&loox720_psy_battery);
