@@ -23,6 +23,7 @@
 
 #define TS_POLL_DELAY(x)	(((x) - 1) * 1000000) // sample rate = +/- 5Hz with 200kHz spi bus
 
+static DEFINE_MUTEX(battery_lock);
 static loox720_ads7846_device_info *loox720_batt_monitor_device = NULL;
 // =======================================================
 // hardcoded values for testing
@@ -114,7 +115,7 @@ static unsigned int SPI_hwmon_read_write_block(loox720_ads7846_device_info * ads
 	
 	spi_sync(ads->spi,m);
 	
-	return convert_hwmon_data_12( ads, 0);
+	return convert_hwmon_data_12( ads->hwmon_receiveblock, 0);
 }
 
 /* ==================================================================
@@ -135,8 +136,10 @@ static int loox720_ads7846_battery_reading(int cpld) {
 	ssize_t v;
 	if (loox720_batt_monitor_device == NULL)
 	  return -1;
+	mutex_lock(&battery_lock);
 	loox720_ads7846_set_hwmon_port(cpld);
 	v = SPI_hwmon_read_write_block(loox720_batt_monitor_device, ads_hwmon_vaux, ARRAY_SIZE(ads_hwmon_vaux));
+	mutex_unlock(&battery_lock);
 	if (v < 0) 
 		return v;
 /* rescale measured vAUX voltage in relation to vREF...note that this is
@@ -200,10 +203,10 @@ static void loox720_ads7846_callback(void *data)
 		if(!readpen(ads))
 			loox720_ads7846_report(ads, ads->rt, ads->x ,ads->y);
 
-	x  = convert_data_12( ads, 1);
-	y  = convert_data_12( ads, 3 );
-	z1 = convert_data_12( ads, 4 );
-	z2 = convert_data_12( ads, 5 );
+	x  = convert_data_12( ads->receiveblock, 1 );
+	y  = convert_data_12( ads->receiveblock, 3 );
+	z1 = convert_data_12( ads->receiveblock, 4 );
+	z2 = convert_data_12( ads->receiveblock, 5 );
 	
 	if ((x>10)&&(y>10)) // valid measurement
 	{

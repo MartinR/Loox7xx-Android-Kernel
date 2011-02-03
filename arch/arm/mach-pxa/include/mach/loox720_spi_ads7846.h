@@ -46,8 +46,8 @@
 
 #define	MAX_12BIT	((1<<12)-1)
 
-#define convert_data_12( data, pos ) (((data)->receiveblock[ pos ] &0x3f)<<6)|(((data)->receiveblock[ pos + 1] &0xfc00)>>10)
-#define convert_hwmon_data_12( data, pos ) (((data)->hwmon_receiveblock[ pos ] &0x3f)<<6)|(((data)->hwmon_receiveblock[ pos + 1] &0xfc00)>>10)
+#define convert_data_12( data, pos ) (((data)[ pos ] &0x3f)<<6)|(((data)[ pos + 1] &0xfc00)>>10)
+#define convert_hwmon_data_12( data, pos ) (((data)[ pos ] &0x3f)<<6)|(((data)[ pos + 1] &0xfc00)>>10)
 
 #define LOOX720_CPLD_VAUX_VBATT		0
 #define LOOX720_CPLD_VAUX_IBATT		1
