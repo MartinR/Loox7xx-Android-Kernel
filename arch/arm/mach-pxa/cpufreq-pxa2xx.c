@@ -56,6 +56,15 @@ module_param(pxa27x_maxfreq, uint, 0);
 MODULE_PARM_DESC(pxa27x_maxfreq, "Set the pxa27x maxfreq in MHz"
 		 "(typically 624=>pxa270, 416=>pxa271, 520=>pxa272)");
 
+static int __init pxa27x_maxfreq_setup(char *str)
+{
+	unsigned long t;
+	if (!strict_strtoul(str, 10, &t))
+		pxa27x_maxfreq = t;
+	return 1;
+}
+__setup("pxa27x_maxfreq=", pxa27x_maxfreq_setup);
+
 typedef struct {
 	unsigned int khz;
 	unsigned int membus;
