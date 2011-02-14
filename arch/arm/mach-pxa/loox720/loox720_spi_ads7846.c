@@ -11,6 +11,7 @@
 #include <linux/sched.h>
 #include <linux/interrupt.h>
 #include <linux/spinlock.h>
+#include <linux/math64.h>
 
 #include <linux/spi/spi.h>
 #include <linux/input.h>
@@ -173,17 +174,190 @@ int loox720_ads7846_battery_temp(void)
 }
 EXPORT_SYMBOL(loox720_ads7846_battery_temp);
 
-/* ==========================================================
-	input layer reporting interface
-   ========================================================== */
+static s64 divr64_s64(s64 dividend, s64 divisor)
+{
+    if (dividend >= 0)
+    {
+	if (divisor >= 0)
+	{
+	    return div64_u64(dividend + (divisor >> 1), divisor);
+	}
+	else
+	{
+	    return -div64_u64(dividend + ((-divisor) >> 1), -divisor);
+	}
+    }
+    else
+    {
+	if (divisor >= 0)
+	{
+	    return -div64_u64((-dividend) + (divisor >> 1), divisor);
+	}
+	else
+	{
+	    return div64_u64((-dividend) + ((-divisor) >> 1), -divisor);
+	}
+    }
+}
+
+static unsigned int leftbits(s64 x)
+{
+    unsigned int c;
+
+    if (x == 0)
+	return (sizeof(x)*8) - 1;
+
+    if (x < 0)
+	x = -x;
+
+    c = 0;
+    while (!(x & (1LL << ((sizeof(x)*8) - 2))))
+	c++, x<<= 1;
+
+    return c;
+}
+
+static int detbits(s64 x)
+{
+    unsigned int c;
+
+    if (x == 0)
+	return (sizeof(x)*8) - 1;
+
+    c = 0;
+    while ((!(x & 1)) && (x >= (1LL << (sizeof(int)*8))))
+	c++, x>>= 1;
+
+    while (x < (1LL << (sizeof(int)*8)))
+	c--, x<<= 1;
+
+    return c;
+}
+
+static int transform_a[7] = {-9904, -97, 35864388, 176, 12671, -5268952, 16};
+/*static int transform_a[7] = {1, 0, 0, 0, 1, 0, 0};*/
+
+static void calibrate(int xts[5], int yts[5], int xfb[5], int yfb[5])
+{
+    int n, x, y, x2, y2, xy, z, zx, zy;
+    long long a, b, c;
+    int e, f, i;
+    long long det;
+    int scaling, detscaling;
+    long long t[6];
+
+    x = y = x2 = y2 = xy = 0;
+    n = 5;
+    while (n--)
+    {
+	x+= xts[n];
+	y+= yts[n];
+	x2+= xts[n] * xts[n];
+	y2+= yts[n] * yts[n];
+	xy+= xts[n] * yts[n];
+    }
+
+    det = 5*((long long)x2*(long long)y2 - (long long)xy*(long long)xy) + x*((long long)xy*(long long)y - (long long)x*(long long)y2) + y*((long long)x*(long long)xy - (long long)y*(long long)x2);
+    if (!det)
+    {
+	printk(KERN_ERR "Invalid calibration data (determinant is 0).\n");
+	return;
+    }
+
+    a = (long long)x2*(long long)y2 - (long long)xy*(long long)xy;
+    b = (long long)xy*y - x*(long long)y2;
+    c = x*(long long)xy - y*(long long)x2;
+    e = 5*y2 - y*y;
+    f = x*y - 5*xy;
+    i = 5*x2 - x*x;
+
+    z = zx = zy = 0;
+    n = 5;
+    while (n--)
+    {
+	z+= xfb[n];
+	zx+= xfb[n] * xts[n];
+	zy+= xfb[n] * yts[n];
+    }
+
+    t[0] = a*z + b*zx + c*zy;
+    t[1] = b*z + e*(long long)zx + f*(long long)zy;
+    t[2] = c*z + f*(long long)zx + i*(long long)zy;
+
+    z = zx = zy = 0;
+    n = 5;
+    while (n--)
+    {
+	z+= yfb[n];
+	zx+= yfb[n] * xts[n];
+	zy+= yfb[n] * yts[n];
+    }
+
+    t[3] = a*z + b*zx + c*zy;
+    t[4] = b*z + e*(long long)zx + f*(long long)zy;
+    t[5] = c*z + f*(long long)zx + i*(long long)zy;
+
+    scaling = leftbits(t[5]);
+    n = 5;
+    while (n--)
+    {
+	int s = leftbits(t[n]);
+	if (scaling > s)
+	    scaling = s;
+    }
+    n = 6;
+    while (n--)
+	t[n]<<= scaling;
+    detscaling = detbits(det);
+    if (scaling + detscaling < 0)
+	detscaling = -scaling;
+    det = (detscaling >= 0) ? (det >> detscaling) : (det << (-detscaling));
+
+    transform_a[0] = divr64_s64(t[1], det);
+    transform_a[1] = divr64_s64(t[2], det);
+    transform_a[2] = divr64_s64(t[0], det);
+
+    transform_a[3] = divr64_s64(t[4], det);
+    transform_a[4] = divr64_s64(t[5], det);
+    transform_a[5] = divr64_s64(t[3], det);
+
+    transform_a[6] = scaling + detscaling;
+
+    while (transform_a[6] > (sizeof(short)*8))
+    {
+	transform_a[6]--;
+	n = 5;
+	while (n--)
+	    transform_a[n]>>= 1;
+    }
+
+    printk(KERN_INFO "Computed calibration coefficients %d %d %d %d %d %d %d.\n", transform_a[0], transform_a[1], transform_a[2], transform_a[3],  transform_a[4], transform_a[5],  transform_a[6]);
+}
+
+static int __init calibration_setup(char *str)
+{
+    static int xfb[5] = {240, 90, 90, 390, 390};
+    static int yfb[5] = {320, 120, 520, 520, 120};
+
+    int x[5], y[5];
+
+    if (sscanf(str, "%d,%d;%d,%d;%d,%d;%d,%d;%d,%d", &x[0], &y[0], &x[1], &y[1], &x[2], &y[2], &x[3], &y[3], &x[4], &y[4]) != 10)
+    {
+	printk(KERN_ERR "Invalid calibration data %s.\n", str);
+    }
+    else
+    {
+	calibrate(x, y, xfb, yfb);
+    }
+    return 1;
+}
+__setup("ads7846_calib=", calibration_setup);
+
 
 static void transform(unsigned int *x, unsigned int *y)
 {
-    static int a[7] = {-9904, -97, 35864388, 176, 12671, -5268952, 65536};
-    /*static s32 a[7] = {1, 0, 0, 0, 1, 0, 1};*/
-
-    int xtemp = (a[2] + a[0] * ((s32)(*x)) + a[1] * ((s32)(*y))) / a[6];
-    int ytemp = (a[5] + a[3] * ((s32)(*x)) + a[4] * ((s32)(*y))) / a[6];
+    int xtemp = (transform_a[2] + transform_a[0] * ((s32)(*x)) + transform_a[1] * ((s32)(*y))) >> transform_a[6];
+    int ytemp = (transform_a[5] + transform_a[3] * ((s32)(*x)) + transform_a[4] * ((s32)(*y))) >> transform_a[6];
 
     if (xtemp < 0)
         xtemp = 0;
@@ -198,6 +372,10 @@ static void transform(unsigned int *x, unsigned int *y)
     *x = xtemp;
     *y = ytemp;
 }
+
+/* ==========================================================
+	input layer reporting interface
+   ========================================================== */
 
 void loox720_ads7846_report(loox720_ads7846_device_info * dev, unsigned int Rt, unsigned int x, unsigned int y)
 {
