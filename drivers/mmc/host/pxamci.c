@@ -40,7 +40,7 @@
 
 #define DRIVER_NAME	"pxa2xx-mci"
 
-#define NR_SG	1
+#define NR_SG	32
 #define CLKRT_OFF	(~0)
 
 struct pxamci_host {
